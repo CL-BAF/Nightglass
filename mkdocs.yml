@@ -1,7 +1,7 @@
 site_name: honeywatch
 site_description: Planet-scale SSH honeypot scanner with AI confidence scoring
-site_url: https://github.com/honeywatch/honeywatch
-repo_url: https://github.com/honeywatch/honeywatch
+site_url: https://github.com/CL-BAF/Nightglass
+repo_url: https://github.com/CL-BAF/Nightglass
 edit_uri: ""
 
 theme:
