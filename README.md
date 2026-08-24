@@ -144,8 +144,8 @@ Full legal disclaimer and abuse-reporting guidance: `docs/security.md`.
 **Quick path** — use the bundled setup script (creates a venv and installs the package in editable mode with extras). Do **not** run `setup.sh` as root:
 
 ```bash
-git clone https://github.com/<owner>/nightglass.git
-cd nightglass
+git clone https://github.com/CL-BAF/Nightglass.git
+cd Nightglass
 ./setup.sh
 ```
 
