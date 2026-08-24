@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+# PEP 639 SPDX license expression (`license = "MIT"`) needs setuptools>=77.
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +9,10 @@ version = "0.1.0"
 description = "Planet-scale SSH honeypot scanner with AI confidence scoring"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+# PEP 639 SPDX license expression (a plain string). setuptools>=77 turns this
+# into the canonical `License-Expression: MIT` metadata, so we no longer need
+# the deprecated `License :: OSI Approved :: MIT License` trove classifier.
+license = "MIT"
 authors = [{ name = "honeywatch" }]
 keywords = ["ssh", "honeypot", "scanner", "security", "ollama"]
 classifiers = [
@@ -16,7 +20,6 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Information Technology",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -24,6 +27,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Topic :: System :: Networking :: Monitoring",
 ]
