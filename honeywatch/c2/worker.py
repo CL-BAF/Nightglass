@@ -213,8 +213,11 @@ class Worker:
                 return {"mode": "ssh", "target": f"{user}@{target.ip}", "error": "timeout"}
             except Exception as exc:
                 return {"mode": "ssh", "target": f"{user}@{target.ip}", "error": str(exc)}
-        # Password auth (cracked credential): delegate to sshpass when present.
-        argv = ["sshpass", "-p", passw,
+        # Password auth (cracked credential): delegate to sshpass via an env
+        # var (-e) so the secret never appears in argv / process listings.
+        env = dict(os.environ)
+        env["SSHPASS"] = passw
+        argv = ["sshpass", "-e",
                 "ssh", "-o", "StrictHostKeyChecking=no",
                 "-o", "PreferredAuthentications=password",
                 "-o", "PubkeyAuthentication=no",
@@ -226,6 +229,7 @@ class Worker:
                 capture_output=True,
                 text=True,
                 timeout=600,
+                env=env,
             )
             return {
                 "mode": "ssh",

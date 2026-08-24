@@ -72,6 +72,7 @@ nav:
       - C2 Controller: c2.md
       - Operations & Targeting: ops.md
       - SSH Cracking: crack.md
+      - Opsec Model: opsec.md
       - AI Agent & Chat: agent.md
   - API Reference:
       - Overview: api/index.md

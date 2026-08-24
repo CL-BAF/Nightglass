@@ -108,9 +108,17 @@ class OllamaClient:
 
     # ------------------------------------------------------------ discovery
     def is_reachable(self) -> bool:
-        """True when GET ``/models`` returns any 2xx status."""
+        """True when GET ``/models`` returns any 2xx status.
+
+        Sends the ``Authorization`` header when an API key is set so this also
+        works against authenticated endpoints (Ollama Cloud rejects an
+        unauthenticated ``/models`` with 401, which would otherwise make the
+        scorer silently skip AI on every run).
+        """
         try:
-            req = urllib.request.Request(f"{self.base_url}/models", method="GET")
+            req = urllib.request.Request(
+                f"{self.base_url}/models", headers=self._headers(), method="GET"
+            )
             with urllib.request.urlopen(req, timeout=min(self.timeout, 10.0)) as resp:
                 return 200 <= resp.status < 300
         except OSError:
@@ -119,7 +127,9 @@ class OllamaClient:
     def models(self) -> list[str]:
         """List model ids advertised by the endpoint (GET ``/models``, "data")."""
         try:
-            req = urllib.request.Request(f"{self.base_url}/models", method="GET")
+            req = urllib.request.Request(
+                f"{self.base_url}/models", headers=self._headers(), method="GET"
+            )
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError:

