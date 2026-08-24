@@ -478,10 +478,11 @@ class ChainOrchestrator:
         if self.cfg.payload_id in {"xmrig", "xmrigcc"}:
             missing = [k for k in ("pool", "wallet") if not getattr(self.cfg, k)]
             if missing:
+                flags = ", ".join(f"--{k}" for k in missing)
                 self._emit(
                     ChainPhase.PERSIST,
-                    f"ABORT: miner deploy needs --{'/--'.join(missing)} "
-                    f"(configure via `honeywatch setup` or pass --{'/--'.join(missing)})",
+                    f"ABORT: miner deploy needs {flags} "
+                    f"(configure via `honeywatch setup` or pass {flags})",
                 )
                 return
 

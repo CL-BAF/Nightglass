@@ -129,6 +129,9 @@ def default_config() -> dict[str, Any]:
             "exec_mode": "dry_run",
             "ssh_user": "root",
             "ssh_key": None,
+            # Bearer token gating controller API + WS. None = unauthenticated
+            # (matches the controller default; set to match --api-token).
+            "api_token": None,
         },
         # ------------------------------------------------------------------ #
         # SSH password cracker

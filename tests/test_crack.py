@@ -218,6 +218,38 @@ def test_crack_targets_multi_host(monkeypatch):
     assert all(r.password == "letmein" for r in results)
 
 
+def test_crack_targets_forwards_on_attempt(monkeypatch):
+    """Regression: `crack_targets` must accept and forward ``on_attempt``.
+
+    The CLI handler passes ``on_attempt=...`` for live per-attempt progress.
+    Before the fix, ``crack_targets`` only declared ``on_result``, so every
+    ``honeywatch crack`` invocation raised ``TypeError`` 100% of the time —
+    a bug no unit test caught because the tests called ``crack_targets``
+    directly without ``on_attempt``.
+    """
+    _install_fake_paramiko(monkeypatch, winner=("root", "letmein"))
+    targets = [
+        CrackTarget(
+            ip="10.0.0.7", port=22, users=["root"],
+            passwords=["letmein", "nope"], banner="SSH-2.0-test", timeout_s=2.0,
+        )
+    ]
+    seen = []
+
+    def on_attempt(attempt, result):
+        seen.append((attempt.user, attempt.password, attempt.success))
+
+    results = _run(
+        crack_targets(targets, concurrency=2, host_concurrency=3, on_attempt=on_attempt)
+    )
+
+    # No TypeError, the host cracked, and the per-attempt callback actually fired.
+    assert len(results) == 1
+    assert results[0].success is True
+    assert seen, "on_attempt was never invoked"
+    assert any(u == "root" and pw == "letmein" and ok for u, pw, ok in seen)
+
+
 # --------------------------------------------------------------------------- #
 # Credential persistence in the store
 # --------------------------------------------------------------------------- #

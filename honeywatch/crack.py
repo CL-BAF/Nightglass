@@ -432,18 +432,20 @@ async def crack_targets(
     concurrency: int = 8,
     host_concurrency: int = 32,
     on_result=None,
+    on_attempt=None,
 ) -> list[CrackResult]:
     """Crack many hosts concurrently, bounded by ``host_concurrency``.
 
     ``concurrency`` is per-host (login attempts), ``host_concurrency`` caps how
     many hosts are being attacked at once. Results are returned in input order;
-    ``on_result`` (if given) is called per finished host.
+    ``on_result`` (if given) is called per finished host, and ``on_attempt``
+    (if given) is called per login attempt (forwarded to :func:`crack_host`).
     """
     sem = asyncio.Semaphore(max(1, host_concurrency))
 
     async def one(target: CrackTarget) -> CrackResult:
         async with sem:
-            res = await crack_host(target, concurrency=concurrency)
+            res = await crack_host(target, concurrency=concurrency, on_attempt=on_attempt)
         if on_result is not None:
             try:
                 on_result(res)
