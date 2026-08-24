@@ -128,6 +128,31 @@ def test_chain_state_note_records_round():
     assert s.log[0] == {"phase": "recon", "msg": "hi", "round": 1, "extra": "x"}
 
 
+def test_chain_max_rounds_zero_runs_forever_until_growth_exhausted():
+    """max_rounds=0 is the daemon mode: it must loop until a pivot round finds
+    no new subnets, NOT stop at a fixed round count."""
+    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=0, pool="p", wallet="w")
+    orch = _MockChain(cfg)
+    state = orch.run()
+    # round 1 pivots to 10.0.1.0/24, round 2 finds nothing -> growth-exhausted.
+    assert state.round == 2
+    assert state.stopped is True
+    assert "growth exhausted" in state.stop_reason
+    # it must NOT claim it hit a max-rounds cap (there is no cap when 0=forever).
+    assert "max_rounds" not in state.stop_reason
+
+
+def test_chain_max_rounds_one_caps_cleanly():
+    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=1, pool="p", wallet="w")
+    orch = _MockChain(cfg)
+    state = orch.run()
+    # one round runs, it pivots to new ground, but the cap stops it before round 2.
+    assert state.round == 1
+    assert state.stopped is True
+    assert state.stop_reason == "reached max_rounds=1"
+
+
+
 def test_chain_config_defaults():
     cfg = ChainConfig()
     assert cfg.payload_id == "xmrig"

