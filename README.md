@@ -177,6 +177,45 @@ platform: Linux gives you the full pipeline (the scanners + the high-opsec
 and deploy against hosts you name explicitly but has no native `masscan`/`zmap`.
 For the full blackhat pipeline on Windows, use **WSL2 or a Linux VPS**.
 
+#### Quick path (Linux — one script does everything)
+
+`setup.sh` at the repo root provisions the venv, installs honeywatch editable
+with the optional extras, and probes the external binaries the chain phases
+shell out to (`masscan`/`zmap`/`nmap`/`sshpass`/`hashcat`/`john`) — reporting
+which are missing with install hints instead of failing, since the chain
+degrades gracefully when a tool is absent.
+
+```bash
+git clone https://github.com/CL-BAF/Nightglass.git
+cd Nightglass
+./setup.sh                        # .venv/ + paramiko + aiohttp/websockets + pytest
+. .venv/bin/activate
+honeywatch --version
+```
+
+It does five things in order: Python ≥ 3.10 gate, venv creation (with
+`ensurepip` fallback for bare-venv distros), `pip install -e .[full,c2,dev]`,
+the external-binary probe, and a next-steps banner. Idempotent — re-run any
+time to upgrade honeywatch + extras in place.
+
+Env overrides (all optional):
+
+```bash
+VENV=/opt/hw ./setup.sh                     # custom venv location
+HONEYWATCH_EXTRAS=full ./setup.sh            # only paramiko (no c2/dev)
+PYTHON=python3.12 ./setup.sh                 # build the venv from a specific interpreter
+SKIP_BINARY_CHECK=1 ./setup.sh              # skip the masscan/hashcat/etc. probe
+```
+
+Install any binaries the probe flags as `MISSING` (Debian/Ubuntu one-liner):
+
+```bash
+sudo apt-get install -y masscan zmap nmap sshpass hashcat john
+```
+
+The manual numbered path below is the explicit/Windows route and the
+reference for what `setup.sh` automates.
+
 #### 1. Get the repo (both platforms)
 
 ```bash
