@@ -371,7 +371,7 @@ Then (Linux, full chain):
 
     honeywatch scan 10.0.0.0/24 --skip-vpn-check --no-ai
     honeywatch botnet 10.0.0.0/24 --payload xmrig --skip-vpn-check
-    # --pool/--wallet/--worker/--tls default from `honeywatch setup`; pass them to override
+    # --pool/--wallet/--worker/--tls default from 'honeywatch setup'; pass them to override
 
 Tests:
 
