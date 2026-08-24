@@ -260,6 +260,22 @@ class ChatAgent:
         retry with json_mode=True to force the API to enforce structured
         output — some models obey the JSON contract only when told to.
         """
+        # ── Debug: dump the raw API response shape ──
+        try:
+            raw_msg = self.client.chat(messages, json_mode=False, return_raw=True)
+            _debug_msg = (
+                f"[DEBUG] raw message keys: {list(raw_msg.keys())}\n"
+                f"  content:           {str(raw_msg.get('content', ''))[:200]!r}\n"
+                f"  reasoning_content: {str(raw_msg.get('reasoning_content', ''))[:200]!r}\n"
+                f"  thinking:          {str(raw_msg.get('thinking', ''))[:200]!r}"
+            )
+            log.warning(_debug_msg)
+            print(_debug_msg, flush=True)
+        except Exception as exc:
+            _debug_fail = f"[DEBUG] return_raw failed: {exc}"
+            log.warning(_debug_fail)
+            print(_debug_fail, flush=True)
+
         try:
             raw = self.client.chat(messages, json_mode=False)
         except AiError as exc:
@@ -268,6 +284,10 @@ class ChatAgent:
                 "speak": f"I can't reach Ollama right now: {exc}. Check your API key and base URL with `honeywatch setup`.",
                 "tools": [],
             }
+        _debug_chat = f"[DEBUG] chat() returned {len(raw)} chars: {raw[:300]!r}"
+        log.warning(_debug_chat)
+        print(_debug_chat, flush=True)
+
         try:
             parsed = _extract_json(raw)
         except Exception:
@@ -279,11 +299,14 @@ class ChatAgent:
                 return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
             # raw is empty — content field was blank and no fallback field
             # existed.  Retry with json_mode=True to force structured output.
-            log.warning(
-                "model returned empty content on first attempt; retrying with json_mode=True"
-            )
+            _retry_msg = "model returned empty content on first attempt; retrying with json_mode=True"
+            log.warning(_retry_msg)
+            print(f"[DEBUG] {_retry_msg}", flush=True)
             try:
                 raw = self.client.chat(messages, json_mode=True)
+                _debug_retry = f"[DEBUG] json_mode retry returned {len(raw)} chars: {raw[:300]!r}"
+                log.warning(_debug_retry)
+                print(_debug_retry, flush=True)
             except AiError as exc:
                 return {
                     "thoughts": "Ollama is unreachable (json_mode retry).",
