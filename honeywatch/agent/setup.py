@@ -273,7 +273,7 @@ def run_setup_wizard(
     )
     cfg.wallet = _get(
         "wallet",
-        "Wallet address",
+        "Monero wallet address (required for miner deploy)",
         default=existing.wallet,
     )
     cfg.pass_ = _get(

