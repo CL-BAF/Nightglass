@@ -66,8 +66,23 @@ def _build_botnet_config(args):
 
 def _cmd_botnet(args, argv) -> int:
     from honeywatch.chain import ChainPhase, run_chain
+    from honeywatch.store import Store
 
     cfg = _build_botnet_config(args)
+
+    # If no targets were given and the store has no hosts either, the chain
+    # will loop through all phases doing nothing. Fail early with a clear hint.
+    if not cfg.targets:
+        try:
+            store = Store(cfg.db_path)
+            known = store.scored_hosts()
+        except Exception:
+            known = set()
+        if not known:
+            print("honeywatch botnet: no targets specified and no stored hosts found.\n"
+                  "  Pass target IPs/ranges as arguments, or run a scan first "
+                  "to populate the store.", file=sys.stderr)
+            return 1
 
     def on_phase(phase: ChainPhase, msg: str, state, **extra):
         if not args.json:

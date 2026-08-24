@@ -567,9 +567,12 @@ def grab_shadow(
         out["error"] = "no credential supplied (need password or key)"
         return out
 
-    os.makedirs(os.path.join(stash_dir, ip), exist_ok=True)
-    local_shadow = os.path.join(stash_dir, ip, "shadow")
-    local_passwd = os.path.join(stash_dir, ip, "passwd")
+    # Sanitize the IP to prevent path traversal (e.g. "../../etc").
+    safe_ip = ip.replace("/", "_").replace("\\", "_").replace("..", "_")
+    ip_dir = os.path.join(stash_dir, safe_ip)
+    os.makedirs(ip_dir, exist_ok=True)
+    local_shadow = os.path.join(ip_dir, "shadow")
+    local_passwd = os.path.join(ip_dir, "passwd")
 
     transport = None
     try:

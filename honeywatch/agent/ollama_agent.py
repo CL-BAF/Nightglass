@@ -18,6 +18,10 @@ from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
+# Maximum characters per tool result appended to conversation history.
+# Individual results longer than this are truncated to avoid bloating context.
+_MAX_TOOL_RESULT_CHARS = 4000
+
 from honeywatch.agent.setup import AgentConfig, SetupStore
 from honeywatch.agent.tools import TOOL_REGISTRY, ToolContext, execute_tool
 from honeywatch.ai.ollama import AiError, OllamaClient
@@ -441,7 +445,7 @@ class ChatAgent:
                         log.debug("fell back to %s (%d chars)", alt_key, len(alt))
                         break
             raw = content.strip()
-            log.warning(
+            log.debug(
                 "message keys=%s content=%d chars reasoning=%d thinking=%d "
                 "chat()=%d chars",
                 list(raw_msg.keys()),
@@ -478,6 +482,12 @@ class ChatAgent:
             return parsed
 
         # Nothing parseable at all — treat as plain text.
+        if not raw:
+            # Both the normal and json_mode responses were empty. Signal a
+            # diagnostic so the operator sees the model produced nothing.
+            return {"thoughts": "model returned empty response",
+                    "speak": "[empty model response - check model availability]",
+                    "tools": [], "done": True}
         return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
 
     def _execute_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -531,9 +541,14 @@ class ChatAgent:
             )
             results = self._execute_tool_calls(tool_calls)
             # Append a compact result summary as the next user message.
+            # Truncate individual results that exceed the limit to avoid
+            # bloating conversation history and blowing the context window.
             summary_lines = []
             for r in results:
-                summary_lines.append(json.dumps(r, default=str, ensure_ascii=False))
+                text = json.dumps(r, default=str, ensure_ascii=False)
+                if len(text) > _MAX_TOOL_RESULT_CHARS:
+                    text = text[:_MAX_TOOL_RESULT_CHARS] + "\n...[truncated]"
+                summary_lines.append(text)
             self.messages.append(
                 {
                     "role": "user",
@@ -574,11 +589,23 @@ class ChatAgent:
         return "\n".join(lines)
 
     def _trim_history(self, keep_tail: int = 8) -> None:
-        """Keep system + goal seed + a rolling tail so a forever run can't OOM."""
+        """Keep system + goal seed + a rolling tail so a forever run can't OOM.
+
+        After trimming, the resulting message list must maintain the
+        alternating user/assistant pattern required by the chat-completions
+        API.  If the tail starts with a role that would create two consecutive
+        same-role messages, a synthetic bridging message is inserted.
+        """
         if len(self.messages) <= 2 + keep_tail:
             return
         head = self.messages[:2]   # system prompt + goal seed
         tail = self.messages[-keep_tail:]
+        # The head ends with the goal-seed user message.  If the tail also
+        # starts with a user message we'd have [system, user, user, ...]
+        # which Ollama rejects.  Insert a synthetic assistant bridge.
+        if tail and tail[0]["role"] == "user":
+            bridge = {"role": "assistant", "content": "[context trimmed]"}
+            tail = [bridge] + tail
         self.messages = head + tail
 
     def run_autonomous(
@@ -653,7 +680,12 @@ class ChatAgent:
             # 3. execute the model's chosen tool calls.
             results = self._execute_tool_calls(tools)
             tool_calls_total += len(tools)
-            summary_lines = [json.dumps(r, default=str, ensure_ascii=False) for r in results]
+            summary_lines = []
+            for r in results:
+                text = json.dumps(r, default=str, ensure_ascii=False)
+                if len(text) > _MAX_TOOL_RESULT_CHARS:
+                    text = text[:_MAX_TOOL_RESULT_CHARS] + "\n...[truncated]"
+                summary_lines.append(text)
             self.messages.append({
                 "role": "user",
                 "content": "Tool results:\n" + "\n".join(summary_lines),

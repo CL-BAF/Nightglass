@@ -156,8 +156,35 @@ def test_autonomous_loop_history_is_trimmed(tmp_path, monkeypatch):
     agent.client = client
 
     agent.run_autonomous(goal="test", max_cycles=50)
-    # system + goal seed + rolling tail (8) -- never 100+ messages.
-    assert len(agent.messages) <= 2 + 8
+    # system + goal seed + optional bridge + rolling tail (8).
+    # The bridge message is inserted when trimming creates consecutive
+    # same-role messages, so the maximum is 2 + 1 + 8 = 11.
+    assert len(agent.messages) <= 2 + 1 + 8
+
+
+def test_trim_history_preserves_alternation(tmp_path):
+    """After trimming, the message list must maintain alternating
+    user/assistant roles -- two consecutive user messages would cause
+    an Ollama API 400 error."""
+    agent = _make_agent(tmp_path)
+    # Build a long message list manually to trigger trimming.
+    agent.messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "goal"},
+    ]
+    # Add 20 user/assistant pairs to exceed the trim threshold.
+    for i in range(20):
+        agent.messages.append({"role": "user", "content": f"status {i}"})
+        agent.messages.append({"role": "assistant", "content": f"reply {i}"})
+    # Add one more user message at the end (fleet status).
+    agent.messages.append({"role": "user", "content": "fleet status"})
+    agent._trim_history()
+    # Verify no two consecutive messages have the same role.
+    for i in range(1, len(agent.messages)):
+        assert agent.messages[i]["role"] != agent.messages[i - 1]["role"], (
+            f"consecutive same-role messages at index {i - 1}/{i}: "
+            f"{agent.messages[i - 1]['role']} -> {agent.messages[i]['role']}"
+        )
 
 
 def test_chat_agent_autonomous_uses_autonomous_prompt(tmp_path, monkeypatch):

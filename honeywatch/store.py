@@ -103,8 +103,13 @@ class Store:
         self._mem_lock = threading.RLock()
         self._initialized = False
         # Ensure the schema + pragmas exist up front.
-        conn = self._connect()
-        self._close(conn)
+        try:
+            conn = self._connect()
+            self._close(conn)
+        except sqlite3.OperationalError as exc:
+            raise RuntimeError(
+                f"honeywatch: cannot open database at {db_path!r}: {exc}"
+            ) from exc
 
     def _connect(self) -> sqlite3.Connection:
         if self.db_path == ":memory:":

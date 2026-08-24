@@ -115,6 +115,7 @@ class C2Store:
 
     def __init__(self, db_path: str = "honeywatch.db"):
         self.db_path = db_path
+        self._initialized = False
         conn = self._connect()
         self._close(conn)
 
@@ -122,8 +123,15 @@ class C2Store:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.executescript(_SCHEMA)
-        conn.commit()
+        if not self._initialized:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.OperationalError:
+                pass  # read-only filesystem — fall back silently
+            conn.executescript(_SCHEMA)
+            conn.commit()
+            self._initialized = True
         return conn
 
     def _close(self, conn: sqlite3.Connection) -> None:

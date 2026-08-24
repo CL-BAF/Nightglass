@@ -783,6 +783,8 @@ def _match_signature(func, candidates: dict) -> dict:
 def parse_host(spec: str, default_port: int = 22):
     """Parse 'ip', 'ip:port', '[v6]:port' into (ip, port)."""
     spec = (spec or "").strip()
+    if not spec:
+        raise SystemExit("honeywatch: empty host specification")
     if spec.startswith("["):
         end = spec.find("]")
         if end != -1:
@@ -790,14 +792,19 @@ def parse_host(spec: str, default_port: int = 22):
             rest = spec[end + 1 :]
             port = default_port
             if rest.startswith(":"):
+                port_str = rest[1:]
+                if port_str and not port_str.isdigit():
+                    raise SystemExit(f"honeywatch: invalid port {port_str!r} in host spec {spec!r}")
                 try:
-                    port = int(rest[1:])
+                    port = int(port_str) if port_str else default_port
                 except ValueError:
                     pass
             return ip, port
     if spec.count(":") == 1:
         host, _, port_str = spec.partition(":")
-        if port_str.isdigit():
+        if port_str:
+            if not port_str.isdigit():
+                raise SystemExit(f"honeywatch: invalid port {port_str!r} in host spec {spec!r}")
             return host, int(port_str)
     return spec, default_port
 
@@ -1245,6 +1252,15 @@ def _cmd_c2(args, argv) -> int:
     api_token = args.api_token or getattr(c2_cfg, "api_token", None)
 
     from honeywatch.c2 import Controller, C2Store, build_ssl_context
+    from honeywatch.c2.controller import HAS_AIOHTTP
+
+    if not HAS_AIOHTTP:
+        print(
+            "honeywatch: the c2 subcommand requires the 'aiohttp' package.\n"
+            "  Install it with:  pip install honeywatch[c2]",
+            file=sys.stderr,
+        )
+        return 1
 
     store = C2Store(db_path)
     ssl_ctx = build_ssl_context(cert, key)
@@ -1521,6 +1537,17 @@ def _cmd_agent(args, argv) -> int:
     print(f"  max-cycles: {args.max_cycles} (0 = forever)  business-hours: {args.business_hours}")
     if log_fh:
         print(f"  log: {args.log}")
+    # Pre-flight: verify Ollama is reachable. Wasting all max_cycles on
+    # connection errors is pointless; fail early with a clear message.
+    if not agent.client.is_reachable():
+        print(
+            f"honeywatch: cannot reach Ollama at {agent.config.ollama_base_url}. "
+            "Check that Ollama is running and your API key is correct.",
+            file=sys.stderr,
+        )
+        if log_fh:
+            log_fh.close()
+        return 1
     print("-" * 60)
     try:
         summary = agent.run_autonomous(
@@ -1735,6 +1762,11 @@ def _cmd_hashcrack(args, argv) -> int:
             shadow_path = sub
     if not os.path.isfile(shadow_path):
         print("hashcrack: shadow file not found: " + args.shadow)
+        return 1
+
+    wordlist = args.wordlist
+    if wordlist and not os.path.isfile(wordlist):
+        print("hashcrack: wordlist not found: " + wordlist, file=sys.stderr)
         return 1
 
     extra = []

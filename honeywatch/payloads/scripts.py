@@ -117,9 +117,11 @@ _UNSAFE_PATTERNS = (
     "`",     # command substitution
     "$(",    # command substitution
     "${",    # parameter expansion
+    "$",     # bare variable expansion ($HOME, $PATH etc.)
     "&&",    # command sequencing
     "||",    # command sequencing
     ";",     # command separator
+    '"',     # breaks out of double-quoted shell strings
     "\n",    # newline injection
     "\r",    # carriage return
 )

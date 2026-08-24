@@ -499,8 +499,7 @@ class ChainOrchestrator:
         }
         try:
             manifest = build_manifest(self.cfg.payload_id, targets, variables,
-                                      apply_evasion=self.cfg.evasion or None,
-                                      allow_unsafe_vars=True)
+                                      apply_evasion=self.cfg.evasion or None)
             c2 = C2Store(self.cfg.db_path)
             op = enqueue_operation(c2, manifest)
             # The chain only enqueues; a separately-launched `honeywatch worker`
