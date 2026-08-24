@@ -26,16 +26,23 @@ def _make_agent(tmp_path):
 
 
 def _scripted_client(responses):
-    """A fake Ollama client whose .chat() pops scripted JSON strings."""
+    """A fake Ollama client whose .chat() pops scripted responses.
+
+    Supports return_raw=True by returning a message dict with the text in
+    the content field, matching the real OllamaClient.chat() contract.
+    """
     queue = list(responses)
     calls = {"count": 0}
 
-    def chat(messages, json_mode=False):
+    def chat(messages, json_mode=False, *, return_raw=False):
         calls["count"] += 1
         if not queue:
-            # Default to a DONE so a misconfigured test can't spin forever.
-            return json.dumps({"thoughts": "", "speak": "done", "tools": [], "done": True})
-        return queue.pop(0)
+            text = json.dumps({"thoughts": "", "speak": "done", "tools": [], "done": True})
+        else:
+            text = queue.pop(0)
+        if return_raw:
+            return {"role": "assistant", "content": text}
+        return text
 
     return types.SimpleNamespace(chat=chat), calls
 
@@ -163,3 +170,21 @@ def test_chat_agent_autonomous_uses_autonomous_prompt(tmp_path, monkeypatch):
     convo = ChatAgent(config=cfg, db_path=str(tmp_path / "hw.db"),
                       skip_vpn_check=True, autonomous=False)
     assert "UNATTENDED" not in convo.messages[0]["content"]
+
+
+def test_autonomous_loop_semi_structured_response(tmp_path, monkeypatch):
+    """The agent should handle deepseek-v4-flash style semi-structured output."""
+    agent = _make_agent(tmp_path)
+    client, calls = _scripted_client([
+        "THOUGHTS: scanning the network\n"
+        "SPEAK: scanning 10.0.0.0/24\n"
+        "TOOLS:\n"
+        '- {"name": "scan", "arguments": {"targets": "10.0.0.0/24"}}\n'
+        "DONE: false",
+        _resp(done=True),
+    ])
+    agent.client = client
+
+    summary = agent.run_autonomous(goal="test", max_cycles=10)
+    assert summary["tool_calls"] == 1
+    assert summary["cycles"] == 2

@@ -150,7 +150,21 @@ class OllamaClient:
         # ``content``.  Fall back through these fields so the agent loop
         # actually receives the model's response instead of a silent empty
         # string that causes an immediate "exhausted" exit.
-        content = message.get("content") or ""
+        raw_content = message.get("content")
+
+        # OpenAI-compatible APIs may return content as a list of content
+        # blocks: [{"type": "text", "text": "..."}].  Extract the text.
+        if isinstance(raw_content, list):
+            parts = []
+            for block in raw_content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            content = "\n".join(parts) if parts else ""
+        elif raw_content is None:
+            content = ""
+        else:
+            content = str(raw_content)
+
         if not content.strip():
             # Try alternate fields where reasoning models stash their output.
             for alt_key in ("reasoning_content", "thinking"):

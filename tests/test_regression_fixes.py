@@ -67,10 +67,14 @@ def _make_agent(tmp_path):
 def _scripted_client(responses):
     queue = list(responses)
 
-    def chat(messages, json_mode=False):
+    def chat(messages, json_mode=False, *, return_raw=False):
         if not queue:
-            return json.dumps({"thoughts": "", "speak": "done", "tools": [], "done": True})
-        return queue.pop(0)
+            text = json.dumps({"thoughts": "", "speak": "done", "tools": [], "done": True})
+        else:
+            text = queue.pop(0)
+        if return_raw:
+            return {"role": "assistant", "content": text}
+        return text
 
     return types.SimpleNamespace(chat=chat)
 

@@ -149,6 +149,157 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise ValueError("unbalanced JSON")
 
 
+def _parse_model_response(text: str) -> dict[str, Any] | None:
+    """Parse a model response into {thoughts, speak, tools, done}.
+
+    Handles three formats the model might emit:
+
+    1. **Proper JSON** — ``{"THOUGHTS":"...", "SPEAK":"...", "TOOLS":[...],
+       "DONE":false}``
+    2. **Semi-structured text** — the model writes THOUGHTS/SPEAK/TOOLS/DONE as
+       labelled paragraphs instead of JSON, e.g.::
+
+           THOUGHTS: I should scan...
+           SPEAK: Scanning 10.0.0.0/24
+           TOOLS:
+           - {"name": "scan", "arguments": {"targets": "10.0.0.0/24"}}
+           DONE: false
+
+    3. **Markdown-wrapped JSON** — `````json ... ``` ```
+
+    Returns None if nothing parseable is found.
+    """
+    if not text or not text.strip():
+        return None
+
+    # ── Strategy 1: full JSON object ──
+    # If the entire response (or a fenced block) is valid JSON matching our
+    # schema, use it directly.  But if it's just a bare tool call or some other
+    # JSON that doesn't have our keys, save it for later and try semi-structured
+    # parsing — the model may have emitted THOUGHTS/SPEAK labels outside the
+    # JSON, e.g. "THOUGHTS: ...\nTOOLS:\n- {...}".
+    extracted_tool: dict[str, Any] | None = None
+    try:
+        parsed = _extract_json(text)
+        # Normalize keys to lowercase so THOUGHTS/Thoughts both work.
+        lower = {}
+        for k, v in parsed.items():
+            lower[k.lower()] = v
+        if "thoughts" in lower or "speak" in lower or "tools" in lower or "done" in lower:
+            return {
+                "thoughts": lower.get("thoughts", ""),
+                "speak": lower.get("speak", ""),
+                "tools": lower.get("tools", []),
+                "done": lower.get("done", False),
+            }
+        # Valid JSON but not our schema — might be a single tool call.
+        # Stash it and try semi-structured before falling back.
+        if "name" in lower and "arguments" in lower:
+            extracted_tool = parsed
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    # ── Strategy 2: semi-structured text ──
+    # Models like deepseek-v4-flash emit labelled paragraphs instead of JSON.
+    # We split the text at key boundaries (THOUGHTS:, SPEAK:, TOOLS:, DONE:)
+    # and extract each section's value.
+    result: dict[str, Any] = {}
+
+    # Find all key markers and their positions.
+    key_pattern = re.compile(
+        r"(?:^|\n)\s*(THOUGHTS|SPEAK|TOOLS|DONE)\s*[:=]\s*",
+        re.IGNORECASE,
+    )
+    markers = list(key_pattern.finditer(text))
+    if not markers:
+        # No semi-structured markers found.  If Strategy 1 extracted a bare
+        # tool call JSON, return it; otherwise nothing parseable.
+        if extracted_tool is not None:
+            return {
+                "thoughts": "",
+                "speak": "",
+                "tools": [extracted_tool],
+                "done": False,
+            }
+        return None
+
+    for i, m in enumerate(markers):
+        key = m.group(1).upper()
+        value_start = m.end()
+        # Value extends to the start of the next key marker, or end of text.
+        value_end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+        value = text[value_start:value_end].strip()
+
+        if key == "TOOLS":
+            # TOOLS section: may be a JSON array on one line or a markdown list.
+            # Try JSON array first.
+            if value.startswith("["):
+                try:
+                    arr = json.loads(value)
+                    if isinstance(arr, list):
+                        result["tools"] = arr
+                        continue
+                except json.JSONDecodeError:
+                    pass
+            # Otherwise parse markdown list items:  - {"name": ...}
+            tool_calls: list[dict[str, Any]] = []
+            for line in value.splitlines():
+                line = line.strip()
+                if line.startswith("- "):
+                    line = line[2:].strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict) and "name" in obj:
+                        tool_calls.append(obj)
+                except json.JSONDecodeError:
+                    try:
+                        obj = _extract_json(line)
+                        if isinstance(obj, dict) and "name" in obj:
+                            tool_calls.append(obj)
+                    except (ValueError, json.JSONDecodeError):
+                        log.debug("skipping unparseable tool line: %r", line[:120])
+            if tool_calls:
+                result["tools"] = tool_calls
+        else:
+            # Coerce string booleans for DONE field.
+            if key == "DONE":
+                val_lower = value.strip().lower()
+                if val_lower in ("true", "1", "yes", "y", "done", "ok", "okay"):
+                    result["done"] = True
+                elif val_lower in ("false", "0", "no", "n"):
+                    result["done"] = False
+                else:
+                    result[key.lower()] = value
+            else:
+                result[key.lower()] = value
+
+    if result:
+        # Ensure required keys exist.
+        result.setdefault("thoughts", "")
+        result.setdefault("speak", "")
+        result.setdefault("tools", [])
+        result.setdefault("done", False)
+        # If Strategy 1 found a bare tool call JSON object but no schema keys,
+        # and Strategy 2 didn't find TOOLS, include it now.
+        if not result["tools"] and extracted_tool is not None:
+            result["tools"] = [extracted_tool]
+        return result
+
+    # Neither JSON nor semi-structured text.  If Strategy 1 found a bare tool
+    # call, return it.
+    if extracted_tool is not None:
+        return {
+            "thoughts": "",
+            "speak": "",
+            "tools": [extracted_tool],
+            "done": False,
+        }
+
+    return None
+
+
 _TRUTHY_STRINGS = {"1", "true", "yes", "y", "done", "ok", "okay"}
 
 
@@ -251,84 +402,102 @@ class ChatAgent:
         self.on_say(text)
 
     def _ollama_chat(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        """Send messages to Ollama and parse the tool JSON.
+        """Send messages to Ollama and parse the response.
 
-        First attempt: plain chat, extract JSON from the response text.
-        If extraction fails and the model is a reasoning model that returned
-        its output in an alternate field, the OllamaClient.chat() fallback
-        logic already surfaces it.  If that *still* yields nothing usable,
-        retry with json_mode=True to force the API to enforce structured
-        output — some models obey the JSON contract only when told to.
+        Strategy:
+        1. Single API call with return_raw=True — gets the full message dict so
+           we can inspect reasoning_content/thinking fallbacks AND debug the
+           response shape, all in one inference (no double-call drift).
+        2. Try to parse the text as JSON, then as semi-structured text, then
+           fall back to plain text.
+        3. If the text is empty (content blank, no reasoning fallback), retry
+           with json_mode=True to force structured output.
         """
-        # ── Debug: dump the raw API response shape ──
+        # ── Single API call: get raw message for debug + content ──
+        raw_msg: dict[str, Any] = {}
+        raw: str = ""
         try:
             raw_msg = self.client.chat(messages, json_mode=False, return_raw=True)
-            _debug_msg = (
-                f"[DEBUG] raw message keys: {list(raw_msg.keys())}\n"
-                f"  content:           {str(raw_msg.get('content', ''))[:200]!r}\n"
-                f"  reasoning_content: {str(raw_msg.get('reasoning_content', ''))[:200]!r}\n"
-                f"  thinking:          {str(raw_msg.get('thinking', ''))[:200]!r}"
+            # Extract content with reasoning fallback (mirrors OllamaClient.chat
+            # logic, but we also get the full message for debugging).
+            raw_content = raw_msg.get("content")
+            # OpenAI-compatible APIs may return content as a list of content
+            # blocks: [{"type": "text", "text": "..."}].
+            if isinstance(raw_content, list):
+                parts = []
+                for block in raw_content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                content = "\n".join(parts) if parts else ""
+            elif raw_content is None:
+                content = ""
+            else:
+                content = str(raw_content)
+            if not content.strip():
+                for alt_key in ("reasoning_content", "thinking"):
+                    alt = raw_msg.get(alt_key)
+                    if alt and isinstance(alt, str) and alt.strip():
+                        content = alt
+                        log.debug("fell back to %s (%d chars)", alt_key, len(alt))
+                        break
+            raw = content.strip()
+            log.warning(
+                "message keys=%s content=%d chars reasoning=%d thinking=%d "
+                "chat()=%d chars",
+                list(raw_msg.keys()),
+                len(raw_msg.get("content", "")),
+                len(raw_msg.get("reasoning_content", "") or ""),
+                len(raw_msg.get("thinking", "") or ""),
+                len(raw),
             )
-            log.warning(_debug_msg)
-            print(_debug_msg, flush=True)
-        except Exception as exc:
-            _debug_fail = f"[DEBUG] return_raw failed: {exc}"
-            log.warning(_debug_fail)
-            print(_debug_fail, flush=True)
-
-        try:
-            raw = self.client.chat(messages, json_mode=False)
         except AiError as exc:
             return {
                 "thoughts": "Ollama is unreachable.",
                 "speak": f"I can't reach Ollama right now: {exc}. Check your API key and base URL with `honeywatch setup`.",
                 "tools": [],
             }
-        _debug_chat = f"[DEBUG] chat() returned {len(raw)} chars: {raw[:300]!r}"
-        log.warning(_debug_chat)
-        print(_debug_chat, flush=True)
 
-        try:
-            parsed = _extract_json(raw)
-        except Exception:
-            # First attempt failed to parse JSON.  Before giving up, try
-            # json_mode=True — some cloud models only emit valid JSON when
-            # response_format is set.
-            if raw.strip():
-                # The model returned text that isn't JSON.  Treat as speak.
-                return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
-            # raw is empty — content field was blank and no fallback field
-            # existed.  Retry with json_mode=True to force structured output.
-            _retry_msg = "model returned empty content on first attempt; retrying with json_mode=True"
-            log.warning(_retry_msg)
-            print(f"[DEBUG] {_retry_msg}", flush=True)
+        # ── Empty response: retry with json_mode ──
+        if not raw:
+            log.warning("empty content; retrying with json_mode=True")
             try:
                 raw = self.client.chat(messages, json_mode=True)
-                _debug_retry = f"[DEBUG] json_mode retry returned {len(raw)} chars: {raw[:300]!r}"
-                log.warning(_debug_retry)
-                print(_debug_retry, flush=True)
             except AiError as exc:
                 return {
                     "thoughts": "Ollama is unreachable (json_mode retry).",
                     "speak": f"I can't reach Ollama right now: {exc}.",
                     "tools": [],
                 }
-            try:
-                parsed = _extract_json(raw)
-            except Exception:
-                return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
 
-        parsed.setdefault("thoughts", "")
-        parsed.setdefault("speak", "")
-        parsed.setdefault("tools", [])
-        return parsed
+        # ── Parse: JSON → semi-structured → plain text ──
+        parsed = _parse_model_response(raw)
+        if parsed is not None:
+            parsed.setdefault("thoughts", "")
+            parsed.setdefault("speak", "")
+            parsed.setdefault("tools", [])
+            return parsed
+
+        # Nothing parseable at all — treat as plain text.
+        return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
 
     def _execute_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Run every tool call and return a list of results."""
         results = []
         for call in tool_calls:
             name = call.get("name")
-            args = dict(call.get("arguments", {}))
+            raw_args = call.get("arguments", {})
+            # Defensive: arguments may be None, a string, or non-dict from the model.
+            if isinstance(raw_args, dict):
+                args = dict(raw_args)
+            elif isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args)
+                    if not isinstance(args, dict):
+                        args = {}
+                except (json.JSONDecodeError, ValueError):
+                    args = {}
+            else:
+                args = {}
             if not name:
                 results.append({"tool": "?", "result": {"error": "missing tool name"}})
                 continue
