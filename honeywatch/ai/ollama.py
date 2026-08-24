@@ -7,12 +7,15 @@ classify SSH fingerprints as honeypot-likely.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
 from typing import Any
 
 __all__ = ["AiError", "OllamaClient"]
+
+log = logging.getLogger(__name__)
 
 _DEFAULT_BASE = "https://ollama.com/v1"
 _DEFAULT_MODEL = "llama3.1:8b"
@@ -95,8 +98,16 @@ class OllamaClient:
         messages: list[dict[str, Any]],
         json_mode: bool = False,
         temperature: float | None = None,
-    ) -> str:
-        """POST ``/chat/completions`` and return the assistant text (stripped)."""
+        *,
+        return_raw: bool = False,
+    ) -> str | dict[str, Any]:
+        """POST ``/chat/completions`` and return the assistant text (stripped).
+
+        When *return_raw* is True, returns the full message dict from the first
+        choice (including ``reasoning_content``, ``thinking``, etc.) instead of
+        just the content string.  This lets callers inspect alternate fields
+        that reasoning models may populate instead of ``content``.
+        """
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -125,14 +136,84 @@ class OllamaClient:
             raise AiError(f"Ollama returned non-JSON response: {err}") from err
 
         try:
-            content = data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as err:
             raise AiError(
                 f"Unexpected Ollama response shape: {str(data)[:500]}"
             ) from err
+
+        if return_raw:
+            return message
+
+        # Reasoning models (e.g. glm, deepseek-r1) may put their output in
+        # ``reasoning_content`` or ``thinking`` instead of (or in addition to)
+        # ``content``.  Fall back through these fields so the agent loop
+        # actually receives the model's response instead of a silent empty
+        # string that causes an immediate "exhausted" exit.
+        content = message.get("content") or ""
+        if not content.strip():
+            # Try alternate fields where reasoning models stash their output.
+            for alt_key in ("reasoning_content", "thinking"):
+                alt = message.get(alt_key)
+                if alt and isinstance(alt, str) and alt.strip():
+                    log.debug(
+                        "message.content empty; falling back to %s (%d chars)",
+                        alt_key, len(alt),
+                    )
+                    content = alt
+                    break
+
+        if not content.strip():
+            log.warning(
+                "Ollama response message had no usable text content: %s",
+                str(message)[:300],
+            )
+
         return str(content).strip()
 
     # ------------------------------------------------------------ discovery
+    # --------------------------------------------------------- diagnostics
+    def raw_chat(
+        self,
+        messages: list[dict[str, Any]],
+        json_mode: bool = False,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        """POST ``/chat/completions`` and return the **full** parsed response.
+
+        Unlike :meth:`chat` which extracts and returns only the content string,
+        this method returns the entire JSON response dict so you can inspect
+        ``reasoning_content``, ``thinking``, usage stats, and any other fields
+        the model might include.  Useful for debugging why a model returns an
+        empty ``content`` field.
+        """
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature if temperature is None else temperature,
+            "stream": False,
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+
+        payload = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=payload,
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(_read_capped(resp))
+        except urllib.error.HTTPError as err:
+            snippet = err.read().decode("utf-8", errors="replace")[:500]
+            raise AiError(f"Ollama HTTP {err.code}: {snippet}") from err
+        except OSError as err:
+            raise AiError(_UNREACHABLE_MSG.format(base=self.base_url)) from err
+        except ValueError as err:
+            raise AiError(f"Ollama returned non-JSON response: {err}") from err
+
     def is_reachable(self) -> bool:
         """True when GET ``/models`` returns any 2xx status.
 

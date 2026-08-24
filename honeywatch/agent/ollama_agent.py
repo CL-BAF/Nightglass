@@ -9,11 +9,14 @@ knows what actions it can take.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 import time
 import uuid
 from typing import Any, Callable
+
+log = logging.getLogger(__name__)
 
 from honeywatch.agent.setup import AgentConfig, SetupStore
 from honeywatch.agent.tools import TOOL_REGISTRY, ToolContext, execute_tool
@@ -248,7 +251,15 @@ class ChatAgent:
         self.on_say(text)
 
     def _ollama_chat(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        """Send messages to Ollama and parse the tool JSON."""
+        """Send messages to Ollama and parse the tool JSON.
+
+        First attempt: plain chat, extract JSON from the response text.
+        If extraction fails and the model is a reasoning model that returned
+        its output in an alternate field, the OllamaClient.chat() fallback
+        logic already surfaces it.  If that *still* yields nothing usable,
+        retry with json_mode=True to force the API to enforce structured
+        output — some models obey the JSON contract only when told to.
+        """
         try:
             raw = self.client.chat(messages, json_mode=False)
         except AiError as exc:
@@ -259,9 +270,30 @@ class ChatAgent:
             }
         try:
             parsed = _extract_json(raw)
-        except Exception as exc:
-            # The model did not follow the JSON contract; treat raw text as speak.
-            return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
+        except Exception:
+            # First attempt failed to parse JSON.  Before giving up, try
+            # json_mode=True — some cloud models only emit valid JSON when
+            # response_format is set.
+            if raw.strip():
+                # The model returned text that isn't JSON.  Treat as speak.
+                return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
+            # raw is empty — content field was blank and no fallback field
+            # existed.  Retry with json_mode=True to force structured output.
+            log.warning(
+                "model returned empty content on first attempt; retrying with json_mode=True"
+            )
+            try:
+                raw = self.client.chat(messages, json_mode=True)
+            except AiError as exc:
+                return {
+                    "thoughts": "Ollama is unreachable (json_mode retry).",
+                    "speak": f"I can't reach Ollama right now: {exc}.",
+                    "tools": [],
+                }
+            try:
+                parsed = _extract_json(raw)
+            except Exception:
+                return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
 
         parsed.setdefault("thoughts", "")
         parsed.setdefault("speak", "")
