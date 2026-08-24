@@ -1,0 +1,94 @@
+site_name: honeywatch
+site_description: Planet-scale SSH honeypot scanner with AI confidence scoring
+site_url: https://github.com/honeywatch/honeywatch
+repo_url: https://github.com/honeywatch/honeywatch
+edit_uri: ""
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - toc:
+      permalink: true
+  - attr_list
+  - def_list
+  - footnotes
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: installation.md
+      - Quickstart: quickstart.md
+      - Configuration: configuration.md
+  - User Guide:
+      - CLI Reference: cli.md
+      - Architecture: architecture.md
+      - Pipeline: pipeline.md
+      - Fingerprinting: fingerprinting.md
+      - Heuristic Signals: heuristic-signals.md
+      - AI Integration: ai-integration.md
+      - Storage: storage.md
+      - Reports: reports.md
+      - VPN Gate: vpn.md
+      - Scanners: scanners.md
+  - Red-Team Operations:
+      - Payloads: payloads.md
+      - C2 Controller: c2.md
+      - Operations & Targeting: ops.md
+      - AI Agent & Chat: agent.md
+  - API Reference:
+      - Overview: api/index.md
+      - Models: api/models.md
+      - Config: api/config.md
+      - Pipeline: api/pipeline.md
+      - Fingerprint: api/fingerprint.md
+      - AI: api/ai.md
+      - Store: api/store.md
+      - Report: api/report.md
+      - VPN: api/vpn.md
+      - Scanners: api/scanners.md
+      - Payloads: api/payloads.md
+      - C2: api/c2.md
+      - Ops: api/ops.md
+      - Agent: api/agent.md
+      - CLI: api/cli.md
+  - Development:
+      - Testing: development/testing.md
+      - Contributing: development/contributing.md
+  - Security & Legal: security.md

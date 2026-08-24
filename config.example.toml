@@ -1,0 +1,147 @@
+# honeywatch configuration — example / reference.
+#
+# Copy this file to ./config.toml (or anywhere and set HONEYWATCH_CONFIG to its
+# path). Every key below exactly matches the defaults returned by
+# honeywatch.config.load_config() when no TOML is present, so a missing key is
+# never an error — you only need to override what you want to change.
+#
+# Env overrides that take precedence over this file:
+#   HONEYWATCH_CONFIG  path to a TOML config file
+#   OLLAMA_API_KEY     API key for Ollama Cloud (https://ollama.com/v1)
+#   HONEYWATCH_MODEL   override ai.model
+#   HONEYWATCH_AI_BASE override ai.base_url
+
+# --------------------------------------------------------------------------
+# Scanners — external network discovery tools (both are Linux-only; see README)
+# --------------------------------------------------------------------------
+[scanners]
+
+  [scanners.masscan]
+  bin = "masscan"   # path/name of the masscan executable
+  rate = 1000       # packets per second; conservative default — raise only on
+                    # networks you own and only with authorization
+  wait_s = 3        # seconds masscan waits for late SYN-ACK replies after
+                    # sending (--wait). 0 drops late replies and under-counts
+                    # open hosts; a small positive value improves discovery
+                    # completeness. Raise for lossy links.
+  # Subprocess bound in seconds. Default is null = no timeout (so planet-scale
+  # sweeps can run as long as they need); set a value for bounded scans so a
+  # hung run cannot block forever. Uncomment to enable:
+  # timeout_s = 600
+  # CIDRs to skip via `--exclude`. Default is none; on a 0.0.0.0/0 sweep you
+  # should exclude RFC1918 + your own egress IP so you never probe private or
+  # self ranges. Uncomment to enable:
+  # exclude = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]
+
+  [scanners.zmap]
+  bin = "zmap"      # path/name of the zmap executable
+  # Per-port subprocess timeout in seconds (default: null = no timeout).
+  # timeout_s = 600
+
+  [scanners.nmap]
+  bin = "nmap"      # path/name of the nmap executable (optional single-host probe)
+
+# --------------------------------------------------------------------------
+# Scan — result filtering applied after probing
+# --------------------------------------------------------------------------
+[scan]
+only_ssh = true  # drop every host that did not speak SSH (unreachable, refused,
+                 # or a non-SSH service). Set false with --all-hosts for debug.
+
+# --------------------------------------------------------------------------
+# Probing — how deep and how fast we fingerprint each open port 22
+# --------------------------------------------------------------------------
+[probe]
+concurrency = 512  # maximum simultaneous async probes (asyncio.Semaphore)
+timeout_s = 6.0    # per-connection timeout in seconds
+level = "fast"     # "fast" = banner + RFC 4253 KEXINIT + connect/banner timing;
+                   # "full" = above + host-key type & SHA-256 (requires paramiko)
+auth_probe = false # opt-in single bogus SSH auth attempt; logs only the
+                   # server's reply (e.g. "no supported authentication methods")
+                   # — no credentials are ever sent
+progress = false   # print a live heartbeat (every 1000 probes) during long
+                   # scans; useful for 0.0.0.0/0 sweeps that run for hours
+
+# --------------------------------------------------------------------------
+# AI — Ollama-backed confidence verdicts
+# --------------------------------------------------------------------------
+[ai]
+enabled = true              # run the LLM verdict stage at all; false skips it
+# Cloud models only. A valid Ollama Cloud API key is REQUIRED (see api_key_env).
+model = "llama3.1:8b"       # model tag on Ollama Cloud, e.g. llama3.1:8b, gpt-oss:20b
+base_url = "https://ollama.com/v1"  # Ollama Cloud OpenAI-compatible endpoint
+                                    # (no local server fallback)
+api_key_env = "OLLAMA_API_KEY"  # env var holding the API key; create one at
+                                # https://ollama.com/settings/keys
+batch_profiles = true       # group hosts by identical fingerprint profile and
+                            # submit ONE LLM query per unique profile
+temperature = 0.0           # sampling temperature; 0.0 = deterministic verdicts
+timeout_s = 120             # LLM request timeout in seconds
+batch_size = 100            # max profiles per chat call; keeps the prompt inside
+                            # the model context window on planet-scale scans with
+                            # thousands of distinct profiles (one chunk = one call)
+retries = 3                 # transient-failure retries per LLM call with
+                            # exponential backoff (doubles each attempt)
+retry_base_delay = 1.0      # seconds; backoff = retry_base_delay * 2**attempt
+
+# --------------------------------------------------------------------------
+# Storage & reports
+# --------------------------------------------------------------------------
+[storage]
+db = "honeywatch.db"     # SQLite database file, created on first use
+reports_dir = "reports"  # directory for JSON / CSV / Markdown report output
+
+# --------------------------------------------------------------------------
+# VPN — network subcommands refuse to start unless Mullvad is connected
+# --------------------------------------------------------------------------
+[vpn]
+required = true   # enforce the Mullvad gate on `honeywatch scan` and
+                  # `honeywatch probe`; set false only for controlled testing
+provider = "mullvad"  # the tunnel this tool requires
+timeout_s = 8.0       # timeout for the Mullvad connectivity check
+
+# --------------------------------------------------------------------------
+# Red-team payloads — miners, exploit frameworks, and evasion tooling
+# --------------------------------------------------------------------------
+[payloads]
+enabled = true
+allowed_categories = ["miner", "exploit", "evasion"]
+default_evasion = ["upx", "symbol_strip"]
+exec_mode = "dry_run"  # dry_run | local_simulate | ssh
+# Artifact integrity. Payload install scripts fetch binaries over the network
+# and execute them. Point integrity_file at a TOML manifest mapping a payload
+# id to the pinned sha256 of its release tarball, e.g.:
+#   xmrig = "<sha256 of the pinned v6.22.0 linux-x64 tarball>"
+#   upx   = "<sha256 of the pinned v4.2.4 linux-amd64 tarball>"
+# The rendered script then runs `sha256sum -c` against the download and aborts
+# on mismatch. With require_integrity = true, a payload with no pinned hash is
+# refused outright (closes the blind curl|tar|exec gap). Without a hash the
+# script prints a loud UNVERIFIED warning but proceeds.
+# integrity_file = "payloads/integrity.toml"
+require_integrity = false
+
+# --------------------------------------------------------------------------
+# C2 / web control plane — nginx + TLS + WebSocket dashboard
+# --------------------------------------------------------------------------
+[c2]
+enabled = false
+host = "0.0.0.0"
+port = 8443
+# tls_cert = "certs/honeywatch.crt"
+# tls_key = "certs/honeywatch.key"
+# api_token = "shared-secret"  # when set, every API + WebSocket request must
+                                # carry this bearer token (Authorization: Bearer
+                                # <token> header or ?token=<token> query). Workers
+                                # must be started with the matching --api-token.
+# db = "honeywatch.db"  # defaults to storage.db when null
+
+# --------------------------------------------------------------------------
+# Controller-to-worker plane
+# --------------------------------------------------------------------------
+[workers]
+controller_url = "http://127.0.0.1:8443"
+categories = ["miner", "exploit", "evasion"]
+poll_interval = 5.0
+exec_mode = "dry_run"
+ssh_user = "root"
+# ssh_key = "/path/to/id_rsa"

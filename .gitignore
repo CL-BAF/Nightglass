@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+
+# honeywatch runtime artifacts
+honeywatch.db
+reports/
+
+# Environment & secrets
+.env
+
+# Tests
+.pytest_cache/
+tests/.pytest_cache
+
+# Build / packaging
+dist/
+*.egg-info
+
+# C2 TLS certs (generated, never commit)
+certs/
+
+# SQLite WAL sidecars from WAL-mode stores
+*.db-wal
+*.db-shm
+
+# Local agent / harness state
+.claude/
+

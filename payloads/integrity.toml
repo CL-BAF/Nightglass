@@ -1,0 +1,18 @@
+# honeywatch payload integrity manifest.
+#
+# Map a payload id to the sha256 of the release tarball the install script
+# fetches. The rendered install script runs `sha256sum -c` against the
+# download and aborts on mismatch, closing the blind `curl | tar | exec` gap.
+#
+# Fill these with the real sha256s of the pinned releases you trust (compute
+# with `sha256sum <tarball>`). Until you do, the install scripts print a loud
+# UNVERIFIED warning; with --require-integrity / payloads.require_integrity
+# a missing hash aborts the deployment.
+#
+# Example:
+#   xmrig = "abcdef0123456789...                   "   # pinned v6.22.0 linux-x64
+#   upx   = "fedcba9876543210...                   "   # pinned v4.2.4 linux-amd64
+
+# xmrig   = ""
+# xmrigcc = ""
+# upx     = ""

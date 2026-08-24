@@ -1,0 +1,34 @@
+# honeywatch — dependency manifest.
+#
+# Runtime is Python 3.10+ and is STDLIB ONLY (asyncio, sqlite3, tomllib,
+# urllib.request, subprocess, argparse, hashlib, json, xml.etree).
+# There are NO hard third-party dependencies: `pip install -e .` pulls nothing.
+#
+# All optional packages below are commented out and listed for reference.
+# Uncomment the line(s) you need, then `pip install -r requirements.txt`.
+
+# ---------------------------------------------------------------------------
+# paramiko >= 3.0  (OPTIONAL)
+# Enables full-depth probing: `honeywatch probe --probe-level full` (host-key).
+# Adds real RFC 4253 key exchange so the scanner can capture the server's host
+# key type and SHA-256 fingerprint for host-key-algorithm / reuse detection.
+# Without paramiko, `full` silently degrades to `fast`.
+#   install:  pip install paramiko
+# ---------------------------------------------------------------------------
+# paramiko>=3.0
+
+# ---------------------------------------------------------------------------
+# aiohttp >= 3.8  (OPTIONAL — C2 web plane)
+# Provides the HTTP + WebSocket dashboard controller. Only needed for
+# `honeywatch c2` and the worker WebSocket transport.
+#   install:  pip install aiohttp websockets
+# ---------------------------------------------------------------------------
+# aiohttp>=3.8
+# websockets>=12.0
+
+# ---------------------------------------------------------------------------
+# pytest >= 7.0  (DEV ONLY)
+# Used by the test suite under tests/. Not installed, needed for production.
+#   install:  pip install pytest
+# ---------------------------------------------------------------------------
+# pytest>=7.0
