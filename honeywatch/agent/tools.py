@@ -41,10 +41,15 @@ class ToolContext:
         db_path: str = "honeywatch.db",
         agent_config: AgentConfig | None = None,
         skip_vpn_check: bool = False,
+        on_config_change: Callable[[], None] | None = None,
     ):
         self.db_path = db_path
         self.agent_config = agent_config or AgentConfig()
         self.skip_vpn_check = skip_vpn_check
+        # Invoked after a tool mutates agent_config in place (e.g. set_ollama),
+        # so the owning agent can rebuild its live OllamaClient. Without this,
+        # a config change only takes effect on the next process restart.
+        self.on_config_change = on_config_change
         self._store: Store | None = None
         self._c2_store: C2Store | None = None
 
@@ -541,21 +546,24 @@ def _tool_deploy(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if target_file:
         from honeywatch.cli import parse_host
 
-        with open(target_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                ip, port = parse_host(line)
-                targets.append(
-                    Target(
-                        ip=ip,
-                        port=port,
-                        allowed_categories=[],
-                        ssh_user=args.get("ssh_user", ctx.agent_config.ssh_user),
-                        ssh_key=args.get("ssh_key"),
+        try:
+            with open(target_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    ip, port = parse_host(line)
+                    targets.append(
+                        Target(
+                            ip=ip,
+                            port=port,
+                            allowed_categories=[],
+                            ssh_user=args.get("ssh_user", ctx.agent_config.ssh_user),
+                            ssh_key=args.get("ssh_key"),
+                        )
                     )
-                )
+        except OSError as exc:
+            return {"error": f"cannot read target_file {target_file!r}: {exc}"}
     else:
         label = args.get("target_label")
         labels = {label} if label else {"real", "likely_real"}
@@ -680,6 +688,13 @@ def _tool_set_ollama(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if "model" in args:
         cfg.ollama_model = args["model"]
     SetupStore(ctx.db_path).save_config(cfg)
+    # Rebuild the owning agent's live client so the new endpoint/model/key
+    # take effect immediately instead of requiring a restart.
+    if ctx.on_config_change is not None:
+        try:
+            ctx.on_config_change()
+        except Exception:
+            pass
     return {
         "ok": True,
         "base_url": cfg.ollama_base_url,
@@ -925,6 +940,20 @@ def execute_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> dict[str,
     """Execute a tool by name and return its result."""
     if name not in TOOL_REGISTRY:
         return {"error": f"unknown tool: {name!r}"}
+    # Validate required args up front so an omitted required argument produces a
+    # clear, actionable error instead of a cryptic downstream traceback string.
+    spec = TOOL_REGISTRY[name]["spec"]
+    required = spec.get("parameters", {}).get("required", []) or []
+    if required:
+        args = args or {}
+        missing = [r for r in required if r not in args or args.get(r) is None]
+        if missing:
+            return {
+                "error": (
+                    f"tool {name!r} missing required argument(s): "
+                    f"{', '.join(missing)}"
+                )
+            }
     try:
         return TOOL_REGISTRY[name]["func"](args, ctx)
     except Exception as exc:

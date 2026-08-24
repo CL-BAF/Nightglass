@@ -486,9 +486,19 @@ def test_cli_stats_json(tmp_path, capsys):
 
 def test_cli_probe_json_flag_exists():
     parser = cli.build_parser()
-    # probe --help must list the --json flag.
+    # Actually parse the flag instead of just triggering --help (which raises
+    # SystemExit regardless of whether --json exists).
+    args = parser.parse_args(["probe", "192.0.2.1", "--json"])
+    assert args.json is True
+    # And the flag should be advertised in the help text.
+    import io
+    import contextlib
+
+    buf = io.StringIO()
     with pytest.raises(SystemExit):
-        parser.parse_args(["probe", "--help"])
+        with contextlib.redirect_stdout(buf):
+            parser.parse_args(["probe", "--help"])
+    assert "--json" in buf.getvalue()
 
 
 def test_cli_scan_has_resume_and_progress_flags():

@@ -57,28 +57,35 @@ def generate_self_signed(
     key_path = os.path.abspath(key_path)
     os.makedirs(os.path.dirname(cert_path) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(key_path) or ".", exist_ok=True)
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-nodes",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            key_path,
-            "-out",
-            cert_path,
-            "-days",
-            str(days),
-            "-subj",
-            f"/CN={hostname}",
-            "-addext",
-            f"subjectAltName=DNS:{hostname},DNS:localhost,IP:127.0.0.1",
-        ],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-nodes",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key_path,
+                "-out",
+                cert_path,
+                "-days",
+                str(days),
+                "-subj",
+                f"/CN={hostname}",
+                "-addext",
+                f"subjectAltName=DNS:{hostname},DNS:localhost,IP:127.0.0.1",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        # openssl binary not on PATH -- raise a clear error instead of a bare
+        # FileNotFoundError so the operator knows what to install.
+        raise RuntimeError(
+            "openssl not found on PATH; install openssl to generate a self-signed cert"
+        ) from exc
 
 
 def render_nginx_config(
@@ -122,11 +129,22 @@ def ensure_self_signed_pair(base_dir: str = "certs", hostname: str = "honeywatch
 
 
 def build_ssl_context(cert_path: str | None, key_path: str | None) -> ssl.SSLContext | None:
-    """Build an SSL context for the aiohttp controller."""
+    """Build an SSL context for the aiohttp controller.
+
+    Returns ``None`` (-> controller serves plaintext) only when TLS paths were
+    not requested at all. When a cert/key path *was* provided but the file is
+    missing or unreadable, we raise rather than silently downgrading to HTTP --
+    otherwise a typo'd path would expose the C2 dashboard over plaintext on a
+    public bind with no warning.
+    """
     if not cert_path or not key_path:
         return None
     if not os.path.isfile(cert_path) or not os.path.isfile(key_path):
-        return None
+        raise FileNotFoundError(
+            f"TLS cert/key not found (cert={cert_path!r}, key={key_path!r}). "
+            "Fix the paths, regenerate with --generate-certs, or run without "
+            "--tls-cert/--tls-key for plaintext lab use."
+        )
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(cert_path, key_path)
     return ctx

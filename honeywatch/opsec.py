@@ -40,6 +40,7 @@ cracker/sprayer can render results without try/except ladders.
 
 from __future__ import annotations
 
+import os
 import random
 import shlex
 import subprocess
@@ -204,6 +205,8 @@ def auth_methods(
     cannot accept them.
     """
     res = AuthMethods(ip=ip, port=port, user=user)
+    sock = None
+    t = None
     try:
         import paramiko  # type: ignore[import-not-found]
         import socket as _socket
@@ -235,10 +238,19 @@ def auth_methods(
     except Exception as exc:
         res.error = f"{type(exc).__name__}: {exc}"
     finally:
-        try:
-            t.close()
-        except Exception:
-            pass
+        # Close the transport first (it owns the socket once handed off); if the
+        # Transport was never constructed, close the raw socket ourselves so a
+        # failed handshake does not leak a file descriptor per probed host.
+        if t is not None:
+            try:
+                t.close()
+            except Exception:
+                pass
+        elif sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
     return res
 
 
@@ -311,12 +323,21 @@ def attempt_sshpass(
     if jump:
         argv += ["-o", f"ProxyJump={jump}"]
     if proxy:
-        argv += ["-o", f"ProxyCommand=nc -X 5 -x {proxy[len('socks5://'):] if proxy.startswith('socks5://') else proxy} %h %p"]
+        # ProxyCommand is executed by ssh through the user's shell, so the proxy
+        # spec must be shell-quoted -- an unquoted operator-supplied proxy string
+        # containing shell metacharacters would otherwise run arbitrary commands.
+        proxy_host = (
+            proxy[len("socks5://"):] if proxy.startswith("socks5://") else proxy
+        )
+        argv += [
+            "-o",
+            f"ProxyCommand=nc -X 5 -x {shlex.quote(proxy_host)} %h %p",
+        ]
     argv += [f"{user}@{ip}", "exit"]
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_s * 2 + 5,
-            env={**__import__("os").environ, **env},
+            env={**os.environ, **env},
         )
     except FileNotFoundError as exc:
         attempt.error = f"backend missing: {exc.filename or exc}"

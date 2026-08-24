@@ -225,7 +225,10 @@ def test_worker_polling_backoff_grows_on_controller_error(monkeypatch):
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
+            # Expected: we just called task.cancel() while it was mid-sleep.
+            # Any *other* exception (e.g. a real crash inside _run_polling) must
+            # propagate rather than be swallowed here.
             pass
 
     asyncio.run(run_a_bit())

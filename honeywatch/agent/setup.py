@@ -108,27 +108,82 @@ class SetupStore:
             self._close(conn)
         return row[0] if row else default
 
+    def get_many(self, keys: list[str]) -> dict[str, str]:
+        """Read several keys through one connection instead of one per key."""
+        if not keys:
+            return {}
+        placeholders = ",".join("?" for _ in keys)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT key, value FROM agent_setup WHERE key IN ({placeholders})",
+                tuple(keys),
+            ).fetchall()
+        finally:
+            self._close(conn)
+        found = {k: v for k, v in rows}
+        return {k: found.get(k, "") for k in keys}
+
+    def set_many(self, items: dict[str, str]) -> None:
+        """Write several key/value pairs in a single transaction.
+
+        Used by :meth:`save_config` so persisting a full AgentConfig is one
+        connection + one commit instead of ~11 sequential opens.
+        """
+        if not items:
+            return
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        try:
+            with conn:
+                conn.executemany(
+                    """
+                    INSERT INTO agent_setup (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    [(k, v, now) for k, v in items.items()],
+                )
+        finally:
+            self._close(conn)
+
     def load_config(self) -> AgentConfig:
         """Load a full AgentConfig from stored values."""
-        raw = {
-            "ollama_api_key": self.get("ollama_api_key"),
-            "ollama_base_url": self.get("ollama_base_url", "https://ollama.com/v1"),
-            "ollama_model": self.get("ollama_model", "llama3.1:8b"),
-            "pool": self.get("pool"),
-            "wallet": self.get("wallet"),
-            "pass": self.get("pass", "x"),
-            "worker": self.get("worker", "honeywatch"),
-            "tls": self.get("tls", "false").lower() in ("1", "true", "yes"),
-            "controller_url": self.get("controller_url", "http://127.0.0.1:8443"),
-            "exec_mode": self.get("exec_mode", "dry_run"),
-            "ssh_user": self.get("ssh_user", "root"),
+        raw = self.get_many([
+            "ollama_api_key",
+            "ollama_base_url",
+            "ollama_model",
+            "pool",
+            "wallet",
+            "pass",
+            "worker",
+            "tls",
+            "controller_url",
+            "exec_mode",
+            "ssh_user",
+        ])
+        defaults = {
+            "ollama_base_url": "https://ollama.com/v1",
+            "ollama_model": "llama3.1:8b",
+            "pass": "x",
+            "worker": "honeywatch",
+            "controller_url": "http://127.0.0.1:8443",
+            "exec_mode": "dry_run",
+            "ssh_user": "root",
         }
+        for k, d in defaults.items():
+            if not raw.get(k):
+                raw[k] = d
+        raw["tls"] = (raw.get("tls") or "false").lower() in ("1", "true", "yes")
         return AgentConfig.from_dict(raw)
 
     def save_config(self, cfg: AgentConfig) -> None:
         d = cfg.to_dict()
-        for key, value in d.items():
-            self.set(key, str(value))
+        self.set_many({key: str(value) for key, value in d.items()})
 
 
 def _prompt(
@@ -143,10 +198,21 @@ def _prompt(
     else:
         prompt = f"{text}: "
     while True:
-        if password:
-            value = getpass.getpass(prompt)
-        else:
-            value = input(prompt)
+        try:
+            if password:
+                value = getpass.getpass(prompt)
+            else:
+                value = input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            # stdin closed (piped / no TTY) or Ctrl-C. Fall back to the default
+            # when one exists; otherwise bail with a clear message instead of
+            # letting the raw EOFError/K KeyboardInterrupt traceback escape.
+            if allow_empty or default:
+                return default or ""
+            raise SystemExit(
+                "honeywatch setup: input interrupted with no default available; "
+                "run non-interactively via non_interactive=... when unattended"
+            )
         value = value.strip()
         if value:
             return value

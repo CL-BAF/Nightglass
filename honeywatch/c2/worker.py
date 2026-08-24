@@ -30,10 +30,14 @@ from honeywatch.models import Target, WorkerTask
 # Optional WebSocket transport.
 try:
     import websockets
+    from websockets.exceptions import ConnectionClosed
 
     HAS_WEBSOCKETS = True
 except Exception:  # pragma: no cover - optional dependency
     websockets = None  # type: ignore[assignment]
+    # Empty tuple => `except ConnectionClosed` catches nothing when the
+    # dependency is absent (the WS path is guarded by HAS_WEBSOCKETS anyway).
+    ConnectionClosed = ()  # type: ignore[assignment]
     HAS_WEBSOCKETS = False
 
 
@@ -268,17 +272,23 @@ class Worker:
             try:
                 task = await asyncio.to_thread(self.claim_task)
                 if task is None:
-                    backoff = min(backoff * 1.5, max_backoff) if backoff > self.poll_interval else self.poll_interval
-                    await asyncio.sleep(self.poll_interval)
+                    # Idle: actually sleep the grown backoff (the previous code
+                    # computed backoff but always slept the base interval, so the
+                    # exponential idle cadence was dead code).
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 1.5, max_backoff)
                     continue
                 backoff = self.poll_interval  # reset after successful work
                 result = await asyncio.to_thread(self.execute_task, task)
-                success = result.get("returncode") == 0 and "error" not in result
+                # Default an absent returncode to 0 so a dry_run result (which
+                # carries no returncode, only stdout) is reported as success when
+                # it has no error -- otherwise every dry_run task is marked failed.
+                success = result.get("returncode", 0) == 0 and "error" not in result
                 await asyncio.to_thread(self.report_result, task.id, success, result)
             except WorkerError as exc:
                 print(f"honeywatch worker: controller error: {exc}", flush=True)
                 # Exponential backoff so a controller outage doesn't hammer it.
-                await asyncio.sleep(min(backoff, max_backoff))
+                await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
             except Exception as exc:
                 print(f"honeywatch worker: task error: {exc}", flush=True)
@@ -293,58 +303,93 @@ class Worker:
         if self.api_token:
             sep = "&" if "?" in uri else "?"
             uri = f"{uri}{sep}token={self.api_token}"
-        async with websockets.connect(uri) as ws:
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "register_worker",
-                        "worker_id": self.worker_id,
-                        "categories": self.categories,
-                    }
-                )
-            )
-            while not self._shutdown:
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=self.poll_interval)
-                    payload = json.loads(msg)
-                    if payload.get("type") == "task":
-                        task = _task_from_dict(payload["task"])
-                        result = await asyncio.to_thread(self.execute_task, task)
-                        success = result.get("returncode") == 0 and "error" not in result
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "task_result",
-                                    "task_id": task.id,
-                                    "success": success,
-                                    "result": result,
-                                }
-                            )
+        backoff = self.poll_interval
+        max_backoff = max(self.poll_interval * 12, 60.0)
+        # Outer reconnect loop: a dropped connection used to leave the worker
+        # spinning on a dead socket forever (recv kept raising into the broad
+        # `except Exception`, which slept and retried the same closed socket).
+        # Now a closed connection breaks the inner loop and we reconnect here
+        # with exponential backoff.
+        while not self._shutdown:
+            try:
+                async with websockets.connect(uri) as ws:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "register_worker",
+                                "worker_id": self.worker_id,
+                                "categories": self.categories,
+                            }
                         )
-                except asyncio.TimeoutError:
-                    # fall back to HTTP claim when no WS task is pushed
-                    try:
-                        task = await asyncio.to_thread(self.claim_task)
-                        if task is not None:
+                    )
+                    backoff = self.poll_interval  # connected -> reset backoff
+                    while not self._shutdown:
+                        try:
+                            msg = await asyncio.wait_for(
+                                ws.recv(), timeout=self.poll_interval
+                            )
+                        except asyncio.TimeoutError:
+                            # No WS task pushed -> fall back to an HTTP claim.
+                            try:
+                                task = await asyncio.to_thread(self.claim_task)
+                                if task is not None:
+                                    result = await asyncio.to_thread(
+                                        self.execute_task, task
+                                    )
+                                    success = (
+                                        result.get("returncode", 0) == 0
+                                        and "error" not in result
+                                    )
+                                    await ws.send(
+                                        json.dumps(
+                                            {
+                                                "type": "task_result",
+                                                "task_id": task.id,
+                                                "success": success,
+                                                "result": result,
+                                            }
+                                        )
+                                    )
+                            except Exception as exc:
+                                print(f"honeywatch worker: {exc}", flush=True)
+                            continue
+                        except ConnectionClosed:
+                            # Socket is gone -> break inner loop so the outer
+                            # loop reconnects instead of polling a dead socket.
+                            break
+                        payload = json.loads(msg)
+                        if payload.get("type") == "task":
+                            task = _task_from_dict(payload["task"])
                             result = await asyncio.to_thread(self.execute_task, task)
                             success = (
-                                result.get("returncode") == 0 and "error" not in result
+                                result.get("returncode", 0) == 0
+                                and "error" not in result
                             )
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "task_result",
-                                        "task_id": task.id,
-                                        "success": success,
-                                        "result": result,
-                                    }
+                            try:
+                                await ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "task_result",
+                                            "task_id": task.id,
+                                            "success": success,
+                                            "result": result,
+                                        }
+                                    )
                                 )
-                            )
-                    except Exception as exc:
-                        print(f"honeywatch worker: {exc}", flush=True)
-                except Exception as exc:
-                    print(f"honeywatch worker: websocket error: {exc}", flush=True)
-                    await asyncio.sleep(self.poll_interval)
+                            except ConnectionClosed:
+                                break
+            except Exception as exc:
+                if self._shutdown:
+                    break
+                print(
+                    f"honeywatch worker: websocket disconnected: {exc}; "
+                    f"reconnecting in {backoff}s",
+                    flush=True,
+                )
+            if self._shutdown:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
 
     def stop(self) -> None:
         self._shutdown = True

@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
+import threading
 from datetime import datetime, timezone
 
 from honeywatch.ai.scorer import profile_key
-from honeywatch.models import AiVerdict, Fingerprint, Score, Signals
+from honeywatch.models import AiVerdict, Fingerprint, Score, Signals, score_record
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS hosts (
@@ -84,27 +84,6 @@ CREATE TABLE IF NOT EXISTS credentials (
 """
 
 
-def _record(score: Score) -> dict:
-    """Plain-dict representation of a Score (safe for json.dumps)."""
-    fp = asdict(score.fingerprint) if score.fingerprint else None
-    sig = score.signals
-    ai = asdict(score.ai) if score.ai else None
-    return {
-        "ip": score.ip,
-        "port": score.port,
-        "final_label": score.final_label,
-        "final_confidence": score.final_confidence,
-        "fingerprint": fp,
-        "signals": {
-            "anomalies": list(sig.anomalies) if sig else [],
-            "flags": list(sig.flags) if sig else [],
-            "heuristic_score": sig.heuristic_score if sig else 0.0,
-            "evidence": dict(sig.evidence) if sig else {},
-        },
-        "ai": ai,
-    }
-
-
 class Store:
     """Persist Scores to a local SQLite database.
 
@@ -115,6 +94,13 @@ class Store:
     def __init__(self, db_path: str = "honeywatch.db"):
         self.db_path = db_path
         self._mem_conn: sqlite3.Connection | None = None
+        # A :memory: database lives on a single shared connection (each
+        # sqlite3.connect(":memory:") is an isolated empty database, so we must
+        # reuse one). That shared connection is accessed from whatever thread
+        # the caller is on, so it is opened with check_same_thread=False and
+        # guarded by this lock to serialise concurrent use. File-backed stores
+        # open a fresh connection per call instead, so they need no lock.
+        self._mem_lock = threading.RLock()
         self._initialized = False
         # Ensure the schema + pragmas exist up front.
         conn = self._connect()
@@ -123,10 +109,18 @@ class Store:
     def _connect(self) -> sqlite3.Connection:
         if self.db_path == ":memory:":
             # :memory: databases are per-connection; keep one shared connection
-            # so writes are visible to later reads.
-            if self._mem_conn is None:
-                self._mem_conn = sqlite3.connect(":memory:")
-                self._apply_schema(self._mem_conn)
+            # so writes are visible to later reads. The lock is released by the
+            # matching _close() in the caller's finally block.
+            self._mem_lock.acquire()
+            try:
+                if self._mem_conn is None:
+                    self._mem_conn = sqlite3.connect(
+                        ":memory:", check_same_thread=False
+                    )
+                    self._apply_schema(self._mem_conn)
+            except BaseException:
+                self._mem_lock.release()
+                raise
             return self._mem_conn
         conn = sqlite3.connect(self.db_path)
         if not self._initialized:
@@ -157,7 +151,11 @@ class Store:
         self._initialized = True
 
     def _close(self, conn: sqlite3.Connection) -> None:
-        if conn is not self._mem_conn:
+        if conn is self._mem_conn:
+            # Shared :memory: connection: keep it alive, just release the lock
+            # acquired in _connect() so other threads can proceed.
+            self._mem_lock.release()
+        else:
             conn.close()
 
     # ------------------------------------------------------------------ #
@@ -205,7 +203,7 @@ class Store:
             "ai_confidence": (ai.confidence if ai else 0.0),
             "final_confidence": score.final_confidence,
             "final_label": score.final_label,
-            "json": json.dumps(_record(score), default=str),
+            "json": json.dumps(score_record(score), default=str),
             "scanned_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -421,18 +419,22 @@ class Store:
                     "SELECT final_label, COUNT(*) FROM hosts GROUP BY final_label"
                 ).fetchall()
             )
-            flag_rows = conn.execute("SELECT flags FROM hosts").fetchall()
+            # Flags are stored as a comma-joined string in one column, so a
+            # pure-SQL count isn't possible without a normalized table. Stream
+            # the cursor row-by-row instead of fetchall()-ing every host's flags
+            # into a Python list first — on a 0.0.0.0/0 sweep that avoids holding
+            # millions of flag strings in memory at once.
+            flag_cursor = conn.execute("SELECT flags FROM hosts")
+            by_flag: dict[str, int] = {}
+            for (flags,) in flag_cursor:
+                if not flags:
+                    continue
+                for flag in flags.split(","):
+                    if flag:
+                        by_flag[flag] = by_flag.get(flag, 0) + 1
             known = conn.execute("SELECT COUNT(*) FROM known_keys").fetchone()[0]
         finally:
             self._close(conn)
-
-        by_flag: dict[str, int] = {}
-        for (flags,) in flag_rows:
-            if not flags:
-                continue
-            for flag in flags.split(","):
-                if flag:
-                    by_flag[flag] = by_flag.get(flag, 0) + 1
 
         return {
             "total": total,

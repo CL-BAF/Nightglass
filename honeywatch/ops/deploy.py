@@ -16,6 +16,7 @@ from honeywatch.payloads import get_payload, render_manifest_scripts
 from honeywatch.payloads.scripts import (
     generate_operation_id,
     unsafe_variable_reasons,
+    validate_variable_types,
     validate_variables,
 )
 
@@ -47,6 +48,12 @@ def build_manifest(
     if missing:
         raise ValueError(
             f"payload {payload_id!r} missing required variables: {', '.join(missing)}"
+        )
+    type_errors = validate_variable_types(payload, variables)
+    if type_errors:
+        raise ValueError(
+            f"payload {payload_id!r} has invalid variable values: "
+            + "; ".join(type_errors)
         )
     if not allow_unsafe_vars:
         unsafe = unsafe_variable_reasons(variables)
@@ -88,39 +95,57 @@ def build_manifest(
     scripts = render_manifest_scripts(manifest)
 
     if apply_evasion:
-        scripts = _wrap_with_evasion(payload, scripts, apply_evasion)
+        scripts = _wrap_with_evasion(payload, scripts, apply_evasion, variables)
 
     manifest.per_host_scripts = scripts
     return manifest
+
+
+# Where each known evasion payload sits in the install flow. ``prepend`` runs
+# before the main payload (anti-vm bails early on sandboxes); ``append`` runs
+# after install and operates on the installed artifacts (packers/strippers/
+# obfuscators); ``final`` runs last (anti-debug shim). Any id not listed here
+# defaults to ``append`` so a newly-added evasion payload is applied rather than
+# silently dropped.
+_EVASION_POSITION = {
+    "anti_vm": "prepend",
+    "upx": "append",
+    "packers": "append",
+    "symbol_strip": "append",
+    "obfuscators": "append",
+    "anti_debug": "final",
+}
 
 
 def _wrap_with_evasion(
     payload: Payload,
     scripts: dict[str, str],
     evasion_ids: list[str],
+    variables: dict[str, Any],
 ) -> dict[str, str]:
     """Prepend evasion checks and append stripping/packing to each host script."""
     evasion_payloads = [get_payload(eid) for eid in evasion_ids]
     wrapped: dict[str, str] = {}
     for ip, script in scripts.items():
         parts: list[str] = []
-        # Anti-VM first so the rest of the script bails early on sandboxes.
+        # prepend: anti-vm first so the rest of the script bails early on sandboxes.
         for ev in evasion_payloads:
-            if ev.id == "anti_vm":
+            if _EVASION_POSITION.get(ev.id, "append") == "prepend":
                 parts.append(ev.install_script)
                 if ev.run_script:
                     parts.append(ev.run_script)
         # Main payload install.
         parts.append(script)
-        # Packing / stripping after install, operating on installed artifacts.
+        # append: packers / strippers / obfuscators after install, operating on
+        # the installed artifacts.
         for ev in evasion_payloads:
-            if ev.id in {"upx", "packers", "symbol_strip"}:
-                rendered = _render_evasion_for_payload(ev, payload)
+            if _EVASION_POSITION.get(ev.id, "append") == "append":
+                rendered = _render_evasion_for_payload(ev, payload, variables)
                 if rendered:
                     parts.append(rendered)
-        # Anti-debug shim at the end so operators can prepend LD_PRELOAD when running.
+        # final: anti-debug shim last so operators can prepend LD_PRELOAD when running.
         for ev in evasion_payloads:
-            if ev.id == "anti_debug":
+            if _EVASION_POSITION.get(ev.id, "append") == "final":
                 parts.append(ev.install_script)
                 if ev.run_script:
                     parts.append(ev.run_script)
@@ -128,23 +153,35 @@ def _wrap_with_evasion(
     return wrapped
 
 
-def _render_evasion_for_payload(ev: Payload, payload: Payload) -> str:
-    """Render an evasion payload against the main payload's artifacts."""
+def _render_evasion_for_payload(
+    ev: Payload, payload: Payload, variables: dict[str, Any]
+) -> str:
+    """Render an evasion payload against the main payload's installed artifacts.
+
+    The evasion script's ``{{install_dir}}`` resolves to the evasion payload's
+    own install dir (not the main payload's); ``{{input_file}}`` resolves to the
+    main payload's installed primary artifact. Rendering goes through the same
+    template engine as the main scripts so ``{{args|default(...)}}`` and other
+    defaulted placeholders resolve consistently instead of being left literal.
+    """
     if not payload.artifacts:
         return ""
-    target_file = f"/opt/honeywatch/{payload.id}/{payload.artifacts[0]}"
-    variables = {
-        "input_file": target_file,
-        "output_file": f"{target_file}.packed",
-        "install_dir": f"/opt/honeywatch/{ev.id}",
-    }
+    main_install_dir = variables.get("install_dir") or f"/opt/honeywatch/{payload.id}"
+    target_file = f"{main_install_dir}/{payload.artifacts[0]}"
+    ev_install_dir = (
+        variables.get(f"{ev.id}_install_dir") or f"/opt/honeywatch/{ev.id}"
+    )
+    render_vars = dict(variables)
+    render_vars["input_file"] = target_file
+    render_vars["output_file"] = f"{target_file}.packed"
+    render_vars["install_dir"] = ev_install_dir
+    render_vars.setdefault("payload_install_dir", main_install_dir)
     script = ev.install_script
     if ev.run_script:
         script += "\n" + ev.run_script
-    # Simple variable substitution for the evasion templates.
-    for key, value in variables.items():
-        script = script.replace(f"{{{{{key}}}}}", str(value))
-    return script
+    from honeywatch.payloads.scripts import _render_template
+
+    return _render_template(script, render_vars)
 
 
 def prepare_evasion_pipeline(evasion_spec: list[str] | str | None) -> list[str]:

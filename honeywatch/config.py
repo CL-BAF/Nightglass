@@ -20,6 +20,7 @@ they fall back to the defaults above.
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from typing import Any
 
@@ -272,13 +273,25 @@ def _resolve_config_path(path: str | None) -> str | None:
 
 
 def _load_toml(path: str) -> dict[str, Any]:
-    """Parse a TOML file, returning an empty dict if it cannot be read."""
+    """Parse a TOML file, returning an empty dict if it cannot be read.
+
+    A missing file is normal (the config file is optional) and stays silent.
+    A file that exists but cannot be parsed or read is a real operator error,
+    so we surface a stderr warning rather than silently falling back to an
+    empty config — otherwise a typo'd TOML looks identical to "no config".
+    """
     try:
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
-    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
-        data = {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"honeywatch: warning: failed to load config {path!r}: {exc!r}",
+              file=sys.stderr)
+        return {}
     if not isinstance(data, dict):
+        print(f"honeywatch: warning: config {path!r} top level is not a table; ignored",
+              file=sys.stderr)
         return {}
     return data
 
@@ -296,7 +309,9 @@ def _apply_env_overrides(data: dict[str, Any]) -> None:
         ai["base_url"] = base
 
     api_key_env = ai.get("api_key_env") or "OLLAMA_API_KEY"
-    ai["api_key"] = os.environ.get(api_key_env)
+    env_api_key = os.environ.get(api_key_env)
+    if env_api_key:
+        ai["api_key"] = env_api_key
 
 
 # ---------------------------------------------------------------------------

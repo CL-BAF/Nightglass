@@ -96,7 +96,7 @@ stats: dict = store.stats()
 - `query_scores` — same filter, then `json.loads(row["json"])` → `Score` (with dataclass hydration, skipped on `KeyError`/`TypeError` for schema evolution).
 - `stats()` — `COUNT(*)`, `GROUP BY final_label`, `GROUP BY flags` (split CSV), `COUNT(*) FROM known_keys`.
 
-Helper `_record(score) -> dict` builds the API dict for `query`.
+Helper `score_record(score) -> dict` (in `honeywatch.models`) builds the API dict stored in the `json` column and exported by the report writers — one canonical serializer shared by both layers.
 
 ### `known_key_set()`
 

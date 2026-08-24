@@ -28,22 +28,6 @@ def controller(tmp_path):
     return Controller(store, host="127.0.0.1", port=0)
 
 
-async def _run(controller, coro):
-    runner = controller.app.make_runner()
-    await runner.setup()
-    site = controller.app._make_mock()
-    # aiohttp test client is the simplest way.
-    from aiohttp.test_utils import TestServer, TestClient
-
-    server = TestServer(controller.app)
-    client = TestClient(server)
-    await client.start_server()
-    try:
-        return await coro(client)
-    finally:
-        await client.close()
-
-
 @pytest.mark.asyncio
 async def test_health_endpoint(controller):
     from aiohttp.test_utils import TestServer, TestClient

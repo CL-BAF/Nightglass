@@ -146,6 +146,31 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise ValueError("unbalanced JSON")
 
 
+_TRUTHY_STRINGS = {"1", "true", "yes", "y", "done", "ok", "okay"}
+
+
+def _signal_done(response: dict[str, Any]) -> bool:
+    """Return whether the model signalled DONE, coercing string values.
+
+    Models sometimes emit ``"done": "false"`` or ``"DONE": "True"`` as strings
+    rather than booleans. A naive ``bool(...)`` would treat any non-empty
+    string (including ``"false"``) as truthy and halt the run, so we parse the
+    string content explicitly.
+    """
+    for key in ("done", "DONE"):
+        if key not in response:
+            continue
+        val = response[key]
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            return val.strip().lower() in _TRUTHY_STRINGS
+        return bool(val)
+    return False
+
+
 class ChatAgent:
     """Conversational agent that plans and executes tools via Ollama.
 
@@ -185,6 +210,7 @@ class ChatAgent:
             db_path=db_path,
             agent_config=self.config,
             skip_vpn_check=skip_vpn_check,
+            on_config_change=self._reconfigure_client,
         )
         self.messages: list[dict[str, str]] = [
             {"role": "system",
@@ -201,6 +227,21 @@ class ChatAgent:
     def _default_say(text: str) -> None:
         """Default output handler — plain print."""
         print(text, flush=True)
+
+    def _reconfigure_client(self) -> None:
+        """Rebuild the live Ollama client after ``agent_config`` is mutated.
+
+        Tools like ``set_ollama`` change the config in place and persist it;
+        without rebuilding ``self.client`` the new base URL / model / API key
+        only take effect on the next process restart.
+        """
+        self.client = OllamaClient(
+            base_url=self.config.ollama_base_url,
+            api_key=self.config.ollama_api_key,
+            model=self.config.ollama_model,
+            timeout=120,
+            temperature=0.2,
+        )
 
     def _say(self, text: str) -> None:
         """Emit agent speech through the configured callback."""
@@ -259,6 +300,11 @@ class ChatAgent:
                 self.messages.append({"role": "assistant", "content": speak or thoughts})
                 return speak or thoughts
 
+            # Record the assistant turn before tool results so the model keeps
+            # its own prior reasoning/speech across multi-round tool use.
+            self.messages.append(
+                {"role": "assistant", "content": speak or thoughts}
+            )
             results = self._execute_tool_calls(tool_calls)
             # Append a compact result summary as the next user message.
             summary_lines = []
@@ -337,6 +383,9 @@ class ChatAgent:
         stop_reason = ""
         while max_cycles == 0 or cycle < max_cycles:
             # Opsec gate: off-business-hours -> sleep the cycle, do not act.
+            # The sleep still counts against max_cycles so a bounded run
+            # terminates (a `max_cycles=2, business_hours=True` run that starts
+            # off-hours stops after two waits instead of spinning forever).
             if business_hours and not within_business_hours():
                 cycle += 1
                 self._say(f"[cycle {cycle}] off-business-hours; sleeping")
@@ -357,7 +406,7 @@ class ChatAgent:
             thoughts = response.get("thoughts", "")
             speak = response.get("speak", "")
             tools = response.get("tools", [])
-            done = bool(response.get("done", False) or response.get("DONE", False))
+            done = _signal_done(response)
             if speak:
                 self._say(f"[cycle {cycle}] {speak}")
             if on_status:
@@ -369,6 +418,13 @@ class ChatAgent:
                                else "model signaled DONE") if done \
                     else "model emitted no tool calls and no DONE -- treating as exhausted"
                 break
+
+            # Record this cycle's assistant turn before the tool results so the
+            # model retains its own reasoning/speech across tool rounds.
+            self.messages.append({
+                "role": "assistant",
+                "content": speak or thoughts or json.dumps(response, default=str, ensure_ascii=False),
+            })
 
             # 3. execute the model's chosen tool calls.
             results = self._execute_tool_calls(tools)

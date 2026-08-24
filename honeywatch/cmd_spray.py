@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 
 
 def _cmd_spray(args, argv) -> int:
@@ -64,13 +65,17 @@ def _cmd_spray(args, argv) -> int:
             ip, port = parse_host(spec)
             hosts_pairs.append((ip, port))
     if args.target_file:
-        with open(args.target_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                ip, port = parse_host(line)
-                hosts_pairs.append((ip, port))
+        try:
+            with open(args.target_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    ip, port = parse_host(line)
+                    hosts_pairs.append((ip, port))
+        except OSError as exc:
+            print("spray: cannot read target file: " + str(exc), file=sys.stderr)
+            return 1
     if not hosts_pairs and (args.target_label or args.min_confidence is not None):
         rows = store.query(
             limit=args.limit or 1000,
@@ -96,12 +101,12 @@ def _cmd_spray(args, argv) -> int:
             unique.append((ip, port))
 
     spray_hosts = [SprayHost(ip=ip, port=port, users=list(users)) for ip, port in unique]
-    schedule = build_password_schedule(passwords)
+    schedule = build_password_schedule(passwords, per_password_cooldown=args.lockout_delay)
     print("spraying " + str(len(spray_hosts)) + " host(s) x " + str(len(users))
           + " users, " + str(len(schedule)) + " password round(s); lockout-safe cadence")
 
     all_results: list = []
-    for pw, _cooldown in schedule:
+    for pw, cooldown in schedule:
         def on_attempt(attempt, result):
             if not args.json:
                 mark = "+" if attempt.success else "-"
@@ -117,6 +122,12 @@ def _cmd_spray(args, argv) -> int:
             proxy_file=args.proxy_file, jump_file=args.jump_file, on_attempt=on_attempt,
         )
         all_results.extend(res)
+
+        # Lockout-safe cadence: wait out the per-password cooldown between
+        # rounds so we don't fire the next password while a lockout window is
+        # still open. (Skip after the final round.)
+        if cooldown and pw != schedule[-1][0]:
+            time.sleep(cooldown)
 
         if not args.no_save:
             for r in res:

@@ -383,8 +383,10 @@ async def crack_host(
             # Keep the in-flight window at ~2x concurrency so the semaphore is
             # the real gate and we don't eagerly exhaust the generator.
             if len(batch) >= max(concurrency * 2, 16):
-                await _drain(batch, result, target, on_attempt)
+                stopped = await _drain(batch, result, target, on_attempt)
                 batch = []
+                if stopped:
+                    return
         if batch:
             await _drain(batch, result, target, on_attempt)
 
@@ -397,8 +399,12 @@ async def _drain(
     result: CrackResult,
     target: CrackTarget,
     on_attempt=None,
-) -> None:
-    """Collect a batch of attempts, short-circuiting on first success."""
+) -> bool:
+    """Collect a batch of attempts, short-circuiting on first success.
+
+    Returns True if ``stop_on_success`` triggered (caller should stop
+    scheduling further batches), False otherwise.
+    """
     for coro in asyncio.as_completed(tasks):
         attempt = await coro
         result.attempts += 1
@@ -417,7 +423,8 @@ async def _drain(
             if target.stop_on_success:
                 for t in tasks:
                     t.cancel()
-                break
+                return True
+    return False
 
 
 async def crack_targets(

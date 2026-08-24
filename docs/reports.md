@@ -20,7 +20,7 @@ All writers take `(path: str, scores: list[Score])`. They create parent dirs as 
 
 ### `write_json(path, scores)`
 
-Writes a JSON array of `_score_record(score)` dicts (`report.py:142`):
+Writes a JSON array of `score_record(score)` dicts (`honeywatch.models.score_record`, shared with the store's `json` column):
 
 ```json
 [

