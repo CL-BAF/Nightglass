@@ -35,9 +35,6 @@ def test_dry_run_execution(worker):
     assert "[dry run" in result["stdout"]
 
 
-import os
-
-
 def test_local_simulate_execution(worker):
     if os.name == "nt":
         pytest.skip("local_simulate requires a POSIX shell")

@@ -22,6 +22,32 @@ _UNREACHABLE_MSG = (
     "https://ollama.com/settings/keys)"
 )
 
+# Cap response bodies so a misbehaving endpoint can't make us buffer an
+# unbounded stream into memory before json.loads. 16 MiB is far above any
+# legitimate chat/model-list payload.
+_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+def _read_capped(resp: Any, max_bytes: int = _MAX_RESPONSE_BYTES) -> str:
+    """Read an HTTP response body up to ``max_bytes``, then stop.
+
+    Raises ``AiError`` if the body exceeds the cap so a runaway endpoint
+    doesn't force an unbounded ``resp.read()`` into memory.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise AiError(
+                f"Ollama response exceeded {max_bytes} bytes; aborting read"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
 
 class AiError(Exception):
     """Raised when the AI backend cannot be reached or returns garbage."""
@@ -89,7 +115,7 @@ class OllamaClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                data = json.loads(_read_capped(resp))
         except urllib.error.HTTPError as err:
             snippet = err.read().decode("utf-8", errors="replace")[:500]
             raise AiError(f"Ollama HTTP {err.code}: {snippet}") from err
@@ -125,18 +151,19 @@ class OllamaClient:
             return False
 
     def models(self) -> list[str]:
-        """List model ids advertised by the endpoint (GET ``/models``, "data")."""
+        """List model ids advertised by the endpoint (GET ``/models``, "data").
+
+        Returns ``[]`` for any failure (HTTP error, network error, bad JSON),
+        matching :meth:`is_reachable`'s "False for both" liveness contract so
+        callers don't have to handle two different failure shapes.
+        """
         try:
             req = urllib.request.Request(
                 f"{self.base_url}/models", headers=self._headers(), method="GET"
             )
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError:
-            return []
-        except OSError as err:
-            raise AiError(_UNREACHABLE_MSG.format(base=self.base_url)) from err
-        except ValueError:
+                data = json.loads(_read_capped(resp))
+        except (urllib.error.HTTPError, OSError, ValueError, AiError):
             return []
 
         if not isinstance(data, dict):

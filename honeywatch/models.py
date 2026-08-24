@@ -9,7 +9,7 @@ There are no extra required fields beyond what is declared below.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 SSH_PORT = 22
@@ -75,6 +75,32 @@ class Score:
     ai: AiVerdict | None = None
     final_confidence: float = 0.0
     final_label: str = "uncertain"
+
+
+def score_record(score: Score) -> dict:
+    """Plain-dict representation of a :class:`Score`, safe for ``json.dumps``.
+
+    Single canonical serializer shared by the store (the ``hosts.json`` blob
+    column) and the report writers, so the persisted and exported shapes cannot
+    drift apart the way two copied implementations inevitably do. ``Signals``
+    is normalized to plain lists/dicts so the result round-trips through
+    ``json.loads`` without dataclass awareness.
+    """
+    sig = score.signals
+    return {
+        "ip": score.ip,
+        "port": score.port,
+        "final_label": score.final_label,
+        "final_confidence": score.final_confidence,
+        "fingerprint": asdict(score.fingerprint) if score.fingerprint else None,
+        "signals": {
+            "anomalies": list(sig.anomalies) if sig else [],
+            "flags": list(sig.flags) if sig else [],
+            "heuristic_score": sig.heuristic_score if sig else 0.0,
+            "evidence": dict(sig.evidence) if sig else {},
+        },
+        "ai": asdict(score.ai) if score.ai else None,
+    }
 
 
 # --------------------------------------------------------------------------- #

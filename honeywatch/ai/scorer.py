@@ -279,9 +279,15 @@ class AiScorer:
         chunks = [items[i : i + self.batch_size] for i in range(0, len(items), self.batch_size)]
         if not chunks:
             return {}
-        chunk_results = await asyncio.gather(*(self._score_chunk(c) for c in chunks))
+        chunk_results = await asyncio.gather(
+            *(self._score_chunk(c) for c in chunks), return_exceptions=True
+        )
         results: dict[str, AiVerdict] = {}
         for chunk in chunk_results:
+            # return_exceptions=True: a non-AiError exception in one chunk
+            # (e.g. a parse bug) shouldn't abort every other in-flight chunk.
+            if isinstance(chunk, BaseException):
+                continue
             if chunk:
                 results.update(chunk)
         return results
@@ -330,8 +336,7 @@ class AiScorer:
         self,
         profiles: dict[str, tuple[Fingerprint, Signals]],
     ) -> dict[str, AiVerdict]:
-        results: dict[str, AiVerdict] = {}
-        for key, (fp, signals) in profiles.items():
+        async def _one(key: str, fp: Fingerprint, signals: Signals):
             summary = summarize(fp, signals)
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -347,8 +352,21 @@ class AiScorer:
                     base_delay=self.retry_base_delay,
                 )
             except AiError:
-                continue
+                return None
             verdict = verdict_from_text(text)
             verdict.model = self.client.model
+            return key, verdict
+
+        # Score profiles concurrently instead of serially: a failed/slow profile
+        # no longer forces N sequential round-trips on the rest.
+        outcomes = await asyncio.gather(
+            *(_one(k, fp, sig) for k, (fp, sig) in profiles.items()),
+            return_exceptions=True,
+        )
+        results: dict[str, AiVerdict] = {}
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) or outcome is None:
+                continue
+            key, verdict = outcome
             results[key] = verdict
         return results

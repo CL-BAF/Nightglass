@@ -190,7 +190,12 @@ class C2Store:
     ) -> None:
         conn = self._connect()
         try:
-            with conn:
+            # BEGIN IMMEDIATE acquires the write lock before the SELECT so the
+            # read-modify-write of result_log is atomic: two concurrent callers
+            # can't both read the old log and have one append silently overwrite
+            # the other.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 row = conn.execute(
                     "SELECT result_log FROM c2_operations WHERE id = ?",
                     (operation_id,),
@@ -207,6 +212,10 @@ class C2Store:
                     """,
                     (status, _encode(log), _now(), operation_id),
                 )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         finally:
             self._close(conn)
 
@@ -293,7 +302,7 @@ class C2Store:
                 if row is None:
                     return None
                 task = self._task_from_row(row)
-                conn.execute(
+                cur = conn.execute(
                     """
                     UPDATE c2_tasks
                     SET status = 'running', worker_id = ?, updated_at = ?
@@ -301,7 +310,10 @@ class C2Store:
                     """,
                     (worker_id, _now(), task.id),
                 )
-                if conn.total_changes == 0:
+                # cursor.rowcount reflects only THIS update; conn.total_changes
+                # is cumulative across the connection and would stay > 0 from
+                # any earlier write, masking a no-op claim.
+                if cur.rowcount == 0:
                     return None
                 task.status = "running"
                 task.worker_id = worker_id
@@ -315,15 +327,23 @@ class C2Store:
         worker_id: str,
         success: bool,
         result: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
+        """Mark a claimed task completed/failed.
+
+        Returns True only when a row was actually updated -- i.e. the task
+        exists, is owned by ``worker_id``, and was still ``running``. Returns
+        False (no-op) when the worker doesn't own the task, the task is
+        missing, or it was already completed, so callers can avoid broadcasting
+        a spurious "task_completed" event for a transition that didn't happen.
+        """
         conn = self._connect()
         try:
             with conn:
-                conn.execute(
+                cur = conn.execute(
                     """
                     UPDATE c2_tasks
                     SET status = ?, result_json = ?, updated_at = ?
-                    WHERE id = ? AND worker_id = ?
+                    WHERE id = ? AND worker_id = ? AND status = 'running'
                     """,
                     (
                         "completed" if success else "failed",
@@ -333,6 +353,7 @@ class C2Store:
                         worker_id,
                     ),
                 )
+                return cur.rowcount > 0
         finally:
             self._close(conn)
 

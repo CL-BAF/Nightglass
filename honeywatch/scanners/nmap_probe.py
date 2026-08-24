@@ -62,7 +62,10 @@ def probe(
 
     try:
         return _parse_xml(proc.stdout.decode("utf-8", "replace"), port)
-    except ET.ParseError as exc:
+    except (ET.ParseError, ValueError, TypeError) as exc:
+        # ParseError covers malformed XML; ValueError/TypeError cover a bad
+        # numeric attribute (e.g. a non-integer portid) so the never-raises
+        # contract holds for any malformed nmap output.
         return {"error": f"failed to parse nmap XML output: {exc}"}
 
 
@@ -110,8 +113,15 @@ def _parse_xml(raw: str, port: int) -> Dict[str, Any]:
         if cpe_el is not None and cpe_el.text:
             result["cpe"] = cpe_el.text.strip()
 
-    banner_el = port_el.find("banner")
-    if banner_el is not None and banner_el.text:
-        result["banner"] = banner_el.text.strip()
+    # nmap emits a grabbed banner as a <script id="banner" output="..."/> element
+    # under the port (from the banner NSE script), not as a <banner> child -- the
+    # old port_el.find("banner") matched an element nmap never produces. Pull the
+    # real banner from the script output, falling back to the service extrainfo.
+    for script_el in port_el.iter("script"):
+        if script_el.get("id") == "banner" and script_el.get("output"):
+            result["banner"] = script_el.get("output").strip()
+            break
+    if "banner" not in result and svc is not None and svc.get("extrainfo"):
+        result["banner"] = svc.get("extrainfo").strip()
 
     return result

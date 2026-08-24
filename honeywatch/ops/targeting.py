@@ -7,11 +7,18 @@ be run against machines the operator owns or is authorized to test.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Any
 
 from honeywatch.models import Score, Target
 from honeywatch.store import Store
+
+# When the operator sets no explicit limit we still have to pass *some* bound to
+# ``query_scores`` (it has no unbounded / paginated mode). Use a large sentinel
+# rather than the old silent 1000-row cap, and warn if we hit it so a planet-
+# scale selection is not quietly truncated to a random 1000th of the fleet.
+_NO_LIMIT_SENTINEL = 10_000_000
 
 
 @dataclass
@@ -59,11 +66,20 @@ def select_targets(
     ssh_key: str | None = None,
 ) -> list[Target]:
     """Query the store and return matching targets."""
+    explicit_limit = filter_.limit
+    query_limit = explicit_limit if explicit_limit is not None else _NO_LIMIT_SENTINEL
     rows = store.query_scores(
-        limit=filter_.limit or 1000,
+        limit=query_limit,
         label=None,  # we filter labels ourselves so we can use confidence bounds
         min_confidence=filter_.min_confidence,
     )
+    if explicit_limit is None and len(rows) >= _NO_LIMIT_SENTINEL:
+        print(
+            f"honeywatch: warning: target selection returned {len(rows)} rows and "
+            f"reached the internal cap of {_NO_LIMIT_SENTINEL}; results may be "
+            f"truncated. Set an explicit limit or page the selection.",
+            file=sys.stderr,
+        )
     targets: list[Target] = []
     for score in rows:
         if filter_.match(score):
@@ -71,6 +87,6 @@ def select_targets(
             target.ssh_user = ssh_user
             target.ssh_key = ssh_key
             targets.append(target)
-        if filter_.limit is not None and len(targets) >= filter_.limit:
+        if explicit_limit is not None and len(targets) >= explicit_limit:
             break
     return targets

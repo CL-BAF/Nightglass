@@ -457,7 +457,7 @@ class TerminalUI:
     def _init_agent(self) -> None:
         """Lazily create the ChatAgent, running setup if needed."""
         from honeywatch.agent.ollama_agent import ChatAgent
-        from honeywatch.agent.setup import SetupStore
+        from honeywatch.agent.setup import SetupStore, run_setup_wizard
 
         store = SetupStore(self.db_path)
         cfg = store.load_config()

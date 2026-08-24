@@ -16,7 +16,7 @@ from honeywatch.agent.ollama_agent import ChatAgent
 from honeywatch.agent.setup import AgentConfig
 
 
-def _make_agent(tmp_path, monkeypatch):
+def _make_agent(tmp_path):
     cfg = AgentConfig(ollama_api_key="k", ollama_base_url="http://localhost",
                       ollama_model="test-model")
     agent = ChatAgent(config=cfg, db_path=str(tmp_path / "hw.db"),
@@ -46,7 +46,7 @@ def _resp(thoughts="", speak="", tools=None, done=False):
 
 
 def test_autonomous_loop_executes_tools_then_signals_done(tmp_path, monkeypatch):
-    agent = _make_agent(tmp_path, monkeypatch)
+    agent = _make_agent(tmp_path)
     client, calls = _scripted_client([
         _resp(thoughts="check the fleet", speak="getting status",
               tools=[{"name": "get_status", "arguments": {}}], done=False),
@@ -63,7 +63,7 @@ def test_autonomous_loop_executes_tools_then_signals_done(tmp_path, monkeypatch)
 
 
 def test_autonomous_loop_caps_at_max_cycles(tmp_path, monkeypatch):
-    agent = _make_agent(tmp_path, monkeypatch)
+    agent = _make_agent(tmp_path)
     # Model never signals DONE and always emits a (safe) tool call.
     client, calls = _scripted_client([
         _resp(speak="scan again", tools=[{"name": "get_status", "arguments": {}}])
@@ -79,7 +79,7 @@ def test_autonomous_loop_caps_at_max_cycles(tmp_path, monkeypatch):
 
 
 def test_autonomous_loop_stalls_on_no_tools_no_done(tmp_path, monkeypatch):
-    agent = _make_agent(tmp_path, monkeypatch)
+    agent = _make_agent(tmp_path)
     client, calls = _scripted_client([
         _resp(thoughts="stuck", speak="no move", tools=[], done=False),
     ])
@@ -93,7 +93,7 @@ def test_autonomous_loop_stalls_on_no_tools_no_done(tmp_path, monkeypatch):
 
 
 def test_autonomous_loop_done_with_final_tool_calls(tmp_path, monkeypatch):
-    agent = _make_agent(tmp_path, monkeypatch)
+    agent = _make_agent(tmp_path)
     client, calls = _scripted_client([
         _resp(thoughts="final check then done", speak="one last status",
               tools=[{"name": "get_status", "arguments": {}}], done=True),
@@ -108,7 +108,7 @@ def test_autonomous_loop_done_with_final_tool_calls(tmp_path, monkeypatch):
 
 
 def test_autonomous_loop_business_hours_gate_sleeps_without_ollama(tmp_path, monkeypatch):
-    agent = _make_agent(tmp_path, monkeypatch)
+    agent = _make_agent(tmp_path)
     client, calls = _scripted_client([_resp(done=True) for _ in range(20)])
     agent.client = client
     # Force "off-hours" so the loop must sleep every cycle, never call ollama.
@@ -124,7 +124,7 @@ def test_autonomous_loop_business_hours_gate_sleeps_without_ollama(tmp_path, mon
 
 def test_autonomous_loop_forever_until_done_with_max_cycles_zero(tmp_path, monkeypatch):
     """max_cycles=0 = run forever; must stop only when the model signals DONE."""
-    agent = _make_agent(tmp_path, monkeypatch)
+    agent = _make_agent(tmp_path)
     # Five productive cycles, then DONE on the sixth.
     scripted = [_resp(speak=f"cycle {i}", tools=[{"name": "get_status", "arguments": {}}])
                 for i in range(5)]
@@ -141,7 +141,7 @@ def test_autonomous_loop_forever_until_done_with_max_cycles_zero(tmp_path, monke
 
 def test_autonomous_loop_history_is_trimmed(tmp_path, monkeypatch):
     """A long run must not let the message list grow unbounded."""
-    agent = _make_agent(tmp_path, monkeypatch)
+    agent = _make_agent(tmp_path)
     client, calls = _scripted_client([
         _resp(speak=f"c{i}", tools=[{"name": "get_status", "arguments": {}}])
         for i in range(40)

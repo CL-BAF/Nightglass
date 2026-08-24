@@ -811,14 +811,28 @@ def parse_ports(spec: str) -> list:
             continue
         if "-" in part:
             lo_s, _, hi_s = part.partition("-")
-            lo, hi = int(lo_s), int(hi_s)
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                raise SystemExit(
+                    f"honeywatch: invalid port range {part!r}; expected N-M"
+                )
             if hi < lo:
                 lo, hi = hi, lo
             ports.extend(range(lo, hi + 1))
         else:
-            ports.append(int(part))
+            try:
+                ports.append(int(part))
+            except ValueError:
+                raise SystemExit(
+                    f"honeywatch: invalid port {part!r}; must be an integer"
+                )
     seen, result = set(), []
     for p in ports:
+        if not (0 <= p <= 65535):
+            raise SystemExit(
+                f"honeywatch: invalid port {p}; must be 0-65535"
+            )
         if p not in seen:
             seen.add(p)
             result.append(p)
@@ -1508,14 +1522,18 @@ def _cmd_agent(args, argv) -> int:
     if log_fh:
         print(f"  log: {args.log}")
     print("-" * 60)
-    summary = agent.run_autonomous(
-        goal=goal,
-        max_cycles=args.max_cycles,
-        cycle_delay=args.cycle_delay,
-        business_hours=args.business_hours,
-    )
-    if log_fh:
-        log_fh.close()
+    try:
+        summary = agent.run_autonomous(
+            goal=goal,
+            max_cycles=args.max_cycles,
+            cycle_delay=args.cycle_delay,
+            business_hours=args.business_hours,
+        )
+    finally:
+        # Close the log handle on every path -- a raised exception or Ctrl-C
+        # during the autonomous loop must not leak the open file descriptor.
+        if log_fh:
+            log_fh.close()
     if args.json:
         print(_json.dumps(summary, indent=2, default=str))
     else:

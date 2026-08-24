@@ -22,6 +22,6 @@ WAL + `synchronous=NORMAL` + `temp_store=MEMORY`, 5 indexes, `known_keys` table.
 | `query_scores` | `(limit, label, min_confidence) -> list[Score]` | hydrated via `json` column |
 | `stats` | `() -> {total, by_label, by_flag, known_keys}` | aggregates |
 
-Helpers: `_record(score) -> dict`.
+Helpers: `score_record(score) -> dict` (shared with the report writers; see `honeywatch.models.score_record`).
 
 See [Storage](../storage.md) for schema and examples.

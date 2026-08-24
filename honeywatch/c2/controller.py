@@ -11,6 +11,7 @@ Requires the optional ``aiohttp`` package (``pip install honeywatch[c2]``).
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import ssl
 import uuid
@@ -41,6 +42,25 @@ def _json_response(data: Any, status: int = 200) -> "web.Response":
     if web is None:  # pragma: no cover
         raise RuntimeError("aiohttp is not installed")
     return web.json_response(data, status=status)
+
+
+def _query_limit(request: "web.Request", default: int, cap: int) -> int:
+    """Parse an optional ``?limit`` query param safely.
+
+    Non-numeric or out-of-range values fall back to ``default`` (instead of
+    raising an uncaught ValueError -> HTTP 500), and the result is capped at
+    ``cap`` so a caller can't request an unbounded row scan.
+    """
+    raw = request.query.get("limit")
+    if raw is None or raw == "":
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if val < 1:
+        return default
+    return min(val, cap)
 
 
 _DASHBOARD_HTML = """
@@ -174,13 +194,19 @@ class Controller:
 
         Accepts either an ``Authorization: Bearer <token>`` header or a
         ``?token=<token>`` query parameter (handy for WebSocket handshakes,
-        which can't set headers everywhere).
+        which can't set headers everywhere). Comparison is constant-time via
+        :func:`hmac.compare_digest` to avoid token-recovery timing oracles.
         """
+        token = self.api_token
+        if not token:
+            return True
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
-            if auth[len("Bearer "):].strip() == self.api_token:
+            presented = auth[len("Bearer "):].strip()
+            if hmac.compare_digest(presented, token):
                 return True
-        if request.query.get("token") == self.api_token:
+        qtoken = request.query.get("token")
+        if qtoken is not None and hmac.compare_digest(qtoken, token):
             return True
         return False
 
@@ -210,7 +236,7 @@ class Controller:
 
     async def _api_operations(self, request: "web.Request") -> "web.Response":
         status = request.query.get("status")
-        limit = int(request.query.get("limit", "100"))
+        limit = _query_limit(request, 100, 1000)
         ops = await asyncio.to_thread(self.store.list_operations, status, limit)
         return _json_response({"operations": [_op_dict(o) for o in ops]})
 
@@ -236,11 +262,19 @@ class Controller:
         operation_id = request.query.get("operation_id")
         status = request.query.get("status")
         worker_id = request.query.get("worker_id")
-        limit = int(request.query.get("limit", "500"))
+        limit = _query_limit(request, 500, 5000)
+        # Credentials are stripped from the public task view unless an
+        # authenticated caller explicitly opts in via ?include_credentials=true.
+        include_credentials = (
+            bool(self.api_token)
+            and request.query.get("include_credentials") == "true"
+        )
         tasks = await asyncio.to_thread(
             self.store.list_tasks, operation_id, status, worker_id, limit
         )
-        return _json_response({"tasks": [_task_dict(t) for t in tasks]})
+        return _json_response(
+            {"tasks": [_task_dict(t, include_credentials) for t in tasks]}
+        )
 
     async def _api_claim_task(self, request: "web.Request") -> "web.Response":
         try:
@@ -258,7 +292,10 @@ class Controller:
         await self._broadcast(
             {"type": "task_claimed", "id": task.id, "worker_id": worker_id}
         )
-        return _json_response({"task": _task_dict(task)})
+        # The worker executing the task needs the target's ssh credentials,
+        # so the claim response includes them (the worker is the authorized
+        # actor). Dashboard *listings* strip them -- see _api_tasks/_push_snapshot.
+        return _json_response({"task": _task_dict(task, include_credentials=True)})
 
     async def _api_task_result(self, request: "web.Request") -> "web.Response":
         task_id = request.match_info["task_id"]
@@ -269,18 +306,22 @@ class Controller:
         worker_id = data.get("worker_id", "")
         success = bool(data.get("success"))
         result = data.get("result", {})
-        await asyncio.to_thread(
+        completed = await asyncio.to_thread(
             self.store.complete_task, task_id, worker_id, success, result
         )
-        await self._broadcast(
-            {
-                "type": "task_completed",
-                "id": task_id,
-                "success": success,
-                "worker_id": worker_id,
-            }
-        )
-        return _json_response({"ok": True})
+        # Only broadcast a completion when the store actually transitioned the
+        # task (owned by this worker and still running). Otherwise the dashboard
+        # would surface a false "task_completed" for a rejected/already-done task.
+        if completed:
+            await self._broadcast(
+                {
+                    "type": "task_completed",
+                    "id": task_id,
+                    "success": success,
+                    "worker_id": worker_id,
+                }
+            )
+        return _json_response({"ok": True, "completed": completed})
 
     # ------------------------------------------------------------------ #
     # WebSocket handlers
@@ -309,6 +350,27 @@ class Controller:
                         if worker_id:
                             await asyncio.to_thread(
                                 self.store.register_worker, worker_id, categories
+                            )
+                    elif msg_type == "task_result":
+                        # Workers in pure-WS mode report results here instead of
+                        # POST /api/tasks/{id}/result. Without this branch the
+                        # controller silently dropped every WS-mode task result
+                        # and the task stayed "running" forever.
+                        task_id = payload.get("task_id", "")
+                        w_id = payload.get("worker_id", "")
+                        succ = bool(payload.get("success"))
+                        res = payload.get("result", {}) or {}
+                        completed = await asyncio.to_thread(
+                            self.store.complete_task, task_id, w_id, succ, res
+                        )
+                        if completed:
+                            await self._broadcast(
+                                {
+                                    "type": "task_completed",
+                                    "id": task_id,
+                                    "success": succ,
+                                    "worker_id": w_id,
+                                }
                             )
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
@@ -379,13 +441,13 @@ def _op_dict(op: Any) -> dict[str, Any]:
     }
 
 
-def _task_dict(task: WorkerTask) -> dict[str, Any]:
+def _task_dict(task: WorkerTask, include_credentials: bool = False) -> dict[str, Any]:
     return {
         "id": task.id,
         "operation_id": task.operation_id,
         "payload_id": task.payload_id,
         "category": task.category,
-        "target": _target_to_dict(task.target),
+        "target": _target_to_dict(task.target, include_credentials),
         "script": task.script,
         "variables": task.variables,
         "status": task.status,
@@ -394,19 +456,27 @@ def _task_dict(task: WorkerTask) -> dict[str, Any]:
     }
 
 
-def _target_to_dict(target: Target | None) -> dict[str, Any] | None:
+def _target_to_dict(
+    target: Target | None, include_credentials: bool = False
+) -> dict[str, Any] | None:
     if target is None:
         return None
-    return {
+    d: dict[str, Any] = {
         "ip": target.ip,
         "port": target.port,
         "label": target.label,
         "confidence": target.confidence,
         "profile_key": target.profile_key,
         "allowed_categories": target.allowed_categories,
-        "ssh_user": target.ssh_user,
-        "ssh_key": target.ssh_key,
-        "ssh_pass": target.ssh_pass,
     }
+    # Cracked ssh credentials are only included for the worker that will exec
+    # the task (claim endpoint) or an authenticated caller that explicitly opts
+    # in. Dashboard listings and WS snapshots receive the stripped form so a
+    # browser session never sees plaintext passwords/keys.
+    if include_credentials:
+        d["ssh_user"] = target.ssh_user
+        d["ssh_key"] = target.ssh_key
+        d["ssh_pass"] = target.ssh_pass
+    return d
 
 

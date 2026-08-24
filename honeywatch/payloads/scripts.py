@@ -39,9 +39,14 @@ def _render_template(
     return _TOKEN_RE.sub(repl, template)
 
 
-def _inject_ids(script: str, payload_id: str, target: Target | None) -> str:
-    """Add deterministic runtime identifiers to a rendered script."""
-    op_id = uuid.uuid4().hex[:12]
+def _inject_ids(
+    script: str, payload_id: str, target: Target | None, op_id: str
+) -> str:
+    """Add deterministic runtime identifiers to a rendered script.
+
+    ``op_id`` is generated once per :func:`render_payload_script` call and shared
+    between the install and run sections so both report the same operation id.
+    """
     extras = {
         "payload_id": payload_id,
         "operation_id": op_id,
@@ -53,10 +58,12 @@ def _inject_ids(script: str, payload_id: str, target: Target | None) -> str:
 
 def render_payload_script(payload: Payload, variables: dict[str, Any], target: Target | None = None) -> str:
     """Render a payload's install script (and optionally run script) for one host."""
-    script = _inject_ids(payload.install_script, payload.id, target)
+    # One operation id for both the install and run sections so they agree.
+    op_id = uuid.uuid4().hex[:12]
+    script = _inject_ids(payload.install_script, payload.id, target, op_id)
     script = _render_template(script, variables)
     if payload.run_script:
-        run = _inject_ids(payload.run_script, payload.id, target)
+        run = _inject_ids(payload.run_script, payload.id, target, op_id)
         run = _render_template(run, variables)
         script += f"\n\n# --- run command ---\n{run}\n"
     return script
@@ -69,6 +76,32 @@ def validate_variables(payload: Payload, variables: dict[str, Any]) -> list[str]
         if spec.get("required") and variables.get(key) in (None, ""):
             missing.append(key)
     return missing
+
+
+def validate_variable_types(payload: Payload, variables: dict[str, Any]) -> list[str]:
+    """Return human-readable type-mismatch errors for present variables.
+
+    Only variables that are actually set (non-None, non-empty) are checked, so
+    unset optional fields and defaults filled in later by :func:`merge_defaults`
+    are not flagged. Integer fields must ``int()``-parse; boolean fields must be
+    a real bool or the string form ``true``/``false`` (the forms the CLI and the
+    chain orchestrator pass after coercing config values to strings).
+    """
+    errors: list[str] = []
+    for key, spec in payload.config_schema.items():
+        value = variables.get(key)
+        if value is None or value == "":
+            continue
+        vtype = spec.get("type")
+        if vtype == "integer":
+            try:
+                int(str(value))
+            except (TypeError, ValueError):
+                errors.append(f"{key} must be an integer, got {value!r}")
+        elif vtype == "boolean":
+            if str(value).strip().lower() not in {"true", "false"}:
+                errors.append(f"{key} must be a boolean (true/false), got {value!r}")
+    return errors
 
 
 # Variables whose values are intentionally free-form script/program text and so

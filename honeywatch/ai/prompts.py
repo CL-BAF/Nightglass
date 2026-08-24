@@ -39,9 +39,7 @@ def user_prompt_for(summary: dict[str, Any]) -> str:
         lines.append(f"{key}: {rendered}")
 
     lines.append("")
-    lines.append(
-        'Return JSON: {"classification": one of "real" | "likely_real" | '
-        '"uncertain" | "likely_honeypot" | "honeypot", "confidence": float '
-        '0.0-1.0, "reasons": [string]} '
-    )
+    # Reuse the single exported schema literal instead of re-stating it inline
+    # (an inline copy already drifted from OUTPUT_JSON once).
+    lines.append(f"Return JSON: {OUTPUT_JSON}")
     return "\n".join(lines)

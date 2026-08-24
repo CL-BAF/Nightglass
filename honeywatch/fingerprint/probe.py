@@ -103,9 +103,22 @@ def parse_kexinit(payload: bytes) -> dict:
         return result
     data = payload
     # Strip the transport padding-length byte and the SSH_MSG_KEXINIT id (20)
-    # when the caller handed us the whole packet body.
+    # when the caller handed us the whole packet body (the form _read_packet
+    # returns). A payload handed in starting at the 16-byte cookie has no such
+    # prefix. data[1]==20 alone is ambiguous: a cookie whose second byte happens
+    # to be 20 would make us strip two real cookie bytes and corrupt the parse
+    # (~1/256 of cookie-start inputs). Disambiguate by also requiring the
+    # name-list length that would sit right after the 2-byte prefix + 16-byte
+    # cookie to be plausible; if it isn't, treat the input as cookie-start.
     if len(data) >= 18 and data[1] == MSG_KEXINIT:
-        data = data[2:]
+        looks_like_body = True
+        if len(data) >= 22:
+            first_len = int.from_bytes(data[18:22], "big")
+            looks_like_body = (
+                first_len <= _MAX_PACKET and 22 + first_len <= len(data)
+            )
+        if looks_like_body:
+            data = data[2:]
     if len(data) < 16:  # cookie
         return result
     offset = 16
@@ -139,6 +152,15 @@ async def _read_banner(reader: asyncio.StreamReader, timeout: float) -> bytes | 
         return exc.partial
     except asyncio.TimeoutError:
         return None
+    except asyncio.LimitOverrunError:
+        # A misbehaving server sent more than the stream limit with no newline.
+        # Hand back whatever is already buffered so the banner is still
+        # best-effort parsed, instead of letting the exception escape and
+        # violate probe_ssh's never-raises contract.
+        try:
+            return reader.read_nowait()
+        except Exception:
+            return None
 
 
 async def _read_packet(reader: asyncio.StreamReader, timeout: float) -> bytes | None:
@@ -190,9 +212,19 @@ def _full_probe(fp: Fingerprint, auth_probe: bool, timeout: float) -> dict:
 
     transport = None
     try:
-        transport = paramiko.Transport((fp.ip, fp.port))
+        # Create the socket with an explicit connect timeout so a host that
+        # blackholes the SYN (rather than refusing) cannot hold a worker thread
+        # indefinitely -- paramiko.Transport((host, port)) connects with no
+        # timeout of its own.
+        import socket as _socket
+
+        deadline = max(6.0, float(timeout))
+        sock = _socket.create_connection((fp.ip, fp.port), timeout=deadline)
+        sock.settimeout(deadline)
+        transport = paramiko.Transport(sock)
+        transport.set_timeout(deadline)
         try:
-            transport.start_client(timeout=max(6.0, float(timeout)))
+            transport.start_client(timeout=deadline)
         except TypeError:
             # Ancient paramiko without the timeout kwarg.
             transport.start_client()
@@ -232,6 +264,16 @@ async def probe_ssh(
     ``level="full"`` additionally extracts the host key (via paramiko) and,
     when ``auth_probe`` is set, records whether a deliberately wrong password
     was accepted.
+
+    .. note:: The ``level="full"`` host key and auth-probe evidence are gathered
+       on a *second* TCP connection (paramiko owns that handshake end-to-end),
+       while the banner + KEXINIT algorithm lists come from the first raw
+       connection. The two are blended into one :class:`Fingerprint`. For a
+       single backend host this is fine; behind a load balancer the second
+       connection may hit a different real server, so ``host_key_sha256`` and
+       ``kex_algorithms`` could describe different nodes. Callers that need a
+       guaranteed single-session view should drive paramiko end-to-end instead
+       of mixing the two transports here.
 
     Never raises; the outcome is described by ``Fingerprint.error`` in
     ``{"no_banner", "connection_refused", "timeout", "error:<repr>"}``.

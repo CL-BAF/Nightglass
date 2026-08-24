@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from typing import Any
 
 __all__ = [
@@ -48,6 +49,14 @@ __all__ = [
 # have not verified against the real artifact.
 KNOWN_HASHES: dict[str, str] = {}
 
+# A pinned hash is a lowercase hex string. Real sha256s are 64 chars, but
+# operators (and tests) also stage short hex placeholders while pinning a
+# release; those still flow through to the install script where ``sha256sum -c``
+# will simply fail against the real artifact. What we *do* reject is non-hex
+# garbage ("TODO", "see notes") -- a value like that would be injected as a
+# "pinned hash" and mask the fact that no real pin is in effect.
+_SHA256_RE = re.compile(r"[0-9a-f]+")
+
 
 def load_integrity(path: str | None) -> dict[str, str]:
     """Load an optional ``{payload_id_or_artifact: sha256}`` manifest.
@@ -62,7 +71,9 @@ def load_integrity(path: str | None) -> dict[str, str]:
 
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
-    except (FileNotFoundError, OSError, ImportError, Exception):
+    except Exception:
+        # Missing file, unreadable, no tomllib on old Pythons, or bad TOML --
+        # all collapse to "no hashes known" rather than erroring the deploy.
         return {}
     if not isinstance(data, dict):
         return {}
@@ -72,8 +83,14 @@ def load_integrity(path: str | None) -> dict[str, str]:
     if not isinstance(table, dict):
         return {}
     for key, value in table.items():
-        if isinstance(key, str) and isinstance(value, str) and value:
-            out[key] = value.strip().lower()
+        if not (isinstance(key, str) and isinstance(value, str) and value):
+            continue
+        normalized = value.strip().lower()
+        # Drop non-hex values (a typo'd "TODO"/"see notes" entry) so they cannot
+        # masquerade as a pinned hash. Short hex placeholders and real 64-char
+        # sha256s both pass through; ``sha256sum -c`` catches a wrong one at deploy.
+        if _SHA256_RE.fullmatch(normalized):
+            out[key] = normalized
     return out
 
 
