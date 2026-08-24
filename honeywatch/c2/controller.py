@@ -406,6 +406,7 @@ def _target_to_dict(target: Target | None) -> dict[str, Any] | None:
         "allowed_categories": target.allowed_categories,
         "ssh_user": target.ssh_user,
         "ssh_key": target.ssh_key,
+        "ssh_pass": target.ssh_pass,
     }
 
 

@@ -113,6 +113,19 @@ Checked via `https://am.i.mullvad.net/json` (`mullvad_exit_ip`) + `/connected` f
 
 See [Payloads](payloads.md).
 
+### `[crack]`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `concurrency` | `8` | parallel login attempts per host (kept modest: many sshd throttle parallel auth failures) |
+| `host_concurrency` | `32` | hosts attacked at once |
+| `timeout_s` | `6.0` | seconds per TCP + KEX + auth attempt |
+| `max_attempts` | `null` | guesses per host before giving up (`null` = drain the wordlist) |
+| `mutations` | `true` | expand the wordlist with case/year/symbol suffix dialect |
+| `save_credentials` | `true` | persist recovered creds to the `credentials` table |
+
+See [SSH Cracking](crack.md).
+
 ### `[c2]`
 
 | Key | Default | Meaning |

@@ -87,7 +87,10 @@ def _target_to_dict(target: Target | None) -> dict[str, Any] | None:
         "allowed_categories": target.allowed_categories,
         "ssh_user": target.ssh_user,
         "ssh_key": target.ssh_key,
-        # never persist plaintext passwords in the C2 store
+        # Cracked credential, carried so password exec-mode works end-to-end.
+        # The authoritative store remains the credentials table in the main
+        # Store; this field is transient transport, not a credential vault.
+        "ssh_pass": target.ssh_pass,
     }
 
 
@@ -103,6 +106,7 @@ def _target_from_dict(data: dict[str, Any] | None) -> Target | None:
         allowed_categories=list(data.get("allowed_categories", [])),
         ssh_user=data.get("ssh_user"),
         ssh_key=data.get("ssh_key"),
+        ssh_pass=data.get("ssh_pass"),
     )
 
 

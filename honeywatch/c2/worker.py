@@ -187,11 +187,38 @@ class Worker:
             return {"mode": "ssh", "error": "task has no target"}
         user = target.ssh_user or self.ssh_user
         key = target.ssh_key or self.ssh_key
-        argv = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes"]
-        if key:
-            argv += ["-i", key]
-        argv += [f"{user}@{target.ip}"]
-        # Pipe the script over stdin to avoid leaving it on disk remotely.
+        passw = target.ssh_pass
+        # Key auth: BatchMode=yes, stdin-piped script.
+        if key or not passw:
+            argv = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes"]
+            if key:
+                argv += ["-i", key]
+            argv += [f"{user}@{target.ip}"]
+            try:
+                proc = subprocess.run(
+                    argv,
+                    input=script,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                return {
+                    "mode": "ssh",
+                    "target": f"{user}@{target.ip}",
+                    "returncode": proc.returncode,
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                }
+            except subprocess.TimeoutExpired:
+                return {"mode": "ssh", "target": f"{user}@{target.ip}", "error": "timeout"}
+            except Exception as exc:
+                return {"mode": "ssh", "target": f"{user}@{target.ip}", "error": str(exc)}
+        # Password auth (cracked credential): delegate to sshpass when present.
+        argv = ["sshpass", "-p", passw,
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                "-o", "PreferredAuthentications=password",
+                "-o", "PubkeyAuthentication=no",
+                f"{user}@{target.ip}"]
         try:
             proc = subprocess.run(
                 argv,
@@ -202,15 +229,23 @@ class Worker:
             )
             return {
                 "mode": "ssh",
+                "auth": "password",
                 "target": f"{user}@{target.ip}",
                 "returncode": proc.returncode,
                 "stdout": proc.stdout,
                 "stderr": proc.stderr,
             }
+        except FileNotFoundError:
+            return {
+                "mode": "ssh",
+                "auth": "password",
+                "target": f"{user}@{target.ip}",
+                "error": "sshpass not installed; cannot use password auth",
+            }
         except subprocess.TimeoutExpired:
-            return {"mode": "ssh", "target": f"{user}@{target.ip}", "error": "timeout"}
+            return {"mode": "ssh", "auth": "password", "target": f"{user}@{target.ip}", "error": "timeout"}
         except Exception as exc:
-            return {"mode": "ssh", "target": f"{user}@{target.ip}", "error": str(exc)}
+            return {"mode": "ssh", "auth": "password", "target": f"{user}@{target.ip}", "error": str(exc)}
 
     # ------------------------------------------------------------------ #
     # Loop
@@ -324,6 +359,7 @@ def _task_from_dict(data: dict[str, Any]) -> WorkerTask:
             allowed_categories=list(target_data.get("allowed_categories", [])),
             ssh_user=target_data.get("ssh_user"),
             ssh_key=target_data.get("ssh_key"),
+            ssh_pass=target_data.get("ssh_pass"),
         )
     return WorkerTask(
         id=data.get("id", ""),

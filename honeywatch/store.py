@@ -65,6 +65,24 @@ CREATE TABLE IF NOT EXISTS known_keys (
 )
 """
 
+# Cracked SSH credentials. Populated by the password cracker so later deploy
+# runs can reuse them and so an operator's accumulated access survives across
+# sessions. (ip, port, user) is unique so re-cracking the same box updates the
+# discovered password rather than stacking duplicates.
+_CREDENTIALS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS credentials (
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    user TEXT NOT NULL,
+    password TEXT,
+    banner TEXT,
+    attempts INTEGER DEFAULT 0,
+    source TEXT,
+    discovered_at TEXT,
+    PRIMARY KEY (ip, port, user)
+)
+"""
+
 
 def _record(score: Score) -> dict:
     """Plain-dict representation of a Score (safe for json.dumps)."""
@@ -128,8 +146,13 @@ class Store:
                 pass  # read-only filesystem or restricted sqlite — fall back silently
         conn.executescript(_SCHEMA)
         conn.executescript(_KNOWN_KEYS_SCHEMA)
+        conn.executescript(_CREDENTIALS_SCHEMA)
         for stmt in _INDEXES:
             conn.execute(stmt)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_credentials_ip "
+            "ON credentials(ip, port)"
+        )
         conn.commit()
         self._initialized = True
 
@@ -416,4 +439,114 @@ class Store:
             "by_label": by_label,
             "by_flag": by_flag,
             "known_keys": known,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Cracked credentials
+    # ------------------------------------------------------------------ #
+    def upsert_credential(
+        self,
+        ip: str,
+        port: int,
+        user: str,
+        password: str | None,
+        banner: str | None = None,
+        attempts: int = 0,
+        source: str = "crack",
+    ) -> None:
+        """Insert or replace one cracked credential row.
+
+        Re-cracking the same ``(ip, port, user)`` updates the discovered
+        password in place instead of stacking duplicates.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO credentials
+                        (ip, port, user, password, banner, attempts, source, discovered_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(ip), int(port), user, password, banner, int(attempts), source, now),
+                )
+        finally:
+            self._close(conn)
+
+    def query_credentials(
+        self,
+        ip: str | None = None,
+        port: int | None = None,
+        user: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Return cracked credential rows as dicts.
+
+        Filters are optional and combine with AND. Rows are ordered by most
+        recently discovered first so an operator re-running crack sees fresh
+        wins at the top.
+        """
+        sql = (
+            "SELECT ip, port, user, password, banner, attempts, source, discovered_at "
+            "FROM credentials WHERE 1=1"
+        )
+        params: list[object] = []
+        if ip is not None:
+            sql += " AND ip = ?"
+            params.append(str(ip))
+        if port is not None:
+            sql += " AND port = ?"
+            params.append(int(port))
+        if user is not None:
+            sql += " AND user = ?"
+            params.append(user)
+        sql += " ORDER BY discovered_at DESC LIMIT ?"
+        params.append(int(limit))
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            self._close(conn)
+        return [
+            {
+                "ip": r[0],
+                "port": int(r[1]),
+                "user": r[2],
+                "password": r[3],
+                "banner": r[4],
+                "attempts": int(r[5] or 0),
+                "source": r[6],
+                "discovered_at": r[7],
+            }
+            for r in rows
+        ]
+
+    def credential_for(self, ip: str, port: int = 22) -> dict | None:
+        """Return the most recently discovered working credential for a host.
+
+        Used by ``deploy`` to auto-fill ``Target.ssh_pass`` / ``ssh_user``
+        when the operator did not pin credentials.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT ip, port, user, password, banner, attempts, source, discovered_at "
+                "FROM credentials WHERE ip = ? AND port = ? "
+                "ORDER BY discovered_at DESC LIMIT 1",
+                (str(ip), int(port)),
+            ).fetchone()
+        finally:
+            self._close(conn)
+        if not row:
+            return None
+        return {
+            "ip": row[0],
+            "port": int(row[1]),
+            "user": row[2],
+            "password": row[3],
+            "banner": row[4],
+            "attempts": int(row[5] or 0),
+            "source": row[6],
+            "discovered_at": row[7],
         }

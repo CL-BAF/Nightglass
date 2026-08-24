@@ -71,6 +71,7 @@ nav:
       - Payloads: payloads.md
       - C2 Controller: c2.md
       - Operations & Targeting: ops.md
+      - SSH Cracking: crack.md
       - AI Agent & Chat: agent.md
   - API Reference:
       - Overview: api/index.md

@@ -298,6 +298,64 @@ honeywatch chat
 
 ---
 
+## `honeywatch crack` — SSH password cracking
+
+```bash
+honeywatch crack [HOSTS...] [options]
+```
+
+Targets come from positional `ip[:port]` hosts, `--target-file`, or the store (`--target-label`/`--min-confidence`/`--limit`). Recovered credentials persist to the `credentials` table and auto-feed `deploy`. See [SSH Cracking](crack.md).
+
+| Flag | Default | Help |
+|---|---|---|
+| `HOSTS...` (positional) | — | `ip[:port]` hosts to crack |
+| `--target-file PATH` | — | file with `ip[:port]` lines |
+| `--target-label LABEL` | — | pull hosts from the store by final label |
+| `--min-confidence F` | 0.0 | lower bound when pulling from the store |
+| `--limit N` | 1000 | cap targets pulled from the store |
+| `--users a,b,c` | built-ins | usernames to try |
+| `--user U` | — | pin a single username |
+| `--wordlist PATH` | — | newline-separated password wordlist |
+| `--passwords a,b,c` | — | explicit passwords (bypasses wordlist/mutations) |
+| `--no-mutations` | off | try wordlist entries verbatim |
+| `--concurrency N` | config `crack.concurrency` (8) | parallel attempts per host |
+| `--host-concurrency N` | config `crack.host_concurrency` (32) | hosts at once |
+| `--timeout S` | config `crack.timeout_s` (6.0) | seconds per attempt |
+| `--max-attempts N` | unbounded | guesses per host before giving up |
+| `--no-stop-on-success` | off | keep going after a hit (audit mode) |
+| `--no-save` | off | do not persist credentials |
+| `--json` | off | emit a JSON array |
+| `--db PATH` | config | SQLite path |
+| `--skip-vpn-check` | off | bypass the Mullvad gate |
+| `--config PATH` | auto | TOML path |
+
+Handler `cli.py` `_cmd_crack`: builds `CrackTarget`s, runs `crack_targets` (async), persists wins via `Store.upsert_credential`.
+
+```bash
+honeywatch crack 10.0.0.5 --wordlist rockyou.txt --user root --skip-vpn-check
+honeywatch crack --target-label real --min-confidence 0.8 --json --skip-vpn-check
+```
+
+## `honeywatch creds` — list cracked credentials
+
+```bash
+honeywatch creds [options]
+```
+
+| Flag | Default | Help |
+|---|---|---|
+| `--ip IP` | — | filter by host ip |
+| `--port PORT` | — | filter by port |
+| `--user USER` | — | filter by username |
+| `--limit N` | 100 | max rows |
+| `--json` | off | emit a JSON array |
+| `--db PATH` | config | SQLite path |
+| `--config PATH` | auto | TOML path |
+
+Handler `cli.py` `_cmd_creds`: `Store.query_credentials`.
+
+---
+
 ## Helpers
 
 - `parse_host(spec, default_port=22) -> (ip, port)` — `cli.py:466` — handles `ip`, `ip:port`, `[v6]:port`.
