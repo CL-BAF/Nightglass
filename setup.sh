@@ -83,6 +83,19 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Normalize VENV to an absolute path. The venv-validation step below runs the
+# venv's python and checks that `sys.executable` (always absolute) starts with
+# $VENV — if VENV stays relative (the default ".venv") that check always fails
+# on a real install, rejecting a perfectly good venv.
+if command -v realpath >/dev/null 2>&1; then
+    VENV="$(realpath -m "$VENV")"
+else
+    case "$VENV" in
+        /*) : ;;
+        *)  VENV="$(pwd)/$VENV" ;;
+    esac
+fi
+
 # ========================================================================= #
 # 1. Python present + version >= 3.10
 # ========================================================================= #
