@@ -44,16 +44,24 @@ def build_manifest(
     refused outright, closing the blind ``curl | tar | exec`` gap.
     """
     payload = get_payload(payload_id)
-    missing = validate_variables(payload, variables)
-    if missing:
+    # validate_variables is the unified entry point (required + type). We
+    # split the result back into missing-required vs type-errors so the
+    # ValueError messages stay specific, but there's only one validation call
+    # now — a future caller using validate_variables alone gets both checks.
+    errors = validate_variables(payload, variables)
+    if errors:
+        # Distinguish "missing required" (a bare key name) from a type-mismatch
+        # message (contains "must be"). This keeps the error messages specific
+        # without calling validate_variable_types a second time.
+        missing = [e for e in errors if " must be " not in e]
+        type_errors = [e for e in errors if " must be " in e]
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing required variables: {', '.join(missing)}")
+        if type_errors:
+            parts.append("invalid variable values: " + "; ".join(type_errors))
         raise ValueError(
-            f"payload {payload_id!r} missing required variables: {', '.join(missing)}"
-        )
-    type_errors = validate_variable_types(payload, variables)
-    if type_errors:
-        raise ValueError(
-            f"payload {payload_id!r} has invalid variable values: "
-            + "; ".join(type_errors)
+            f"payload {payload_id!r} " + "; ".join(parts)
         )
     if not allow_unsafe_vars:
         unsafe = unsafe_variable_reasons(variables)

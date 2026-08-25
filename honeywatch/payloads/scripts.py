@@ -70,12 +70,23 @@ def render_payload_script(payload: Payload, variables: dict[str, Any], target: T
 
 
 def validate_variables(payload: Payload, variables: dict[str, Any]) -> list[str]:
-    """Return a list of missing required variables for ``payload``."""
-    missing: list[str] = []
+    """Return a list of validation errors for ``payload`` against ``variables``.
+
+    Combines required-field checks AND type checks so there's one entry point.
+    A future caller using only :func:`validate_variables` gets type validation
+    for free — previously the two were split and a caller that skipped
+    :func:`validate_variable_types` would silently accept a non-integer
+    ``threads`` value. The returned list is human-readable error strings; an
+    empty list means valid.
+    """
+    errors: list[str] = []
+    # Required-field check.
     for key, spec in payload.config_schema.items():
         if spec.get("required") and variables.get(key) in (None, ""):
-            missing.append(key)
-    return missing
+            errors.append(key)
+    # Type check (folded in so the single entry point covers both).
+    errors.extend(validate_variable_types(payload, variables))
+    return errors
 
 
 def validate_variable_types(payload: Payload, variables: dict[str, Any]) -> list[str]:
@@ -86,6 +97,10 @@ def validate_variable_types(payload: Payload, variables: dict[str, Any]) -> list
     are not flagged. Integer fields must ``int()``-parse; boolean fields must be
     a real bool or the string form ``true``/``false`` (the forms the CLI and the
     chain orchestrator pass after coercing config values to strings).
+
+    Kept as a separate function so tests and :func:`validate_variables` can
+    call it directly; new callers should use :func:`validate_variables` (the
+    unified entry point) so type validation can't be skipped by accident.
     """
     errors: list[str] = []
     for key, spec in payload.config_schema.items():
@@ -114,10 +129,9 @@ _FREEFORM_VARS = frozenset({"resource_script"})
 # (or accident) to break out of the surrounding shell context. Blocking these
 # protects the operator from self-injection via a pasted wallet/pool/etc.
 _UNSAFE_PATTERNS = (
-    "`",     # command substitution
-    "$(",    # command substitution
-    "${",    # parameter expansion
-    "$",     # bare variable expansion ($HOME, $PATH etc.)
+    "`",     # command substitution (backtick form)
+    "$(",    # command substitution ($(...) form)
+    "${",    # parameter expansion (${VAR} form)
     "&&",    # command sequencing
     "||",    # command sequencing
     ";",     # command separator
@@ -125,6 +139,13 @@ _UNSAFE_PATTERNS = (
     "\n",    # newline injection
     "\r",    # carriage return
 )
+# Note: a bare "$" is intentionally NOT flagged. The dangerous shell expansion
+# forms are $( and ${ above; a bare $ in a password like "pa$$word" or a
+# systemd unit with "$ARGS" is a literal inside the rendered script's quoted
+# context. Flagging bare $ masks real misconfiguration as a security block
+# (the operator sets --allow-unsafe-vars and then misses a genuinely
+# dangerous value). A pool URL like "stratum+tcp://$HOSTNAME:4444" is exotic
+# and the operator who writes it knows what they're doing.
 
 
 def unsafe_variable_reasons(

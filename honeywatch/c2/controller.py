@@ -231,7 +231,11 @@ class Controller:
         return _json_response({"status": "ok", "time": _now()})
 
     async def _api_workers(self, request: "web.Request") -> "web.Response":
-        workers = await asyncio.to_thread(self.store.list_workers)
+        # Surface liveness: workers whose last_seen is older than 3x the
+        # typical poll interval are marked offline so the dashboard stops
+        # showing ghosts (list_workers has the filter; the API never used it).
+        stale = 900.0  # 15 min — ~3x the default 5s poll, generous for slow exec
+        workers = await asyncio.to_thread(self.store.list_workers, stale)
         return _json_response({"workers": workers})
 
     async def _api_operations(self, request: "web.Request") -> "web.Response":
@@ -420,8 +424,31 @@ class Controller:
         scheme = "https" if self.ssl else "http"
         print(f"honeywatch C2 listening on {scheme}://{self.host}:{self.port}")
         try:
+            # Periodic lease sweeper: re-queue tasks whose worker died
+            # mid-execution (claimed_at older than the lease window) so the
+            # fleet never accumulates orphaned "running" tasks that stall
+            # forever. This is the silent-failure fix for worker crashes at
+            # scale — without it a 100-worker fleet losing 10%/day stalls on
+            # ~10 tasks/day forever.
+            sweep_interval = 300.0
+            lease_seconds = 3600.0
             while True:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(sweep_interval)
+                try:
+                    requeued = await asyncio.to_thread(
+                        self.store.sweep_expired_leases, lease_seconds
+                    )
+                    if requeued:
+                        print(
+                            f"honeywatch C2: swept {requeued} expired task lease(s) "
+                            "back to pending",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        f"honeywatch C2: lease sweep failed: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
         except asyncio.CancelledError:
             pass
         finally:

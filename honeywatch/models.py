@@ -187,4 +187,7 @@ class WorkerTask:
     variables: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"
     worker_id: str | None = None
+    # When the task was claimed (ISO-8601 UTC). Used by the lease sweeper to
+    # re-queue tasks whose worker died mid-execution.
+    claimed_at: str | None = None
     result: dict[str, Any] | None = None

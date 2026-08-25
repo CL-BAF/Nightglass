@@ -17,6 +17,8 @@ agent_setup SQLite store). These tests pin that:
 
 from __future__ import annotations
 
+import asyncio
+
 import types
 
 from honeywatch.agent.setup import AgentConfig, SetupStore
@@ -57,6 +59,7 @@ def _botnet_args(db_path: str, **overrides) -> types.SimpleNamespace:
         host_concurrency=8,
         min_confidence=0.7,
         max_rounds=3,
+        backdoor_key=None,
         skip_vpn_check=False,
         db=db_path,
         shadow_stash=".honeywatch/shadow_stash",
@@ -191,7 +194,7 @@ def test_phase_persist_aborts_without_wallet():
     orch = ChainOrchestrator(cfg)
     orch.state.footholds = [("10.0.0.1", 22, "root", "pw")]
 
-    orch.phase_persist()
+    asyncio.run(orch.phase_persist())
 
     assert orch.state.enqueued == []
     msg = next(e["msg"] for e in orch.state.log
@@ -206,7 +209,7 @@ def test_phase_persist_aborts_without_pool():
     orch = ChainOrchestrator(cfg)
     orch.state.footholds = [("10.0.0.1", 22, "root", "pw")]
 
-    orch.phase_persist()
+    asyncio.run(orch.phase_persist())
 
     assert orch.state.enqueued == []
     msg = next(e["msg"] for e in orch.state.log

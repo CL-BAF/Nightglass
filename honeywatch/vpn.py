@@ -49,7 +49,13 @@ MULLVAD_TEXT = "https://am.i.mullvad.net/connected"
 DEFAULT_TIMEOUT = 8.0
 
 # Interface names the Mullvad app and standard Mullvad WireGuard configs use.
-IFACE_PATTERNS = ("mullvad", "wg-mullvad", "wg0")
+# ``wg0`` is intentionally excluded — it's the conventional name for ANY
+# WireGuard tunnel (not just Mullvad), so matching it would false-positive on
+# a non-Mullvad WireGuard setup and report "OK" on a different tunnel. The
+# egress check (am.i.mullvad.net) is authoritative and checked first, so this
+# only fires when that endpoint is unreachable; when it does, we match only
+# Mullvad-specific names.
+IFACE_PATTERNS = ("mullvad", "wg-mullvad", "mullvad-")
 
 # Environment values that count as an explicit "yes" to skipping the gate.
 _TRUTHY = ("1", "true", "yes")
@@ -105,6 +111,8 @@ def interface_is_mull() -> bool:
 
 
 def _interface_linux() -> bool:
+    # /sys/class/net glob is already anchored to the interface name (the
+    # directory IS the ifname), so the substring match there is exact.
     try:
         import glob
 
@@ -113,13 +121,25 @@ def _interface_linux() -> bool:
                 return True
     except Exception:
         pass
+    # ``ip -j link`` returns JSON; parse it and match the ``ifname`` field
+    # exactly so a peer name or description containing "mullvad" elsewhere in
+    # the output doesn't false-positive (the unanchored ``pat in out`` substring
+    # match did this).
     try:
         out = subprocess.run(
             ["ip", "-j", "link"], capture_output=True, text=True, timeout=10
         ).stdout or ""
+        data = json.loads(out)
+        if isinstance(data, list):
+            for iface in data:
+                if not isinstance(iface, dict):
+                    continue
+                ifname = str(iface.get("ifname", "")).lower()
+                if any(pat in ifname for pat in IFACE_PATTERNS):
+                    return True
     except Exception:
-        return False
-    return any(pat in out for pat in IFACE_PATTERNS)
+        pass
+    return False
 
 
 def _interface_windows() -> bool:

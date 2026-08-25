@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import sys
+import warnings
 from collections import Counter, defaultdict
 
 from honeywatch.ai.scorer import AiScorer, profile_key
@@ -156,8 +158,11 @@ class Pipeline:
         if self.store is not None:
             try:
                 known_hashes |= self.store.known_key_set()
-            except Exception:
-                pass  # a fresh / read-only store must never block scoring
+            except sqlite3.Error as exc:
+                # A corrupt/read-only store must never block scoring, but a
+                # silent pass hides the degradation — warn so the operator
+                # knows honeypot-key learning is offline for this run.
+                warnings.warn(f"honeywatch: known_key_set failed: {exc}")
 
         signals = [analyze(fp, known_hashes) for fp in fingerprints]
 
@@ -214,12 +219,13 @@ class Pipeline:
             )
 
         # Learn honeypot host-key hashes for future runs. A failure here must
-        # never invalidate a completed scan.
+        # never invalidate a completed scan, but a silent pass hides the
+        # degradation — warn so the operator knows learning is offline.
         if self.store is not None:
             try:
                 self.store.learn_from_scores(scores)
-            except Exception:
-                pass
+            except sqlite3.Error as exc:
+                warnings.warn(f"honeywatch: learn_from_scores failed: {exc}")
         return scores
 
     # ------------------------------------------------------------------ #

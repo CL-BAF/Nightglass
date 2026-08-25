@@ -93,20 +93,18 @@ class OllamaClient:
         return headers
 
     # ------------------------------------------------------------------ chat
-    def chat(
+    def _post_chat(
         self,
         messages: list[dict[str, Any]],
         json_mode: bool = False,
         temperature: float | None = None,
-        *,
-        return_raw: bool = False,
-    ) -> str | dict[str, Any]:
-        """POST ``/chat/completions`` and return the assistant text (stripped).
+    ) -> dict[str, Any]:
+        """POST ``/chat/completions`` and return the parsed JSON response.
 
-        When *return_raw* is True, returns the full message dict from the first
-        choice (including ``reasoning_content``, ``thinking``, etc.) instead of
-        just the content string.  This lets callers inspect alternate fields
-        that reasoning models may populate instead of ``content``.
+        Shared by :meth:`chat` and :meth:`raw_chat` so the request-body
+        construction and the HTTP-error → AiError mapping live in one place
+        and cannot drift apart (the original copy-pasted blocks had already
+        started to).
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -126,7 +124,7 @@ class OllamaClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(_read_capped(resp))
+                return json.loads(_read_capped(resp))
         except urllib.error.HTTPError as err:
             snippet = err.read().decode("utf-8", errors="replace")[:500]
             raise AiError(f"Ollama HTTP {err.code}: {snippet}") from err
@@ -134,6 +132,23 @@ class OllamaClient:
             raise AiError(_UNREACHABLE_MSG.format(base=self.base_url)) from err
         except ValueError as err:
             raise AiError(f"Ollama returned non-JSON response: {err}") from err
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        json_mode: bool = False,
+        temperature: float | None = None,
+        *,
+        return_raw: bool = False,
+    ) -> str | dict[str, Any]:
+        """POST ``/chat/completions`` and return the assistant text (stripped).
+
+        When *return_raw* is True, returns the full message dict from the first
+        choice (including ``reasoning_content``, ``thinking``, etc.) instead of
+        just the content string.  This lets callers inspect alternate fields
+        that reasoning models may populate instead of ``content``.
+        """
+        data = self._post_chat(messages, json_mode, temperature)
 
         try:
             message = data["choices"][0]["message"]
@@ -201,32 +216,7 @@ class OllamaClient:
         the model might include.  Useful for debugging why a model returns an
         empty ``content`` field.
         """
-        body: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature if temperature is None else temperature,
-            "stream": False,
-        }
-        if json_mode:
-            body["response_format"] = {"type": "json_object"}
-
-        payload = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=payload,
-            headers=self._headers(),
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(_read_capped(resp))
-        except urllib.error.HTTPError as err:
-            snippet = err.read().decode("utf-8", errors="replace")[:500]
-            raise AiError(f"Ollama HTTP {err.code}: {snippet}") from err
-        except OSError as err:
-            raise AiError(_UNREACHABLE_MSG.format(base=self.base_url)) from err
-        except ValueError as err:
-            raise AiError(f"Ollama returned non-JSON response: {err}") from err
+        return self._post_chat(messages, json_mode, temperature)
 
     def is_reachable(self) -> bool:
         """True when GET ``/models`` returns any 2xx status.
@@ -242,7 +232,10 @@ class OllamaClient:
             )
             with urllib.request.urlopen(req, timeout=min(self.timeout, 10.0)) as resp:
                 return 200 <= resp.status < 300
-        except OSError:
+        except (OSError, ValueError):
+            # OSError = network/DNS failure; ValueError = malformed base_url
+            # (urlopen raises ValueError on a bad URL scheme/host). Both mean
+            # "not reachable" per the docstring's "any 2xx -> True, else False".
             return False
 
     def models(self) -> list[str]:

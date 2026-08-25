@@ -42,6 +42,7 @@ from honeywatch.opsec import (
     attempt_sshpass,
     auth_methods,
     sleep_with_jitter,
+    spoofed_ssh_banner,
     within_business_hours,
 )
 
@@ -240,11 +241,12 @@ async def _paramiko_attempt(
         # Bound blocking transport reads (incl. auth_password) so a hung
         # server stalls only this attempt, not the whole event loop slot.
         t.set_timeout(timeout_s)
+        banner = spoofed_ssh_banner()
         try:
-            t._CLIENT_IDENTITY = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
+            t._CLIENT_IDENTITY = banner
         except Exception:
             pass
-        t.local_version = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
+        t.local_version = banner
         t.start_client(timeout=timeout_s)
         t.auth_password(user, password)
         attempt.success = True

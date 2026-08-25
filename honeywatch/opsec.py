@@ -54,9 +54,11 @@ __all__ = [
     "LoginAttempt",
     "PARAMIKO_HASSH_RISK",
     "ProxyPool",
+    "SPOOFED_BANNER",
     "attempt_sshpass",
     "auth_methods",
     "jitter_delay",
+    "spoofed_ssh_banner",
     "within_business_hours",
 ]
 
@@ -70,6 +72,64 @@ PARAMIKO_HASSH_RISK = (
     "automation tooling; install sshpass+openssh and use the ssh backend for a "
     "genuine OpenSSH client fingerprint"
 )
+
+
+# --------------------------------------------------------------------------- #
+# Spoofed client banner — single source of truth
+# --------------------------------------------------------------------------- #
+# Every honeywatch module that opens an SSH connection (crack.py, spray.py,
+# opsec.py, chain._ssh_exec, hashcrack.grab_shadow, loot.grab_loot,
+# fingerprint._full_probe) used to hardcode the SAME banner string
+# ("SSH-2.0-OpenSSH_9.0p1 Debian-1") in six different files. That made every
+# honeywatch instance on the planet emit one identical client fingerprint —
+# a defender who saw it once could blacklist every honeywatch instance
+# forever. Worse, OpenSSH_9.0p1 shipped April 2022 and the Debian-1 suffix
+# (real Debian packages are Debian-1+deb12u1) was itself a giveaway.
+#
+# This is the single source of truth. Modules import and call
+# :func:`spoofed_ssh_banner` instead of hardcoding a string. The default is a
+# pool of current distro-stamped OpenSSH version strings; :func:`spoofed_ssh_banner`
+# returns a random one per call so two honeywatch instances don't share a
+# fingerprint, and a single instance doesn't reuse the same banner across
+# every connection in a scan. The pool is refreshable via config without a
+# code change.
+import random as _random
+import threading as _threading
+
+# A pool of plausible, currently-deployed OpenSSH client banner strings drawn
+# from real distro packages. Each entry is "SSH-2.0-OpenSSH_<ver> <distro-tag>"
+# matching the format a real ssh client emits. Updated to versions actually
+# shipping in 2024-2026 distro releases so a defender comparing against
+# current baselines doesn't see a 4-year-old client (itself an anomaly).
+_SPOOFED_BANNER_POOL = (
+    "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.4",
+    "SSH-2.0-OpenSSH_9.3p1 Debian-1+deb12u1",
+    "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2",
+    "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10",
+    "SSH-2.0-OpenSSH_9.4p1 Debian-1+deb13u1",
+    "SSH-2.0-OpenSSH_9.7p1 Ubuntu-3ubuntu16",
+    "SSH-2.0-OpenSSH_9.3p1 Fedora-38",
+    "SSH-2.0-OpenSSH_9.5p1 Arch-1",
+    "SSH-2.0-OpenSSH_9.6p1 Alpine-3",
+)
+# Backwards-compat constant: the single banner string older code paths still
+# import as SPOOFED_BANNER. New code should call spoofed_ssh_banner() instead
+# so each connection draws a fresh banner from the pool.
+SPOOFED_BANNER = _SPOOFED_BANNER_POOL[0]
+_banner_lock = _threading.Lock()
+
+
+def spoofed_ssh_banner(seed: int | None = None) -> str:
+    """Return a plausible OpenSSH client banner, randomized per call.
+
+    The pool is a set of current distro-stamped OpenSSH strings. Drawing one
+    per call (instead of a single hardcoded constant) means two honeywatch
+    instances don't share a client fingerprint, and a single instance doesn't
+    reuse the same banner across every connection in a scan. Pass a ``seed``
+    for deterministic test output.
+    """
+    rng = _random.Random(seed) if seed is not None else _random
+    return rng.choice(_SPOOFED_BANNER_POOL)
 
 
 # --------------------------------------------------------------------------- #
@@ -214,11 +274,12 @@ def auth_methods(
         sock = _socket.create_connection((ip, port), timeout=timeout_s)
         sock.settimeout(timeout_s)
         t = paramiko.Transport(sock)
+        banner = spoofed_ssh_banner()
         try:
-            t._CLIENT_IDENTITY = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
+            t._CLIENT_IDENTITY = banner
         except Exception:
             pass
-        t.local_version = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
+        t.local_version = banner
         t.start_client(timeout=timeout_s)
         try:
             t.auth_none(user)

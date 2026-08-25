@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS c2_tasks (
     variables_json TEXT,
     status TEXT NOT NULL,
     worker_id TEXT,
+    claimed_at TEXT,
     result_json TEXT,
     created_at TEXT,
     updated_at TEXT
@@ -270,8 +271,8 @@ class C2Store:
                     """
                     INSERT INTO c2_tasks (id, operation_id, payload_id, category,
                         target_json, script, variables_json, status, worker_id,
-                        result_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        claimed_at, result_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.id,
@@ -283,6 +284,7 @@ class C2Store:
                         _encode(task.variables),
                         task.status,
                         task.worker_id,
+                        task.claimed_at,
                         _encode(task.result),
                         _now(),
                         _now(),
@@ -325,6 +327,11 @@ class C2Store:
                     return None
                 task.status = "running"
                 task.worker_id = worker_id
+                task.claimed_at = _now()
+                conn.execute(
+                    "UPDATE c2_tasks SET claimed_at = ? WHERE id = ?",
+                    (_now(), task.id),
+                )
                 return task
         finally:
             self._close(conn)
@@ -405,6 +412,61 @@ class C2Store:
             worker_id=row["worker_id"],
             result=_decode(row["result_json"]),
         )
+
+    # ------------------------------------------------------------------ #
+    # Lease sweeper (v0.2): orphaned running tasks
+    # ------------------------------------------------------------------ #
+    def sweep_expired_leases(self, lease_seconds: float = 3600.0) -> int:
+        """Re-queue tasks claimed by workers that died mid-execution.
+
+        A claimed task stays ``running`` forever if its worker crashes — the
+        claim is atomic but there is no lease. This is the most likely silent
+        failure mode at fleet scale (a 100-worker fleet losing 10%/day
+        accumulates 10 orphaned running tasks/day that stall forever).
+
+        Tasks whose ``claimed_at`` is older than ``lease_seconds`` are reset
+        to ``pending`` (worker_id cleared) so another worker can pick them up.
+        Returns how many tasks were re-queued. Safe to call on an interval
+        from the controller.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)).isoformat()
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute(
+                    """
+                    UPDATE c2_tasks
+                    SET status = 'pending', worker_id = NULL, claimed_at = NULL,
+                        updated_at = ?
+                    WHERE status = 'running' AND claimed_at IS NOT NULL
+                      AND claimed_at < ?
+                    """,
+                    (_now(), cutoff),
+                )
+                return cur.rowcount
+        finally:
+            self._close(conn)
+
+    def reap_dead_workers(self, stale_seconds: float = 900.0) -> list[str]:
+        """Mark workers offline (they keep a last_seen heartbeat).
+
+        Returns the ids of workers last seen before ``stale_seconds`` ago —
+        the controller surfaces them so an operator sees the fleet shrank
+        instead of a dashboard full of ghosts.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)).isoformat()
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id FROM c2_workers WHERE last_seen < ?", (cutoff,)
+            ).fetchall()
+        finally:
+            self._close(conn)
+        return [r["id"] for r in rows]
 
     # ------------------------------------------------------------------ #
     # Workers

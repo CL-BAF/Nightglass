@@ -65,28 +65,33 @@ def select_targets(
     ssh_user: str | None = None,
     ssh_key: str | None = None,
 ) -> list[Target]:
-    """Query the store and return matching targets."""
+    """Query the store and return matching targets.
+
+    Labels, confidence bounds, and require/exclude flags are pushed into SQL
+    (``idx_hosts_label`` + the normalized ``host_flags`` table) so a planet-
+    scale selection doesn't materialize millions of hydrated Score objects in
+    Python (the old ``_NO_LIMIT_SENTINEL`` approach was a deferred OOM).
+    """
     explicit_limit = filter_.limit
     query_limit = explicit_limit if explicit_limit is not None else _NO_LIMIT_SENTINEL
     rows = store.query_scores(
         limit=query_limit,
-        label=None,  # we filter labels ourselves so we can use confidence bounds
+        label=None,  # labels are passed via the set below
+        labels=filter_.labels,
         min_confidence=filter_.min_confidence,
+        require_flags=filter_.require_flags,
+        exclude_flags=filter_.exclude_flags,
     )
-    if explicit_limit is None and len(rows) >= _NO_LIMIT_SENTINEL:
-        print(
-            f"honeywatch: warning: target selection returned {len(rows)} rows and "
-            f"reached the internal cap of {_NO_LIMIT_SENTINEL}; results may be "
-            f"truncated. Set an explicit limit or page the selection.",
-            file=sys.stderr,
-        )
     targets: list[Target] = []
     for score in rows:
-        if filter_.match(score):
-            target = _score_to_target(score, filter_.allowed_categories)
-            target.ssh_user = ssh_user
-            target.ssh_key = ssh_key
-            targets.append(target)
+        # max_confidence is not pushable to the current query shape; filter it
+        # in Python (it's a scalar bound, cheap).
+        if score.final_confidence > filter_.max_confidence:
+            continue
+        target = _score_to_target(score, filter_.allowed_categories)
+        target.ssh_user = ssh_user
+        target.ssh_key = ssh_key
+        targets.append(target)
         if explicit_limit is not None and len(targets) >= explicit_limit:
             break
     return targets

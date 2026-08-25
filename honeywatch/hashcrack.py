@@ -32,6 +32,8 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from honeywatch.opsec import spoofed_ssh_banner as _spoofed_ssh_banner
+
 __all__ = [
     "CrackedHash",
     "HashCrackResult",
@@ -576,9 +578,19 @@ def grab_shadow(
 
     transport = None
     try:
-        transport = paramiko.Transport((ip, port))
-        transport._CLIENT_IDENTITY = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
-        transport.local_version = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
+        # Build the socket with an explicit connect timeout so a blackholed
+        # foothold cannot stall the chain indefinitely (paramiko.Transport((ip,
+        # port)) connects with no timeout of its own). This is the same
+        # pattern already used in opsec.auth_methods / spray._paramiko_attempt.
+        import socket as _socket
+
+        sock = _socket.create_connection((ip, port), timeout=timeout_s)
+        sock.settimeout(timeout_s)
+        transport = paramiko.Transport(sock)
+        banner = _spoofed_ssh_banner()
+        transport._CLIENT_IDENTITY = banner
+        transport.local_version = banner
+        transport.set_timeout(timeout_s)
         transport.start_client(timeout=timeout_s)
         if key_path:
             pkey = _load_private_key(paramiko, key_path)

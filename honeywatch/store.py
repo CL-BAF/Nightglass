@@ -54,6 +54,23 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_hosts_software ON hosts(software)",
 ]
 
+# Normalized host-flags table. The hosts.flags column is a comma-joined string
+# that can't be filtered in SQL; every flag-based targeting query (deploy's
+# require_flags/exclude_flags, stats()' by-flag counts) had to stream the whole
+# table into Python and split strings. With this table, flag queries become
+# indexed EXISTS lookups and stats() becomes a GROUP BY.
+_HOST_FLAGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS host_flags (
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    flag TEXT NOT NULL,
+    PRIMARY KEY (ip, port, flag)
+)
+"""
+_HOST_FLAGS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_host_flags_flag ON host_flags(flag)"
+)
+
 # Persistent catalogue of host-key SHA-256 fingerprints that previous runs
 # classified as honeypots. Feeding this back into ``features.analyze`` as the
 # ``known_hashes`` set means a honeypot farm seen once is recognised forever.
@@ -80,6 +97,26 @@ CREATE TABLE IF NOT EXISTS credentials (
     source TEXT,
     discovered_at TEXT,
     PRIMARY KEY (ip, port, user)
+)
+"""
+
+# Persistent chain run state. The chain claims "durable state in SQLite so a
+# killed run resumes" — this table is what makes that honest. Without it,
+# pivoted_subnets/looted_footholds/enqueued/round all lived in memory and a
+# killed run re-scanned every pivoted subnet (loud), re-SFTP'd every loot
+# file from every popped box (noise), and re-enqueued deploys (double
+# deploy). One row per run id; each phase checkpoints into it.
+_CHAIN_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chain_state (
+    run_id TEXT PRIMARY KEY,
+    round INTEGER NOT NULL DEFAULT 0,
+    pivoted_subnets TEXT NOT NULL DEFAULT '[]',
+    looted_footholds TEXT NOT NULL DEFAULT '[]',
+    enqueued TEXT NOT NULL DEFAULT '[]',
+    recovered_ssh_keys TEXT NOT NULL DEFAULT '[]',
+    cloud_creds TEXT NOT NULL DEFAULT '[]',
+    loot TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT
 )
 """
 
@@ -146,8 +183,11 @@ class Store:
         conn.executescript(_SCHEMA)
         conn.executescript(_KNOWN_KEYS_SCHEMA)
         conn.executescript(_CREDENTIALS_SCHEMA)
+        conn.executescript(_CHAIN_STATE_SCHEMA)
+        conn.executescript(_HOST_FLAGS_SCHEMA)
         for stmt in _INDEXES:
             conn.execute(stmt)
+        conn.execute(_HOST_FLAGS_INDEX)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_credentials_ip "
             "ON credentials(ip, port)"
@@ -187,6 +227,21 @@ class Store:
                     """,
                     [self._to_row(score) for score in scores],
                 )
+                # Maintain the normalized host_flags table so flag-based
+                # targeting (deploy require_flags/exclude_flags) and stats()
+                # run as indexed SQL instead of Python-side string splitting.
+                for score in scores:
+                    sig = score.signals
+                    flags = list(sig.flags) if sig else []
+                    conn.execute(
+                        "DELETE FROM host_flags WHERE ip = ? AND port = ?",
+                        (score.ip, int(score.port)),
+                    )
+                    if flags:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO host_flags (ip, port, flag) VALUES (?, ?, ?)",
+                            [(str(score.ip), int(score.port), flag) for flag in flags],
+                        )
         finally:
             self._close(conn)
 
@@ -324,8 +379,15 @@ class Store:
         limit: int = 100,
         label: str | None = None,
         min_confidence: float = 0.0,
+        labels: set[str] | None = None,
     ) -> list[dict]:
-        """Return stored rows as dicts with ip, port, label, confidence, banner, flags."""
+        """Return stored rows as dicts with ip, port, label, confidence, banner, flags.
+
+        ``labels`` is a set of labels to match (SQL IN — uses the
+        ``idx_hosts_label`` index, unlike the old chain pattern of pulling
+        100k rows and filtering in Python). ``label`` (single) is kept for
+        back-compat; if both are given, ``labels`` wins.
+        """
         conn = self._connect()
         try:
             sql = (
@@ -333,7 +395,11 @@ class Store:
                 "FROM hosts WHERE final_confidence >= ?"
             )
             params: list[object] = [min_confidence]
-            if label is not None:
+            if labels is not None:
+                placeholders = ",".join("?" for _ in labels)
+                sql += f" AND final_label IN ({placeholders})"
+                params.extend(sorted(labels))
+            elif label is not None:
                 sql += " AND final_label = ?"
                 params.append(label)
             sql += " ORDER BY final_confidence DESC, ip ASC LIMIT ?"
@@ -359,8 +425,18 @@ class Store:
         limit: int = 100,
         label: str | None = None,
         min_confidence: float = 0.0,
+        labels: set[str] | None = None,
+        require_flags: set[str] | None = None,
+        exclude_flags: set[str] | None = None,
     ) -> list[Score]:
-        """Return stored rows as hydrated ``Score`` objects for report writers."""
+        """Return stored rows as hydrated ``Score`` objects for report writers.
+
+        ``labels`` (a set) filters in SQL via the ``idx_hosts_label`` index —
+        the old ``select_targets`` path pulled up to 10M rows and matched in
+        Python, which OOM'd the operator box before enqueuing. ``require_flags``
+        / ``exclude_flags`` filter through the normalized ``host_flags`` table
+        with EXISTS subqueries (indexed, no string splitting).
+        """
         conn = self._connect()
         try:
             sql = (
@@ -368,9 +444,29 @@ class Store:
                 "FROM hosts WHERE final_confidence >= ?"
             )
             params: list[object] = [min_confidence]
-            if label is not None:
+            if labels is not None:
+                placeholders = ",".join("?" for _ in labels)
+                sql += f" AND final_label IN ({placeholders})"
+                params.extend(sorted(labels))
+            elif label is not None:
                 sql += " AND final_label = ?"
                 params.append(label)
+            if require_flags:
+                for flag in sorted(require_flags):
+                    sql += (
+                        " AND EXISTS (SELECT 1 FROM host_flags hf "
+                        "WHERE hf.ip = hosts.ip AND hf.port = hosts.port "
+                        "AND hf.flag = ?)"
+                    )
+                    params.append(flag)
+            if exclude_flags:
+                for flag in sorted(exclude_flags):
+                    sql += (
+                        " AND NOT EXISTS (SELECT 1 FROM host_flags hf "
+                        "WHERE hf.ip = hosts.ip AND hf.port = hosts.port "
+                        "AND hf.flag = ?)"
+                    )
+                    params.append(flag)
             sql += " ORDER BY final_confidence DESC, ip ASC LIMIT ?"
             params.append(int(limit))
             rows = conn.execute(sql, params).fetchall()
@@ -424,19 +520,15 @@ class Store:
                     "SELECT final_label, COUNT(*) FROM hosts GROUP BY final_label"
                 ).fetchall()
             )
-            # Flags are stored as a comma-joined string in one column, so a
-            # pure-SQL count isn't possible without a normalized table. Stream
-            # the cursor row-by-row instead of fetchall()-ing every host's flags
-            # into a Python list first — on a 0.0.0.0/0 sweep that avoids holding
-            # millions of flag strings in memory at once.
-            flag_cursor = conn.execute("SELECT flags FROM hosts")
-            by_flag: dict[str, int] = {}
-            for (flags,) in flag_cursor:
-                if not flags:
-                    continue
-                for flag in flags.split(","):
-                    if flag:
-                        by_flag[flag] = by_flag.get(flag, 0) + 1
+            # Flag counts now come from the normalized host_flags table as an
+            # indexed GROUP BY instead of streaming every hosts.flags column
+            # into Python and splitting strings — on a 0.0.0.0/0 sweep that
+            # was holding millions of flag strings in memory per stats() call.
+            by_flag = dict(
+                conn.execute(
+                    "SELECT flag, COUNT(*) FROM host_flags GROUP BY flag"
+                ).fetchall()
+            )
             known = conn.execute("SELECT COUNT(*) FROM known_keys").fetchone()[0]
         finally:
             self._close(conn)
@@ -556,4 +648,72 @@ class Store:
             "attempts": int(row[5] or 0),
             "source": row[6],
             "discovered_at": row[7],
+        }
+
+    # ------------------------------------------------------------------ #
+    # Chain run state (v0.2: durable resume)
+    # ------------------------------------------------------------------ #
+    def save_chain_state(self, run_id: str, state: dict) -> None:
+        """Persist a chain run's resumable state (round, pivoted subnets,
+        looted footholds, enqueued targets, recovered keys).
+
+        One row per run id; each phase checkpoints into it so a killed
+        daemon resumes from where it left off instead of re-scanning every
+        pivoted subnet, re-SFTPing every loot file, and re-enqueuing deploys.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO chain_state (
+                        run_id, round, pivoted_subnets, looted_footholds,
+                        enqueued, recovered_ssh_keys, cloud_creds, loot,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        int(state.get("round", 0)),
+                        json.dumps(state.get("pivoted_subnets", [])),
+                        json.dumps([list(x) for x in state.get("looted_footholds", [])]),
+                        json.dumps([list(x) for x in state.get("enqueued", [])]),
+                        json.dumps(state.get("recovered_ssh_keys", [])),
+                        json.dumps(state.get("cloud_creds", []), default=str),
+                        json.dumps(state.get("loot", []), default=str),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+        finally:
+            self._close(conn)
+
+    def load_chain_state(self, run_id: str) -> dict | None:
+        """Restore a chain run's persisted state, or ``None`` if unknown."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT round, pivoted_subnets, looted_footholds, enqueued, "
+                "recovered_ssh_keys, cloud_creds, loot "
+                "FROM chain_state WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+        finally:
+            self._close(conn)
+        if row is None:
+            return None
+
+        def _load(raw, default):
+            try:
+                return json.loads(raw) if raw else default
+            except ValueError:
+                return default
+
+        return {
+            "round": int(row[0] or 0),
+            "pivoted_subnets": _load(row[1], []),
+            "looted_footholds": [tuple(x) for x in _load(row[2], [])],
+            "enqueued": [tuple(x) for x in _load(row[3], [])],
+            "recovered_ssh_keys": _load(row[4], []),
+            "cloud_creds": _load(row[5], []),
+            "loot": _load(row[6], []),
         }

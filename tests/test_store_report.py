@@ -86,6 +86,73 @@ def test_store_stats_by_flag(tmp_path, openssh_fp):
 
 
 # ---------------------------------------------------------------------------
+# v0.2: SQL-side label-set filtering + flag filtering (host_flags table)
+# ---------------------------------------------------------------------------
+
+def test_store_query_labels_set_filter(tmp_path):
+    """labels=... filters in SQL via idx_hosts_label instead of the old
+    100k-row Python filter."""
+    store = Store(str(tmp_path / "test.db"))
+    store.upsert_scores([
+        _score("192.0.2.1", label="real", confidence=0.1),
+        _score("192.0.2.2", label="likely_real", confidence=0.3),
+        _score("192.0.2.3", label="honeypot", confidence=0.9),
+    ])
+    rows = store.query(limit=10, labels={"real", "likely_real"})
+    ips = {r["ip"] for r in rows}
+    assert ips == {"192.0.2.1", "192.0.2.2"}
+
+
+def test_store_query_scores_flag_filters(tmp_path):
+    """require_flags / exclude_flags filter through the normalized host_flags
+    table — indexed EXISTS lookups, no Python string splitting."""
+    store = Store(str(tmp_path / "test.db"))
+    s1 = _score("192.0.2.1", label="real", confidence=0.1)
+    s1.signals.flags = ["crypto.legacy_cipher"]
+    s2 = _score("192.0.2.2", label="real", confidence=0.2)
+    s2.signals.flags = ["banner.immediate"]
+    store.upsert_scores([s1, s2])
+
+    with_flag = store.query_scores(limit=10, require_flags={"crypto.legacy_cipher"})
+    assert [s.ip for s in with_flag] == ["192.0.2.1"]
+
+    without_flag = store.query_scores(limit=10, exclude_flags={"crypto.legacy_cipher"})
+    assert [s.ip for s in without_flag] == ["192.0.2.2"]
+
+
+# ---------------------------------------------------------------------------
+# v0.2: chain run state persistence (durable resume)
+# ---------------------------------------------------------------------------
+
+
+def test_chain_state_round_trip(tmp_path):
+    store = Store(str(tmp_path / "test.db"))
+    state = {
+        "round": 2,
+        "pivoted_subnets": ["10.0.0.0/24", "10.0.1.0/24"],
+        "looted_footholds": [("10.0.0.5", 22)],
+        "enqueued": [("10.0.0.5", 22)],
+        "recovered_ssh_keys": ["/tmp/key1"],
+        "cloud_creds": [{"ip": "10.0.0.5", "port": 22, "creds": ["AWS_SECRET"]}],
+        "loot": [{"ip": "10.0.0.5", "summary": "x"}],
+    }
+    store.save_chain_state("run-1", state)
+    loaded = store.load_chain_state("run-1")
+    assert loaded is not None
+    assert loaded["round"] == 2
+    assert loaded["pivoted_subnets"] == ["10.0.0.0/24", "10.0.1.0/24"]
+    assert loaded["looted_footholds"] == [("10.0.0.5", 22)]
+    assert loaded["enqueued"] == [("10.0.0.5", 22)]
+    assert loaded["recovered_ssh_keys"] == ["/tmp/key1"]
+    assert loaded["cloud_creds"][0]["creds"] == ["AWS_SECRET"]
+
+
+def test_chain_state_unknown_run_returns_none(tmp_path):
+    store = Store(str(tmp_path / "test.db"))
+    assert store.load_chain_state("never-ran") is None
+
+
+# ---------------------------------------------------------------------------
 # Report writers
 # ---------------------------------------------------------------------------
 

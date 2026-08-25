@@ -37,6 +37,8 @@ import socket
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator
 
+from honeywatch.opsec import spoofed_ssh_banner as _spoofed_ssh_banner
+
 __all__ = [
     "CrackAttempt",
     "CrackResult",
@@ -277,13 +279,15 @@ def _attempt_login(
         sock.settimeout(timeout_s)
         transport = paramiko.Transport(sock)
         # paramiko advertises "SSH-2.0-paramiko_X.Y.Z" by default -- an
-        # instant automation-tool tell in target auth logs. Spoof a common
-        # OpenSSH banner so attempts blend with normal client traffic.
+        # instant automation-tool tell in target auth logs. Spoof a plausible
+        # OpenSSH banner drawn from a pool so two honeywatch instances don't
+        # share a client fingerprint.
+        banner = _spoofed_ssh_banner()
         try:
-            transport._CLIENT_IDENTITY = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
+            transport._CLIENT_IDENTITY = banner
         except Exception:
             pass
-        transport.local_version = "SSH-2.0-OpenSSH_9.0p1 Debian-1"
+        transport.local_version = banner
         transport.start_client(timeout=timeout_s)
         transport.auth_password(user, password)
         # auth_password returns None on success and raises on failure.
