@@ -84,7 +84,7 @@ class ChainConfig:
     evasion: list[str] = field(default_factory=list)
 
     # Offline hash cracking.
-    hashcrack_wordlist: str = ""
+    hashcrack_wordlist: str = ""  # empty = use bundled default
     hashcrack_tool: str = "hashcat"
 
     # Opsec knobs (threaded into every network-touching phase).
@@ -433,10 +433,13 @@ class ChainOrchestrator:
 
     def phase_escalate(self) -> None:
         """Offline-hashcrack every grabbed shadow -> more creds."""
-        if not self.state.footholds or not self.cfg.hashcrack_wordlist:
-            self._emit(ChainPhase.ESCALATE, "skipping (no footholds or no hashcrack wordlist)")
+        if not self.state.footholds:
+            self._emit(ChainPhase.ESCALATE, "skipping (no footholds)")
             return
+        from honeywatch.crack import default_wordlist_path
         from honeywatch.hashcrack import crack_shadow
+
+        wordlist = self.cfg.hashcrack_wordlist or default_wordlist_path()
 
         store = self._store()
         new_creds = 0
@@ -450,7 +453,7 @@ class ChainOrchestrator:
                     continue
             except OSError:
                 continue
-            res = crack_shadow(stash, self.cfg.hashcrack_wordlist,
+            res = crack_shadow(stash, wordlist,
                                tool=self.cfg.hashcrack_tool)
             for c in res.credentials():
                 store.upsert_credential(

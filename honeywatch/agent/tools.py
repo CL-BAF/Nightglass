@@ -332,7 +332,7 @@ _TOOL_SPECS: list[dict[str, Any]] = [
                     "description": "Comma-separated usernames to try (default: built-in population).",
                 },
                 "user": {"type": "string"},
-                "wordlist": {"type": "string"},
+                "wordlist": {"type": "string", "description": "path to a wordlist file (defaults to bundled wordlist)."},
                 "passwords": {"type": "string"},
                 "no_mutations": {"type": "boolean"},
                 "concurrency": {"type": "integer"},
@@ -378,14 +378,14 @@ _TOOL_SPECS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "shadow": {"type": "string", "description": "path to /etc/shadow or a stash dir from grab_shadow."},
-                "wordlist": {"type": "string"},
+                "wordlist": {"type": "string", "description": "path to wordlist file (defaults to bundled wordlist)."},
                 "tool": {"type": "string", "description": "hashcat or john (default hashcat)."},
                 "mode": {"type": "integer"},
                 "ip": {"type": "string", "description": "record creds against this host in the store."},
                 "port": {"type": "integer"},
                 "no_save": {"type": "boolean"},
             },
-            "required": ["shadow", "wordlist"],
+            "required": ["shadow"],
         },
     },
     {
@@ -739,6 +739,10 @@ def _tool_crack_ssh(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     wordlist: list[str] | None = None
     if args.get("wordlist"):
         wordlist = load_wordlist(args["wordlist"])
+    else:
+        # Default to the bundled wordlist so crack_ssh works out of the box.
+        from honeywatch.crack import default_wordlist_path
+        wordlist = load_wordlist(default_wordlist_path())
 
     hosts: list[tuple[str, int]] = []
     raw = args.get("hosts") or ""
@@ -822,6 +826,7 @@ def _tool_grab_shadow(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 def _tool_hashcrack(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     import os
+    from honeywatch.crack import default_wordlist_path
     from honeywatch.hashcrack import crack_shadow
 
     shadow_path = args["shadow"]
@@ -832,13 +837,14 @@ def _tool_hashcrack(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not os.path.isfile(shadow_path):
         return {"error": "shadow file not found: " + args["shadow"]}
 
+    wordlist = args.get("wordlist") or default_wordlist_path()
     tool = args.get("tool", "hashcat")
     mode = args.get("mode")
     if mode is not None:
         mode = int(mode)
     result = crack_shadow(
         shadow_path=shadow_path,
-        wordlist=args["wordlist"],
+        wordlist=wordlist,
         tool=tool,
         mode=mode,
         timeout_s=args.get("timeout"),
@@ -904,7 +910,7 @@ def _tool_run_chain(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         wallet=wallet,
         worker=worker,
         tls=tls,
-        hashcrack_wordlist=args.get("hashcrack_wordlist", ""),
+        hashcrack_wordlist=args.get("hashcrack_wordlist") or "",
         business_hours=bool(args.get("business_hours", False)),
         max_rounds=int(args.get("max_rounds", 3)),
         skip_vpn_check=skip,

@@ -153,6 +153,17 @@ class CrackResult:
 # --------------------------------------------------------------------------- #
 
 
+def default_wordlist_path() -> str:
+    """Return the path to the bundled default wordlist.
+
+    The bundled wordlist (~1800 common passwords) provides out-of-the-box
+    cracking capability. When no ``--wordlist`` is given, tools use this
+    as the fallback so they work without manual setup.
+    """
+    from honeywatch.data.wordlists import default_wordlist_path as _path
+    return _path()
+
+
 def load_wordlist(path: str) -> list[str]:
     """Read a newline-separated wordlist, skipping blanks and comments.
 

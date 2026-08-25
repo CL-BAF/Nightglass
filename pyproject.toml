@@ -48,6 +48,9 @@ honeywatch = "honeywatch.cli:main"
 [tool.setuptools.packages.find]
 include = ["honeywatch*"]
 
+[tool.setuptools.package-data]
+"honeywatch.data" = ["wordlists/*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

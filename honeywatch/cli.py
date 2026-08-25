@@ -412,6 +412,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="use TLS for pool connections by default",
     )
     p_setup.add_argument("--db", default="honeywatch.db", help="SQLite database path")
+    p_setup.add_argument(
+        "--check-tools",
+        action="store_true",
+        help="only check external tool availability (skip wizard)",
+    )
     p_setup.set_defaults(func=_cmd_setup)
 
     # ----------------------------- chat ----------------------------------
@@ -513,7 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_crack.add_argument(
         "--wordlist",
         default=None,
-        help="path to a newline-separated password wordlist",
+        help="path to a newline-separated password wordlist (default: bundled wordlist)",
     )
     p_crack.add_argument(
         "--passwords",
@@ -598,7 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hash.add_argument("shadow", help="path to an /etc/shadow file (or a stash dir)")
     p_hash.add_argument("--passwd", default=None, help="optional /etc/passwd companion file")
-    p_hash.add_argument("--wordlist", required=True, help="password wordlist for the attack")
+    p_hash.add_argument("--wordlist", default=None, help="password wordlist for the attack (default: bundled wordlist)")
     p_hash.add_argument(
         "--tool", choices=("hashcat", "john"), default="hashcat",
         help="cracker binary (default hashcat)"
@@ -1438,7 +1443,27 @@ def _cmd_deploy(args, argv) -> int:
 
 
 def _cmd_setup(args, argv) -> int:
-    from honeywatch.agent.setup import SetupStore, run_setup_wizard
+    from honeywatch.agent.setup import (
+        SetupStore,
+        check_external_tools,
+        offer_install_tools,
+        run_setup_wizard,
+    )
+
+    # --check-tools: just report tool availability, skip the wizard.
+    if getattr(args, "check_tools", False):
+        tool_status = check_external_tools()
+        for t in tool_status:
+            status = "[ok]" if t["available"] else "[--]"
+            print(f"  {status} {t['name']}")
+        missing = [t for t in tool_status if not t["available"]]
+        if missing:
+            print(f"\n{len(missing)} tool(s) missing -- install with:")
+            for t in missing:
+                print(f"  {t.get('apt', '')}")
+        else:
+            print("\nall external tools found.")
+        return 0
 
     non_interactive = {}
     if args.ollama_api_key is not None:
@@ -1618,6 +1643,10 @@ def _cmd_crack(args, argv) -> int:
                 + " unreadable or empty; using built-ins only",
                 file=sys.stderr,
             )
+    else:
+        # Default to the bundled wordlist so crack works out of the box.
+        from honeywatch.crack import default_wordlist_path
+        wordlist = load_wordlist(default_wordlist_path())
 
     hosts: list[tuple[str, int]] = []
     if args.targets:
@@ -1765,6 +1794,9 @@ def _cmd_hashcrack(args, argv) -> int:
         return 1
 
     wordlist = args.wordlist
+    if not wordlist:
+        from honeywatch.crack import default_wordlist_path
+        wordlist = default_wordlist_path()
     if wordlist and not os.path.isfile(wordlist):
         print("hashcrack: wordlist not found: " + wordlist, file=sys.stderr)
         return 1

@@ -13,6 +13,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import shutil
 import sqlite3
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -310,4 +311,135 @@ def run_setup_wizard(
 
     store.save_config(cfg)
     print("\nsetup saved.")
+
+    # Check external tool availability and offer to install missing ones.
+    # Only offer interactive installs when running interactively.
+    tool_status = check_external_tools()
+    if tool_status:
+        _print_tool_summary(tool_status)
+        missing = [t for t in tool_status if not t["available"]]
+        if missing and non_interactive is None:
+            offer_install_tools(missing)
+
     return cfg
+
+
+# --------------------------------------------------------------------------- #
+# External tool availability
+# --------------------------------------------------------------------------- #
+
+# (tool_name, package_name_apt, package_name_brew)
+_EXTERNAL_TOOLS: list[tuple[str, str, str]] = [
+    ("masscan", "masscan", "masscan"),
+    ("zmap", "zmap", "zmap"),
+    ("nmap", "nmap", "nmap"),
+    ("hashcat", "hashcat", "hashcat"),
+    ("john", "john", "john"),
+    ("sshpass", "sshpass", "hudochenkov/sshpass"),
+    ("ssh", "openssh-client", "openssh"),
+]
+
+
+def check_external_tools() -> list[dict[str, str | bool]]:
+    """Check which external tools honeywatch can use are available on PATH.
+
+    Returns a list of dicts with keys ``name``, ``available``, and
+    ``install_cmd`` (a human-readable apt/brew command string).
+    """
+    results: list[dict[str, str | bool]] = []
+    for name, apt_pkg, brew_pkg in _EXTERNAL_TOOLS:
+        available = shutil.which(name) is not None
+        results.append({
+            "name": name,
+            "available": available,
+            "apt": f"sudo apt install -y {apt_pkg}",
+            "brew": f"brew install {brew_pkg}",
+        })
+    return results
+
+
+def _print_tool_summary(tool_status: list[dict[str, str | bool]]) -> None:
+    """Print a summary of available / missing external tools."""
+    print("\nexternal tool availability:")
+    print("-" * 50)
+    for t in tool_status:
+        status = "[ok]" if t["available"] else "[--]"
+        print(f"  {status} {t['name']}")
+    missing = [t for t in tool_status if not t["available"]]
+    if missing:
+        print(f"\n{len(missing)} tool(s) missing -- some commands will not work")
+    else:
+        print("\nall external tools found.")
+
+
+def offer_install_tools(
+    missing: list[dict[str, str | bool]],
+) -> None:
+    """Interactively offer to install each missing external tool.
+
+    Detects the platform (Linux via apt, or macOS via brew) and runs the
+    appropriate install command when the operator confirms.
+    """
+    if not missing:
+        return
+
+    import platform
+    import subprocess
+
+    system = platform.system()
+    if system == "Linux":
+        # Check if apt is available.
+        has_apt = shutil.which("apt") is not None
+        if not has_apt:
+            print(
+                "\nno apt package manager found -- install missing tools manually."
+            )
+            return
+        pkg_mgr = "apt"
+    elif system == "Darwin":
+        has_brew = shutil.which("brew") is not None
+        if not has_brew:
+            print(
+                "\nno Homebrew found -- install it from https://brew.sh, "
+                "then install the missing tools."
+            )
+            return
+        pkg_mgr = "brew"
+    elif system == "Windows":
+        print(
+            "\nautomatic installs are not supported on Windows. "
+            "Install missing tools manually or via WSL."
+        )
+        return
+    else:
+        print(
+            f"\nplatform '{system}' is not supported for automatic installs -- "
+            "install missing tools manually."
+        )
+        return
+
+    print(f"\nmissing tools can be installed via {pkg_mgr}:")
+    for t in missing:
+        cmd = t[pkg_mgr]  # type: ignore[literal-required]
+        print(f"  {cmd}")
+
+    # Offer to install each one.
+    for t in missing:
+        cmd = t[pkg_mgr]  # type: ignore[literal-required]
+        try:
+            answer = input(f"\ninstall {t['name']}? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nskipping remaining installs.")
+            break
+        if answer in ("", "y", "yes"):
+            print(f"running: {cmd}")
+            try:
+                result = subprocess.run(cmd.split(), capture_output=True, text=True)
+                if result.returncode == 0:
+                    print(f"[ok] {t['name']} installed")
+                else:
+                    print(f"[--] {t['name']} install failed: {result.stderr.strip()}")
+            except Exception as exc:
+                print(f"[--] {t['name']} install error: {exc}")
+        else:
+            print(f"skipped {t['name']}")
