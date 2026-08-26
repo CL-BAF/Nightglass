@@ -128,6 +128,14 @@ class Store:
     across threads / coroutines without sharing a connection object).
     """
 
+    # Module-level set of db_paths that have already had their schema + pragmas
+    # applied in this process. The instance-level _initialized flag is kept for
+    # the :memory: shared-connection path, but for file-backed stores this set
+    # avoids re-running CREATE TABLE/INDEX IF NOT EXISTS + PRAGMA on every new
+    # Store() -- chain.py constructs a Store per phase, and the per-instance
+    # flag made each construction pay full DDL overhead (the critic finding).
+    _INITIALIZED_DB_PATHS: set[str] = set()
+
     def __init__(self, db_path: str = "honeywatch.db"):
         self.db_path = db_path
         self._mem_conn: sqlite3.Connection | None = None
@@ -165,7 +173,11 @@ class Store:
                 raise
             return self._mem_conn
         conn = sqlite3.connect(self.db_path)
-        if not self._initialized:
+        # Skip the schema/PRAGMA pass when *any* Store on this db_path in this
+        # process already did it -- CREATE ... IF NOT EXISTS is idempotent but
+        # not free (executescript + 7 indexes + PRAGMAs per construction), and
+        # chain.py builds a fresh Store per phase.
+        if self.db_path not in Store._INITIALIZED_DB_PATHS:
             self._apply_schema(conn)
         return conn
 
@@ -194,6 +206,8 @@ class Store:
         )
         conn.commit()
         self._initialized = True
+        if self.db_path != ":memory:":
+            Store._INITIALIZED_DB_PATHS.add(self.db_path)
 
     def _close(self, conn: sqlite3.Connection) -> None:
         if conn is self._mem_conn:

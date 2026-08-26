@@ -95,6 +95,12 @@ SPEAK: one-line status for the run log
 TOOLS: a list of tool calls, each {"name": tool_name, "arguments": {arg=value}}
 DONE: true when the goal is met or you have exhausted productive moves
 
+CRITICAL: Every cycle you MUST emit at least one tool call in TOOLS OR set
+DONE=true. Describing a move in SPEAK/THOUGHTS without a corresponding tool
+call does nothing — the host only acts on the TOOLS list. If you intend to
+scan, the TOOLS list must contain a {"name":"scan","arguments":{"targets":"..."}}
+entry. Empty TOOLS without DONE=true will be treated as a stall and retried.
+
 If no tool is needed this cycle, leave TOOLS empty and set DONE=true.
 
 Available tools:
@@ -405,7 +411,9 @@ class ChatAgent:
         """Emit agent speech through the configured callback."""
         self.on_say(text)
 
-    def _ollama_chat(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+    def _ollama_chat(
+        self, messages: list[dict[str, str]], json_mode: bool = False
+    ) -> dict[str, Any]:
         """Send messages to Ollama and parse the response.
 
         Strategy:
@@ -415,13 +423,13 @@ class ChatAgent:
         2. Try to parse the text as JSON, then as semi-structured text, then
            fall back to plain text.
         3. If the text is empty (content blank, no reasoning fallback), retry
-           with json_mode=True to force structured output.
+           with the opposite json_mode to force a different output shape.
         """
         # ── Single API call: get raw message for debug + content ──
         raw_msg: dict[str, Any] = {}
         raw: str = ""
         try:
-            raw_msg = self.client.chat(messages, json_mode=False, return_raw=True)
+            raw_msg = self.client.chat(messages, json_mode=json_mode, return_raw=True)
             # Extract content with reasoning fallback (mirrors OllamaClient.chat
             # logic, but we also get the full message for debugging).
             raw_content = raw_msg.get("content")
@@ -461,11 +469,12 @@ class ChatAgent:
                 "tools": [],
             }
 
-        # ── Empty response: retry with json_mode ──
+        # ── Empty response: retry with the opposite json_mode ──
         if not raw:
-            log.warning("empty content; retrying with json_mode=True")
+            retry_mode = not json_mode
+            log.warning("empty content; retrying with json_mode=%s", retry_mode)
             try:
-                raw = self.client.chat(messages, json_mode=True)
+                raw = self.client.chat(messages, json_mode=retry_mode)
             except AiError as exc:
                 return {
                     "thoughts": "Ollama is unreachable (json_mode retry).",
@@ -653,7 +662,12 @@ class ChatAgent:
                            "Decide the next action(s). Emit tool calls or signal DONE.",
             })
             self._trim_history()
-            response = self._ollama_chat(self.messages)
+            # Force structured (json_object) output so chatty models can't
+            # narrate in prose and skip the TOOLS list. The interactive chat
+            # stays lenient (json_mode=False) because a human is reading; the
+            # autonomous loop has no human to interpret prose, so it must get
+            # parseable JSON or it stalls on cycle 1.
+            response = self._ollama_chat(self.messages, json_mode=True)
             thoughts = response.get("thoughts", "")
             speak = response.get("speak", "")
             tools = response.get("tools", [])
@@ -663,7 +677,37 @@ class ChatAgent:
             if on_status:
                 on_status(cycle, response, tools, done)
 
-            # 2. no tool calls this cycle -> the move is either "done" or stalled.
+            # 2. no tool calls this cycle -> the move is either "done" or
+            # the model narrated without acting. If it's DONE, stop. If it's
+            # not DONE, nudge the model once with a corrective prompt before
+            # giving up — smaller models frequently describe a move in SPEAK
+            # without emitting the TOOLS entry, and a single nudge recovers
+            # them. Only treat as "exhausted" if the nudge also produces no
+            # tools.
+            if not tools and not done:
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        "You described a move in SPEAK but emitted no tool "
+                        "calls in TOOLS. The host only acts on the TOOLS list — "
+                        "describing intent does nothing. Emit the tool call now "
+                        "(e.g. {\"name\":\"scan\",\"arguments\":{\"targets\":"
+                        "\"10.0.0.0/24\"}}) or set DONE=true if you truly have "
+                        "no productive move."
+                    ),
+                })
+                self._say(f"[cycle {cycle}] nudge: no tool calls emitted; retrying")
+                response = self._ollama_chat(self.messages, json_mode=True)
+                self._trim_history()
+                thoughts = response.get("thoughts", "")
+                speak = response.get("speak", "")
+                tools = response.get("tools", [])
+                done = _signal_done(response)
+                if speak:
+                    self._say(f"[cycle {cycle}] {speak}")
+                if on_status:
+                    on_status(cycle, response, tools, done)
+
             if not tools:
                 stop_reason = (f"DONE: {thoughts}" if thoughts
                                else "model signaled DONE") if done \

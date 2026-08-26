@@ -221,11 +221,16 @@ async def _spray_host(
     return res
 
 
-async def _paramiko_attempt(
+def _paramiko_attempt_sync(
     ip: str, port: int, user: str, password: str, timeout_s: float,
     proxy: str | None, jump: str | None,
 ) -> LoginAttempt:
-    """paramiko fallback login (distinct HASSH -- residual risk noted)."""
+    """Blocking paramiko login (distinct HASSH -- residual risk noted).
+
+    Runs entirely on a worker thread — :func:`_paramiko_attempt` wraps this in
+    ``asyncio.to_thread`` + ``asyncio.wait_for`` so a hung server stalls only
+    this attempt's slot, never the event loop itself.
+    """
     attempt = LoginAttempt(user=user, password=password, backend="paramiko",
                            source=proxy or jump)
     sock = None
@@ -267,6 +272,35 @@ async def _paramiko_attempt(
             except Exception:
                 pass
     return attempt
+
+
+async def _paramiko_attempt(
+    ip: str, port: int, user: str, password: str, timeout_s: float,
+    proxy: str | None, jump: str | None,
+) -> LoginAttempt:
+    """Async wrapper: run the blocking paramiko login off the event loop.
+
+    The whole blocking body (TCP connect, banner exchange, auth_password) runs
+    on a worker thread via :func:`asyncio.to_thread`, and is bounded by
+    :func:`asyncio.wait_for` with a wall-clock deadline slightly above the
+    per-attempt timeout. Without the thread hop, ``asyncio.wait_for`` alone
+    cannot interrupt a blocking call that's holding the event loop — the
+    thread hop is what lets the loop keep servicing other hosts while one
+    attempt is stuck.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _paramiko_attempt_sync,
+                ip, port, user, password, timeout_s, proxy, jump,
+            ),
+            timeout=timeout_s + 5,
+        )
+    except asyncio.TimeoutError:
+        return LoginAttempt(
+            user=user, password=password, backend="paramiko",
+            source=proxy or jump, error="auth timeout",
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -275,8 +275,9 @@ def crack_with_hashcat(
             return result
         mode = next(iter(modes))
 
-    tmp_dir = tempfile.mkdtemp(prefix="honeywatch_hashcat_")
+    tmp_dir: str | None = None
     try:
+        tmp_dir = tempfile.mkdtemp(prefix="honeywatch_hashcat_")
         # hashcat wants bare hashes (no user prefix); emit just those.
         bare_hashfile = os.path.join(tmp_dir, "bare.txt")
         with open(bare_hashfile, "w", encoding="utf-8") as fh:
@@ -325,10 +326,17 @@ def crack_with_hashcat(
                 )
         result.attempted = len(entries)
         return result
+    except Exception as exc:
+        # Never-raises contract: mkdtemp, open(), or an unexpected path can
+        # raise OSError; capture it as result.error instead of propagating.
+        if not result.error:
+            result.error = f"{type(exc).__name__}: {exc}"
+        return result
     finally:
         # Always reclaim the temp dir, even if an unexpected exception escapes
         # _run's "never raises" contract or a file write fails.
-        _cleanup(tmp_dir)
+        if tmp_dir is not None:
+            _cleanup(tmp_dir)
 
 
 def _parse_hashcat_show(text: str) -> dict[str, str]:
@@ -371,8 +379,9 @@ def crack_with_john(
     fmts = {e.john_format for e in entries if e.john_format}
     result.john_format = next(iter(fmts), None) if len(fmts) == 1 else None
 
-    tmp_dir = tempfile.mkdtemp(prefix="honeywatch_john_")
+    tmp_dir: str | None = None
     try:
+        tmp_dir = tempfile.mkdtemp(prefix="honeywatch_john_")
         hashfile = os.path.join(tmp_dir, "shadow.txt")
         _write_hashfile(entries, hashfile)
         if potfile is None:
@@ -412,8 +421,13 @@ def crack_with_john(
                 )
         result.attempted = len(entries)
         return result
+    except Exception as exc:
+        if not result.error:
+            result.error = f"{type(exc).__name__}: {exc}"
+        return result
     finally:
-        _cleanup(tmp_dir)
+        if tmp_dir is not None:
+            _cleanup(tmp_dir)
 
 
 def _parse_john_show(text: str) -> dict[str, str]:

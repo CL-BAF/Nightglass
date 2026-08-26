@@ -87,8 +87,11 @@ def test_autonomous_loop_caps_at_max_cycles(tmp_path, monkeypatch):
 
 def test_autonomous_loop_stalls_on_no_tools_no_done(tmp_path, monkeypatch):
     agent = _make_agent(tmp_path)
+    # Two stall responses: the first is the cycle decision, the second is the
+    # nudge retry. Both produce no tools and no DONE, so the loop exhausts.
     client, calls = _scripted_client([
         _resp(thoughts="stuck", speak="no move", tools=[], done=False),
+        _resp(thoughts="still stuck", speak="no move", tools=[], done=False),
     ])
     agent.client = client
 
@@ -215,3 +218,50 @@ def test_autonomous_loop_semi_structured_response(tmp_path, monkeypatch):
     summary = agent.run_autonomous(goal="test", max_cycles=10)
     assert summary["tool_calls"] == 1
     assert summary["cycles"] == 2
+
+
+def test_autonomous_loop_forces_json_mode(tmp_path, monkeypatch):
+    """The autonomous loop must call the model with json_mode=True so chatty
+    models can't narrate in prose and skip the TOOLS list (the cycle-1 stall
+    bug deepseek-v4-flash hit)."""
+    agent = _make_agent(tmp_path)
+    seen_modes: list[bool] = []
+
+    def chat(messages, json_mode=False, *, return_raw=False):
+        seen_modes.append(json_mode)
+        text = json.dumps({
+            "thoughts": "done", "speak": "done", "tools": [], "done": True,
+        })
+        return {"role": "assistant", "content": text} if return_raw else text
+
+    agent.client = types.SimpleNamespace(chat=chat)
+    agent.run_autonomous(goal="test", max_cycles=1)
+    # Every call from the autonomous loop must request json_object mode.
+    assert seen_modes, "expected at least one chat call"
+    assert all(m is True for m in seen_modes), (
+        f"autonomous loop must force json_mode=True, got {seen_modes}"
+    )
+
+
+def test_autonomous_loop_prose_narration_does_not_stall(tmp_path, monkeypatch):
+    """Regression: deepseek-v4-flash narrates in plain prose ("Scanning
+    10.0.0.0/24 for SSH hosts.") with no THOUGHTS/SPEAK/TOOLS labels and no
+    JSON. _parse_model_response returns None for prose, and the plain-text
+    fallback yields tools=[] — which used to end the run on cycle 1 as
+    "exhausted". With json_mode forced the model is constrained to JSON, but
+    if a backend ignores json_object the nudge must still fire and a second
+    stall must terminate cleanly (not silently hang)."""
+    agent = _make_agent(tmp_path)
+    # Model ignores json_object and emits prose twice (cycle + nudge).
+    client, calls = _scripted_client([
+        "Scanning 10.0.0.0/24 for SSH hosts.",
+        "Scanning 10.0.0.0/24 for SSH hosts.",
+    ])
+    agent.client = client
+
+    summary = agent.run_autonomous(goal="test", max_cycles=10)
+    assert summary["cycles"] == 1
+    assert summary["tool_calls"] == 0
+    assert summary["done"] is False
+    assert "exhausted" in summary["stop_reason"]
+    assert calls["count"] == 2  # cycle decision + nudge retry
