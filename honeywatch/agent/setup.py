@@ -46,6 +46,11 @@ class AgentConfig:
     controller_url: str = "http://127.0.0.1:8443"
     exec_mode: str = "dry_run"
     ssh_user: str = "root"
+    # Default scan targets for the autonomous agent (CIDRs / IPs). When set
+    # via `honeywatch setup --targets`, `honeywatch agent` starts with a real
+    # target range instead of a vague goal that makes the model emit scans
+    # with no targets.
+    targets: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -166,6 +171,7 @@ class SetupStore:
             "controller_url",
             "exec_mode",
             "ssh_user",
+            "targets",
         ])
         defaults = {
             "ollama_base_url": "https://ollama.com/v1",
@@ -307,6 +313,11 @@ def run_setup_wizard(
         "ssh_user",
         "Default SSH user",
         default=existing.ssh_user or "root",
+    )
+    cfg.targets = _get(
+        "targets",
+        "Default scan targets for the agent (CIDRs/IPs, e.g. 10.0.0.0/24)",
+        default=existing.targets,
     )
 
     store.save_config(cfg)

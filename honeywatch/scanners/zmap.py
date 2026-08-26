@@ -12,7 +12,7 @@ import subprocess
 from typing import List, Optional
 
 from honeywatch.models import HostHit, SSH_PORT
-from honeywatch.scanners import ScannerError
+from honeywatch.scanners import ScannerError, run_with_sudo_fallback
 
 
 def run(
@@ -57,7 +57,9 @@ def run(
             *targets,
         ]
         try:
-            proc = subprocess.run(argv, capture_output=True, timeout=timeout_s)
+            # Non-root users hit raw-socket permission errors; retry via
+            # `sudo -n` (non-interactive) so scans work out of the box.
+            proc = run_with_sudo_fallback(argv, timeout_s)
         except FileNotFoundError as exc:
             raise ScannerError(
                 f"zmap binary not found at {bin_path!r}: "
@@ -72,8 +74,12 @@ def run(
 
         if proc.returncode != 0:
             stderr = proc.stderr.decode("utf-8", "replace").strip()
+            hint = ""
+            if "permission" in stderr.lower():
+                hint = (" [hint] run with sudo or grant raw sockets: "
+                        "sudo setcap cap_net_raw+ep $(which zmap)")
             raise ScannerError(
-                f"zmap exited with code {proc.returncode}: {stderr or 'no stderr'}"
+                f"zmap exited with code {proc.returncode}: {stderr or 'no stderr'}{hint}"
             )
 
         for line in proc.stdout.decode("utf-8", "replace").splitlines():

@@ -1,0 +1,16 @@
+{
+  "coder": {
+    "agent": "build",
+    "model": {
+      "providerID": "ollama-cloud",
+      "modelID": "deepseek-v4-flash:0731"
+    }
+  },
+  "reviewer": {
+    "agent": "build",
+    "model": {
+      "providerID": "ollama-cloud",
+      "modelID": "deepseek-v4-flash:0731"
+    }
+  }
+}
