@@ -26,5 +26,7 @@ certs/
 
 # Local agent / harness state
 .claude/
+.opencode/
+.opencode-orchestrator/
 
 Maybe/
