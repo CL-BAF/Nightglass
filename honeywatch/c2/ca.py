@@ -32,6 +32,7 @@ __all__ = [
     "cert_fingerprint",
     "ca_pin_from_cert",
     "cert_serial",
+    "rotate_ca",
 ]
 
 
@@ -231,3 +232,75 @@ def cert_serial(cert_path: str) -> int:
         raise CAError(f"unexpected openssl x509 -serial output: {text!r}")
     hex_serial = text[len("serial="):].strip()
     return int(hex_serial, 16)
+
+
+def rotate_ca(
+    old_ca_cert: str,
+    old_ca_key: str,
+    new_ca_cert: str,
+    new_ca_key: str,
+    days: int = 3650,
+    cn: str = "honeywatch-internal-ca",
+) -> dict:
+    """Generate a new CA and cross-sign it with the old CA for rotation.
+
+    Creates a new root CA key+cert, then signs the new CA's public key with
+    the *old* CA to produce a cross-signed certificate. Workers that trust
+    the old CA will accept the cross-signed cert during the transition
+    window; new workers trust the new CA directly.
+
+    Returns a dict with:
+        - ``new_ca_cert``: path to the new CA cert
+        - ``new_ca_key``: path to the new CA key
+        - ``cross_cert``: path to the cross-signed cert (new key, old CA signature)
+        - ``new_pin``: SHA-256 fingerprint of the new CA cert
+        - ``old_pin``: SHA-256 fingerprint of the old CA cert
+    """
+    old_ca_cert = os.path.abspath(old_ca_cert)
+    old_ca_key = os.path.abspath(old_ca_key)
+    new_ca_cert = os.path.abspath(new_ca_cert)
+    new_ca_key = os.path.abspath(new_ca_key)
+    _ensure_parent(new_ca_cert)
+    _ensure_parent(new_ca_key)
+
+    # Step 1: Generate the new root CA key + self-signed cert.
+    generate_ca(new_ca_cert, new_ca_key, days=days, cn=cn)
+
+    # Step 2: Create a cross-signed cert — the new CA's public key signed
+    # by the old CA. Workers that only have the old CA in their trust store
+    # will accept this cross-signed cert during the transition window.
+    cross_cert = os.path.join(os.path.dirname(new_ca_cert), "ca-cross.pem")
+    # Generate a CSR from the new key, then sign it with the old CA.
+    csr_path = os.path.join(os.path.dirname(new_ca_cert), ".ca-rotate.csr")
+    ext_path = os.path.join(os.path.dirname(new_ca_cert), ".ca-rotate.ext")
+    try:
+        _run_openssl(
+            ["req", "-new", "-key", new_ca_key, "-out", csr_path,
+             "-subj", f"/CN={cn}"]
+        )
+        Path(ext_path).write_text(
+            "[v3_cross]\n"
+            "basicConstraints = critical, CA:TRUE, pathlen:1\n"
+            "keyUsage = critical, keyCertSign, cRLSign\n",
+            encoding="utf-8",
+        )
+        _run_openssl(
+            ["x509", "-req", "-in", csr_path,
+             "-CA", old_ca_cert, "-CAkey", old_ca_key, "-CAcreateserial",
+             "-out", cross_cert, "-days", str(days),
+             "-extfile", ext_path, "-extensions", "v3_cross"]
+        )
+    finally:
+        for tmp in (csr_path, ext_path):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    return {
+        "new_ca_cert": new_ca_cert,
+        "new_ca_key": new_ca_key,
+        "cross_cert": cross_cert,
+        "new_pin": cert_fingerprint(new_ca_cert),
+        "old_pin": cert_fingerprint(old_ca_cert),
+    }

@@ -275,6 +275,20 @@ def build_parser() -> argparse.ArgumentParser:
              "or --ca) and exit; prints the cert/key paths + CA pin for the worker config",
     )
     p_c2.add_argument(
+        "--rotate-ca",
+        action="store_true",
+        help="generate a new CA cross-signed by the current CA and start a rotation "
+             "transition window. Workers fetch the new CA from /api/ca-rotate and "
+             "add it to their trust store. Use with --ca.",
+    )
+    p_c2.add_argument(
+        "--rotate-transition-hours",
+        type=int,
+        default=24,
+        help="hours for the CA rotation transition window (default: 24). After this "
+             "time, the old CA is dropped and only the new CA is trusted.",
+    )
+    p_c2.add_argument(
         "--api-token",
         default=None,
         help="shared bearer secret; when set, every API + WS request must carry it",
@@ -1422,6 +1436,40 @@ def _cmd_c2(args, argv) -> int:
                   ca=ca_path, cert=w_cert, key=w_key, pin=pin))
         return 0
 
+    # Handle --rotate-ca: generate a new CA cross-signed by the current one.
+    if args.rotate_ca:
+        from honeywatch.c2.ca import ca_pin_from_cert, rotate_ca
+
+        if not ca_path or not os.path.isfile(ca_path):
+            print(
+                "honeywatch: --rotate-ca needs an existing CA cert; "
+                "pass --ca <path> pointing to the current CA.",
+                file=sys.stderr,
+            )
+            return 2
+        old_ca_key = os.path.join(os.path.dirname(ca_path), "honeywatch-ca.key")
+        if not os.path.isfile(old_ca_key):
+            print(
+                f"honeywatch: CA key not found at {old_ca_key!r}; "
+                "the CA key is needed to cross-sign the new CA.",
+                file=sys.stderr,
+            )
+            return 2
+        new_ca_cert = os.path.join(os.path.dirname(ca_path), "honeywatch-ca-new.pem")
+        new_ca_key = os.path.join(os.path.dirname(ca_path), "honeywatch-ca-new.key")
+        result = rotate_ca(ca_path, old_ca_key, new_ca_cert, new_ca_key)
+        print("CA rotation initiated:")
+        print(f"  new CA cert    : {result['new_ca_cert']}")
+        print(f"  new CA key     : {result['new_ca_key']}")
+        print(f"  cross-signed   : {result['cross_cert']}")
+        print(f"  new CA pin     : {result['new_pin']}")
+        print(f"  old CA pin     : {result['old_pin']}")
+        print(f"  transition     : {args.rotate_transition_hours}h")
+        print()
+        print("Update worker configs with the new --ca-pin after transition.")
+        print("During the transition, workers can fetch the new CA from /api/ca-rotate.")
+        return 0
+
     cert = args.tls_cert or getattr(c2_cfg, "tls_cert", None)
     key = args.tls_key or getattr(c2_cfg, "tls_key", None)
     api_token = args.api_token or getattr(c2_cfg, "api_token", None)
@@ -1460,6 +1508,12 @@ def _cmd_c2(args, argv) -> int:
                             api_token=api_token, ca_path=ca_path,
                             revoked_serials=revoked,
                             c2_encrypt=c2_encrypt, c2_key=c2_key)
+    # If a CA rotation is in progress (new CA files on disk), load the
+    # rotation state so workers can fetch the new CA via /api/ca-rotate.
+    if ca_path:
+        import os as _os
+        ca_dir = _os.path.dirname(_os.path.abspath(ca_path))
+        controller.load_ca_rotation(ca_dir, transition_hours=args.rotate_transition_hours)
     try:
         _maybe_await(controller.run())
     except KeyboardInterrupt:

@@ -203,6 +203,11 @@ class Controller:
                 self.crypto = C2Crypto()
         self.app = web.Application(middlewares=[self._build_auth_middleware(), self._build_padding_middleware()])
         self._clients: list["web.WebSocketResponse"] = []
+        # CA rotation state: during a transition window, the controller serves
+        # both the old and new CA certs so workers can update their trust store.
+        # ``_ca_rotation`` is None when no rotation is active, or a dict with
+        # keys (new_ca_cert, cross_cert, new_pin, started_at, expires_at).
+        self._ca_rotation: dict | None = None
         self._setup_routes()
 
     # ------------------------------------------------------------------ #
@@ -318,6 +323,71 @@ class Controller:
         """True when the serial has been revoked."""
         return int(serial) in self.revoked_serials
 
+    def start_ca_rotation(
+        self,
+        old_ca_cert: str,
+        old_ca_key: str,
+        new_ca_cert: str,
+        new_ca_key: str,
+        transition_hours: int = 24,
+    ) -> dict:
+        """Start a CA rotation by generating a new CA cross-signed by the old one.
+
+        After calling this, workers can fetch the new CA from
+        ``/api/ca-rotate`` and add it to their trust store. The transition
+        window defaults to 24 hours, after which the old CA should be dropped.
+        """
+        from honeywatch.c2.ca import rotate_ca
+        from datetime import datetime, timezone, timedelta
+        result = rotate_ca(old_ca_cert, old_ca_key, new_ca_cert, new_ca_key)
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(hours=transition_hours)
+        self._ca_rotation = {
+            "new_ca_cert": result["new_ca_cert"],
+            "new_ca_key": result["new_ca_key"],
+            "cross_cert": result["cross_cert"],
+            "new_pin": result["new_pin"],
+            "old_pin": result["old_pin"],
+            "started_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+        }
+        return self._ca_rotation
+
+    def load_ca_rotation(self, ca_dir: str, transition_hours: int = 24) -> None:
+        """Load CA rotation state from disk if a rotation is in progress.
+
+        Checks for ``ca-rotated.pem`` and ``ca-cross.pem`` in the CA
+        directory. If both exist, sets up the rotation state so workers
+        can fetch the new CA via ``/api/ca-rotate``.
+        """
+        import os as _os
+        from datetime import datetime, timezone, timedelta
+        new_ca = _os.path.join(ca_dir, "honeywatch-ca-new.pem")
+        cross = _os.path.join(ca_dir, "ca-cross.pem")
+        if not _os.path.isfile(new_ca) or not _os.path.isfile(cross):
+            return
+        from honeywatch.c2.ca import cert_fingerprint
+        try:
+            new_pin = cert_fingerprint(new_ca)
+        except Exception:
+            return
+        old_ca = _os.path.join(ca_dir, "honeywatch-ca.pem")
+        old_pin = ""
+        try:
+            old_pin = cert_fingerprint(old_ca)
+        except Exception:
+            pass
+        now = datetime.now(timezone.utc)
+        self._ca_rotation = {
+            "new_ca_cert": new_ca,
+            "new_ca_key": _os.path.join(ca_dir, "honeywatch-ca-new.key"),
+            "cross_cert": cross,
+            "new_pin": new_pin,
+            "old_pin": old_pin,
+            "started_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=transition_hours)).isoformat(),
+        }
+
     def _authorized(self, request: "web.Request") -> bool:
         """True when the request carries the configured bearer token.
 
@@ -351,6 +421,7 @@ class Controller:
         self.app.router.add_get("/api/pubkey", self._api_pubkey)
         self.app.router.add_get("/api/beacon", self._api_beacon)
         self.app.router.add_post("/api/loot", self._api_loot)
+        self.app.router.add_get("/api/ca-rotate", self._api_ca_rotate)
         self.app.router.add_get("/api/health", self._api_health)
 
     # ------------------------------------------------------------------ #
@@ -442,6 +513,43 @@ class Controller:
             body = await request.read()
             files.append({"name": "body", "size": len(body)})
         return _json_response({"ok": True, "files": files, "time": _now()})
+
+    async def _api_ca_rotate(self, request: "web.Request") -> "web.Response":
+        """Serve the new CA cert during a rotation transition window.
+
+        Workers call this endpoint to fetch the new CA and cross-signed
+        cert. They add the new CA to their trust store alongside the old
+        one. After the transition window expires, workers drop the old CA.
+
+        Returns 204 when no rotation is active.
+        """
+        if self._ca_rotation is None:
+            return web.Response(status=204)
+        rot = self._ca_rotation
+        # Check if the transition window has expired.
+        from datetime import datetime, timezone
+        expires = datetime.fromisoformat(rot["expires_at"])
+        if datetime.now(timezone.utc) > expires:
+            return web.Response(status=204)
+        new_ca_pem = ""
+        cross_pem = ""
+        try:
+            with open(rot["new_ca_cert"], "r", encoding="utf-8") as f:
+                new_ca_pem = f.read()
+        except OSError:
+            pass
+        try:
+            with open(rot["cross_cert"], "r", encoding="utf-8") as f:
+                cross_pem = f.read()
+        except OSError:
+            pass
+        return _json_response({
+            "new_ca_cert": new_ca_pem,
+            "cross_signed_cert": cross_pem,
+            "new_pin": rot["new_pin"],
+            "old_pin": rot["old_pin"],
+            "expires_at": rot["expires_at"],
+        })
 
     async def _api_workers(self, request: "web.Request") -> "web.Response":
         # Surface liveness: workers whose last_seen is older than 3x the

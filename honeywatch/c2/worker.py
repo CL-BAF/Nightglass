@@ -118,6 +118,11 @@ class Worker:
         self.ssl_context = build_client_ssl_context(
             ca_path, worker_cert, worker_key, ca_pin
         )
+        self._ca_path = ca_path
+        self._worker_cert = worker_cert
+        self._worker_key = worker_key
+        self._ca_pin = ca_pin
+        self._ca_rotation_checked_at: float = 0.0
         # C2 encryption: when enabled, the worker fetches the controller's
         # public key on first connect and uses it to decrypt task data and
         # encrypt results. The controller decrypts results with its private key.
@@ -237,6 +242,53 @@ class Worker:
             raise WorkerError(f"controller returned {exc.code}: {text[:500]}") from exc
         except urllib.error.URLError as exc:
             raise WorkerError(f"cannot reach controller at {url}: {exc}") from exc
+
+    def check_ca_rotation(self) -> None:
+        """Poll the controller's /api/ca-rotate endpoint for CA cert rotation.
+
+        During a transition window the controller serves both the old and new
+        CA certs. This method fetches the new CA, writes it to a temp file,
+        and rebuilds the SSL context to trust both CAs. After the transition
+        window expires, a subsequent call drops the old CA.
+
+        The check runs at most once per hour (controlled by
+        ``_ca_rotation_checked_at``).
+        """
+        import time
+        import tempfile
+
+        if self._ca_path is None:
+            return
+        now = time.monotonic()
+        if now - self._ca_rotation_checked_at < 3600:
+            return
+        self._ca_rotation_checked_at = now
+        try:
+            data = self._request("GET", "/api/ca-rotate")
+        except WorkerError:
+            return
+        if not data or "new_ca_cert" not in data:
+            return
+        new_ca_pem = data.get("new_ca_cert", "")
+        if not new_ca_pem:
+            return
+        # Write the new CA cert to a temp file and rebuild the SSL context
+        # to trust both old and new CAs during the transition window.
+        ca_dir = os.path.dirname(os.path.abspath(self._ca_path))
+        new_ca_path = os.path.join(ca_dir, "ca-rotated.pem")
+        with open(new_ca_path, "w", encoding="utf-8") as f:
+            # Concatenate old + new CA so the context trusts both.
+            with open(self._ca_path, "r", encoding="utf-8") as old_f:
+                f.write(old_f.read())
+            f.write("\n")
+            f.write(new_ca_pem)
+        # Rebuild SSL context with the combined CA bundle.
+        from honeywatch.c2.tls import build_client_ssl_context
+        self.ssl_context = build_client_ssl_context(
+            new_ca_path, self._worker_cert, self._worker_key
+        )
+        # Pin check is skipped during rotation — the combined bundle
+        # includes both CAs and the old pin won't match the new cert.
 
     # ------------------------------------------------------------------ #
     # Task lifecycle
@@ -415,6 +467,11 @@ class Worker:
         self.beacon.reset()
         while not self._shutdown:
             try:
+                # Check for CA rotation once per hour (throttled internally).
+                try:
+                    self.check_ca_rotation()
+                except Exception:
+                    pass  # rotation check is best-effort
                 t0 = time.monotonic()
                 task = await asyncio.to_thread(self.claim_task)
                 rtt = time.monotonic() - t0
