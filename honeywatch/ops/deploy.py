@@ -193,8 +193,11 @@ _EVASION_POSITION = {
     "forensics_cleanup": "final",
     "cleanup": "final",
     "firewall_disable": "prepend",
+    "cpu_governor": "append",
     "k8s_daemonset": "persist",
     "cron_beacon": "persist",
+    "web_exploit": "persist",
+    "windows_cred_dump": "persist",
 }
 
 # Sort order within the ``append`` group. Lower numbers run first. Strip (1)

