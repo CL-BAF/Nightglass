@@ -15,13 +15,57 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random as _random
+import string as _string
 import time
 
 from ..models import Fingerprint
+from ..opsec import spoofed_ssh_banner_for_target
 
-CLIENT_BANNER = b"SSH-2.0-honeywatch_0.1\r\n"
+# Backwards-compat constant: older code and docs may import CLIENT_BANNER. The
+# probe itself no longer uses it -- it draws a per-call spoofed banner via
+# _client_banner_bytes() (see below) so two connections, and two honeywatch
+# instances, don't share a client fingerprint. Kept as a single plausible
+# OpenSSH banner for any remaining static import; the former tool-named
+# ``SSH-2.0-honeywatch_0.1`` value was the loudest OPSEC hole in the codebase
+# (the first bytes any probed host saw) and is intentionally gone.
+CLIENT_BANNER = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.4\r\n"
 MSG_KEXINIT = 20  # RFC 4253 section 7.1: SSH_MSG_KEXINIT
 _MAX_PACKET = 1 << 16  # defensive cap on a single SSH packet
+
+
+def _client_banner_bytes(ip: str, port: int = 22) -> bytes:
+    """A per-target spoofed OpenSSH client banner, CRLF-terminated.
+
+    Sent on the raw-socket KEXINIT exchange. The banner is sticky per target
+    (see :func:`spoofed_ssh_banner_for_target`): repeat probes of one host
+    carry one consistent client identity instead of a different OpenSSH
+    version on every connection.
+    """
+    return spoofed_ssh_banner_for_target(ip, port).encode("ascii", "ignore") + b"\r\n"
+
+
+# Generic accounts every SSH scanner attempts. Drawing the honeypot auth-probe
+# username from here blends with organic failed-login noise rather than
+# advertising a tool-specific handle like the former ``honeywatch_probe_xz9``.
+_PROBE_USER_POOL = (
+    "root", "admin", "user", "ubuntu", "debian", "centos",
+    "postgres", "git", "ansible", "operator",
+)
+
+
+def _probe_credentials() -> tuple[str, str]:
+    """Return a per-call ``(username, password)`` for the deliberate-wrong probe.
+
+    The password is a high-entropy random string: guaranteed not a real
+    credential (so a real host rejects it and we don't accidentally
+    authenticate), and different every call so a honeypot cannot fingerprint
+    honeywatch by a fixed probe password such as the former ``wrong-pass-12345``.
+    """
+    user = _random.choice(_PROBE_USER_POOL)
+    alphabet = _string.ascii_letters + _string.digits
+    password = "".join(_random.choice(alphabet) for _ in range(16))
+    return user, password
 
 # RFC 4253 section 7.1 name-list field order, in the wire order they appear.
 _NAME_LIST_KEYS = (
@@ -222,6 +266,11 @@ def _full_probe(fp: Fingerprint, auth_probe: bool, timeout: float) -> dict:
         sock = _socket.create_connection((fp.ip, fp.port), timeout=deadline)
         sock.settimeout(deadline)
         transport = paramiko.Transport(sock)
+        # Advertise a spoofed OpenSSH client banner (matching every other
+        # connection path) instead of paramiko's default -- which is itself a
+        # distinctive client fingerprint. Sticky per target so repeat probes
+        # of one host present one consistent client identity.
+        transport.local_version = spoofed_ssh_banner_for_target(fp.ip, fp.port)
         transport.set_timeout(deadline)
         try:
             transport.start_client(timeout=deadline)
@@ -234,8 +283,9 @@ def _full_probe(fp: Fingerprint, auth_probe: bool, timeout: float) -> dict:
         if blob:
             fp.host_key_sha256 = hashlib.sha256(blob).hexdigest()
         if auth_probe:
+            probe_user, probe_pass = _probe_credentials()
             try:
-                transport.auth_password("honeywatch_probe_xz9", "wrong-pass-12345")
+                transport.auth_password(probe_user, probe_pass)
                 evidence["auth_password_accepted"] = True
             except Exception as exc:
                 evidence["auth_password_accepted"] = False
@@ -313,7 +363,7 @@ async def probe_ssh(
         fp.banner = banner
         fp.protocol, fp.software, fp.software_version = parse_banner(banner)
 
-        writer.write(CLIENT_BANNER)
+        writer.write(_client_banner_bytes(ip, port))
         await writer.drain()
 
         # Read packets until we hit an SSH_MSG_KEXINIT (or run out of tries).

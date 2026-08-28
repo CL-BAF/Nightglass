@@ -126,3 +126,52 @@ async def test_claim_and_complete_task(controller):
         assert resp.status == 200
     finally:
         await client.close()
+
+
+class _FakeTransport:
+    """Minimal stand-in for an aiohttp request transport for peercert tests."""
+
+    def __init__(self, peercert):
+        self._peercert = peercert
+
+    def get_extra_info(self, name, default=None):
+        if name == "peercert":
+            return self._peercert
+        return default
+
+
+class _FakeRequest:
+    def __init__(self, peercert):
+        self.transport = _FakeTransport(peercert)
+
+
+def test_client_cert_serial_parses_hex_string(controller):
+    """The asyncio SSL transport exposes serialNumber as a hex string, not int.
+
+    Python's ``getpeercert()`` returns e.g. ``{'serialNumber': '2ED0594A...'}``;
+    the controller must parse that to an int so revocation set membership works.
+    """
+    # 0x2ED0594AC6E47BE6 == 338882... ; use a small explicit value.
+    assert controller._client_cert_serial(_FakeRequest({"serialNumber": "0A0B0C"})) == 0x0A0B0C
+    # uppercase / long hex survives
+    assert controller._client_cert_serial(
+        _FakeRequest({"serialNumber": "2ED0594AC6E47BE6"})
+    ) == int("2ED0594AC6E47BE6", 16)
+
+
+def test_client_cert_serial_handles_missing_and_garbage(controller):
+    assert controller._client_cert_serial(_FakeRequest(None)) is None
+    assert controller._client_cert_serial(_FakeRequest({})) is None
+    # garbage that isn't hex -> None (never raises)
+    assert controller._client_cert_serial(_FakeRequest({"serialNumber": "nothex"})) is None
+    # already-int passes through (defensive)
+    assert controller._client_cert_serial(_FakeRequest({"serialNumber": 42})) == 42
+
+
+def test_revocation_set_operations(controller):
+    controller.revoke_serial(0x0A0B0C)
+    assert controller.is_revoked(0x0A0B0C)
+    assert not controller.is_revoked(0x0A0B0D)
+    # revoking again is idempotent
+    controller.revoke_serial(0x0A0B0C)
+    assert controller.is_revoked(0x0A0B0C)

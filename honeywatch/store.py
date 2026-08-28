@@ -14,6 +14,7 @@ connection pragmas are applied once per instance.
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import threading
@@ -100,6 +101,25 @@ CREATE TABLE IF NOT EXISTS credentials (
 )
 """
 
+# Verified footholds — credentials confirmed by phase_foothold (actual SSH
+# shell access, shadow file grab, etc.). NOT every cracked password — only
+# those where the chain actually connected and verified access. This is
+# separate from the credentials table because a credential with source
+# 'chain-spray' may not have shell access (service account with nologin),
+# while source 'chain-foothold' means verified shell access.
+_FOOTHOLDS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS footholds (
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    user TEXT NOT NULL,
+    password TEXT,
+    key_path TEXT,
+    source TEXT,
+    verified_at TEXT,
+    PRIMARY KEY (ip, port, user)
+)
+"""
+
 # Persistent chain run state. The chain claims "durable state in SQLite so a
 # killed run resumes" — this table is what makes that honest. Without it,
 # pivoted_subnets/looted_footholds/enqueued/round all lived in memory and a
@@ -116,7 +136,79 @@ CREATE TABLE IF NOT EXISTS chain_state (
     recovered_ssh_keys TEXT NOT NULL DEFAULT '[]',
     cloud_creds TEXT NOT NULL DEFAULT '[]',
     loot TEXT NOT NULL DEFAULT '[]',
+    hosts TEXT NOT NULL DEFAULT '[]',
+    sprayable TEXT NOT NULL DEFAULT '[]',
+    credentials TEXT NOT NULL DEFAULT '[]',
+    footholds TEXT NOT NULL DEFAULT '[]',
+    stopped INTEGER NOT NULL DEFAULT 0,
+    stop_reason TEXT NOT NULL DEFAULT '',
+    phases_completed TEXT NOT NULL DEFAULT '[]',
+    arp_neighbors TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT
+)
+"""
+
+# UCB1 bandit state: per-SSH-banner (attempts, successes) for RL target
+# selection. The bandit persists across runs so learning accumulates.
+_LEARNING_OUTCOMES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS learning_outcomes (
+    banner TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    successes INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT,
+    PRIMARY KEY (banner)
+)
+"""
+
+# Hypothesis ledger — the evidential record of what the agent is testing,
+# what it attempted, and whether the evidence confirmed or refuted the claim.
+# This is the foundation that separates "the tool ran" (operational success)
+# from "the evidence proved the hypothesis" (evidential success). One row per
+# hypothesis; terminal statuses (confirmed/refuted/exhausted) stop further
+# work on that claim.
+_HYPOTHESIS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS hypotheses (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    cycle INTEGER NOT NULL DEFAULT 0,
+    statement TEXT NOT NULL,
+    target TEXT,
+    tool TEXT,
+    arguments_json TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    confidence REAL DEFAULT 0.5,
+    evidence_json TEXT,
+    expected_evidence TEXT,
+    failure_class TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    independent_check_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT,
+    judged_at TEXT
+)
+"""
+
+# Tamper-evident audit chain — append-only, SHA256-chained record of every
+# tool call, deploy, crack, and grab. Each row's this_hash is sha256 of the
+# canonical JSON of the row *excluding* this_hash; row N+1's prev_hash is
+# row N's this_hash. Verification re-walks the chain and recomputes hashes;
+# any tampering (modified row, deleted row, inserted row) breaks the chain.
+# seq is AUTOINCREMENT so the chain is monotonic even across deleted runs.
+_AUDIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS audit_chain (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    session_id TEXT,
+    cycle INTEGER,
+    timestamp TEXT,
+    target_ip TEXT,
+    tool TEXT,
+    action TEXT,
+    arguments_json TEXT,
+    result_json TEXT,
+    code_sha256 TEXT,
+    exit_code INTEGER,
+    prev_hash TEXT,
+    this_hash TEXT
 )
 """
 
@@ -136,8 +228,15 @@ class Store:
     # flag made each construction pay full DDL overhead (the critic finding).
     _INITIALIZED_DB_PATHS: set[str] = set()
 
-    def __init__(self, db_path: str = "honeywatch.db"):
+    def __init__(self, db_path: str = "honeywatch.db", vault_passphrase: str | None = None):
         self.db_path = db_path
+        # When a vault passphrase is set, credential passwords are encrypted
+        # at rest with AES-256-GCM. The master key is derived once via
+        # PBKDF2-SHA256 (600k iterations) and cached for the store's lifetime.
+        self._vault_key: bytes | None = None
+        if vault_passphrase:
+            from honeywatch.c2.crypto import derive_vault_key
+            self._vault_key = derive_vault_key(vault_passphrase)
         self._mem_conn: sqlite3.Connection | None = None
         # A :memory: database lives on a single shared connection (each
         # sqlite3.connect(":memory:") is an isolated empty database, so we must
@@ -195,14 +294,82 @@ class Store:
         conn.executescript(_SCHEMA)
         conn.executescript(_KNOWN_KEYS_SCHEMA)
         conn.executescript(_CREDENTIALS_SCHEMA)
+        conn.executescript(_FOOTHOLDS_SCHEMA)
         conn.executescript(_CHAIN_STATE_SCHEMA)
+        conn.executescript(_LEARNING_OUTCOMES_SCHEMA)
         conn.executescript(_HOST_FLAGS_SCHEMA)
+        conn.executescript(_HYPOTHESIS_SCHEMA)
+        conn.executescript(_AUDIT_SCHEMA)
         for stmt in _INDEXES:
             conn.execute(stmt)
         conn.execute(_HOST_FLAGS_INDEX)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_credentials_ip "
             "ON credentials(ip, port)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_footholds_ip "
+            "ON footholds(ip, port)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hypotheses_run "
+            "ON hypotheses(run_id, cycle)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hypotheses_status "
+            "ON hypotheses(status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_run "
+            "ON audit_chain(run_id, cycle)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_target "
+            "ON audit_chain(target_ip)"
+        )
+        # Migrate: add columns added in v0.3 (hosts, sprayable, credentials,
+        # footholds, stopped, stop_reason) if the table was created by an
+        # older version. ALTER TABLE ADD COLUMN is idempotent-safe on SQLite
+        # (raises OperationalError if the column already exists, which we
+        # suppress).
+        _MIGRATION_COLUMNS = [
+            ("hosts", "TEXT NOT NULL DEFAULT '[]'"),
+            ("sprayable", "TEXT NOT NULL DEFAULT '[]'"),
+            ("credentials", "TEXT NOT NULL DEFAULT '[]'"),
+            ("footholds", "TEXT NOT NULL DEFAULT '[]'"),
+            ("stopped", "INTEGER NOT NULL DEFAULT 0"),
+            ("stop_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("phases_completed", "TEXT NOT NULL DEFAULT '[]'"),
+            ("arp_neighbors", "TEXT NOT NULL DEFAULT '[]'"),
+            ("vulnerable_packages", "TEXT NOT NULL DEFAULT '[]'"),
+        ]
+        for col_name, col_type in _MIGRATION_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE chain_state ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass  # column already exists — expected on second run
+        # Migrate: add vulnerability_score and priority_score to hosts table.
+        # These are computed by scorers.compute_vulnerability_score() and
+        # stored for fast querying without recomputation.
+        for col_name, col_type in [
+            ("vulnerability_score", "REAL NOT NULL DEFAULT 0.0"),
+            ("priority_score", "REAL NOT NULL DEFAULT 0.0"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE hosts ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        # Migrate: add vault_salt to credentials table for encrypted credential
+        # storage. When vault_passphrase is set, passwords are stored as
+        # AES-256-GCM ciphertext with a per-row salt.
+        try:
+            conn.execute("ALTER TABLE credentials ADD COLUMN vault_salt BLOB")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Index for priority-based targeting queries.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hosts_priority "
+            "ON hosts(final_label, priority_score DESC)"
         )
         conn.commit()
         self._initialized = True
@@ -232,11 +399,13 @@ class Store:
                     INSERT OR REPLACE INTO hosts (
                         ip, port, profile_key, banner, software, version, flags,
                         heuristic, ai_classification, ai_confidence,
-                        final_confidence, final_label, json, scanned_at
+                        final_confidence, final_label, json, scanned_at,
+                        vulnerability_score, priority_score
                     ) VALUES (
                         :ip, :port, :profile_key, :banner, :software, :version, :flags,
                         :heuristic, :ai_classification, :ai_confidence,
-                        :final_confidence, :final_label, :json, :scanned_at
+                        :final_confidence, :final_label, :json, :scanned_at,
+                        :vulnerability_score, :priority_score
                     )
                     """,
                     [self._to_row(score) for score in scores],
@@ -277,6 +446,8 @@ class Store:
             "ai_confidence": (ai.confidence if ai else 0.0),
             "final_confidence": score.final_confidence,
             "final_label": score.final_label,
+            "vulnerability_score": score.vulnerability_score,
+            "priority_score": score.priority_score,
             "json": json.dumps(score_record(score), default=str),
             "scanned_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -571,7 +742,24 @@ class Store:
 
         Re-cracking the same ``(ip, port, user)`` updates the discovered
         password in place instead of stacking duplicates.
+
+        When ``vault_passphrase`` was passed to the Store constructor, the
+        password is encrypted with AES-256-GCM before storage. Each row gets
+        its own random salt so identical passwords produce different ciphertext.
         """
+        stored_pw = password
+        vault_salt = None
+        if self._vault_key is not None and password is not None:
+            from honeywatch.c2.crypto import vault_encrypt
+            try:
+                ct, salt = vault_encrypt(password, self._vault_key)
+            except ImportError:
+                raise ImportError(
+                    "Vault encryption requires the 'cryptography' package. "
+                    "Install it with: pip install honeywatch[vault]"
+                )
+            stored_pw = base64.b64encode(ct).decode("ascii")
+            vault_salt = salt
         now = datetime.now(timezone.utc).isoformat()
         conn = self._connect()
         try:
@@ -579,10 +767,10 @@ class Store:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO credentials
-                        (ip, port, user, password, banner, attempts, source, discovered_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (ip, port, user, password, banner, attempts, source, discovered_at, vault_salt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (str(ip), int(port), user, password, banner, int(attempts), source, now),
+                    (str(ip), int(port), user, stored_pw, banner, int(attempts), source, now, vault_salt),
                 )
         finally:
             self._close(conn)
@@ -599,9 +787,14 @@ class Store:
         Filters are optional and combine with AND. Rows are ordered by most
         recently discovered first so an operator re-running crack sees fresh
         wins at the top.
+
+        When ``vault_passphrase`` was passed to the Store constructor,
+        encrypted passwords are decrypted on read. If decryption fails (wrong
+        passphrase or corrupted data), the raw ciphertext is returned so the
+        caller can distinguish encrypted values from plaintext.
         """
         sql = (
-            "SELECT ip, port, user, password, banner, attempts, source, discovered_at "
+            "SELECT ip, port, user, password, banner, attempts, source, discovered_at, vault_salt "
             "FROM credentials WHERE 1=1"
         )
         params: list[object] = []
@@ -621,19 +814,31 @@ class Store:
             rows = conn.execute(sql, params).fetchall()
         finally:
             self._close(conn)
-        return [
-            {
+        results = []
+        for r in rows:
+            pw = r[3]
+            salt = r[8]
+            # Decrypt vault-encrypted password if vault key is available.
+            if self._vault_key is not None and salt is not None and pw is not None:
+                try:
+                    from honeywatch.c2.crypto import vault_decrypt
+                    ct = base64.b64decode(pw)
+                    pw = vault_decrypt(ct, salt, self._vault_key)
+                except ImportError:
+                    pass  # cryptography not installed — return raw ciphertext
+                except Exception:
+                    pass  # Decryption failed — return raw ciphertext
+            results.append({
                 "ip": r[0],
                 "port": int(r[1]),
                 "user": r[2],
-                "password": r[3],
+                "password": pw,
                 "banner": r[4],
                 "attempts": int(r[5] or 0),
                 "source": r[6],
                 "discovered_at": r[7],
-            }
-            for r in rows
-        ]
+            })
+        return results
 
     def credential_for(self, ip: str, port: int = 22) -> dict | None:
         """Return the most recently discovered working credential for a host.
@@ -665,15 +870,94 @@ class Store:
         }
 
     # ------------------------------------------------------------------ #
+    # Verified footholds (phase_foothold confirmed shell access)
+    # ------------------------------------------------------------------ #
+    def upsert_foothold(
+        self,
+        ip: str,
+        port: int,
+        user: str,
+        password: str | None = None,
+        key_path: str | None = None,
+        source: str = "chain-foothold",
+    ) -> None:
+        """Insert or replace a verified foothold row.
+
+        A foothold is a credential where phase_foothold actually connected and
+        confirmed shell access (grabbed shadow, ran commands). NOT every cracked
+        password — only verified ones. Re-verifying the same ``(ip, port, user)``
+        updates in place.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO footholds
+                        (ip, port, user, password, key_path, source, verified_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(ip), int(port), user, password, key_path, source, now),
+                )
+        finally:
+            self._close(conn)
+
+    def query_footholds(
+        self,
+        ip: str | None = None,
+        source: str | None = None,
+        limit: int = 10000,
+    ) -> list[dict]:
+        """Return verified foothold rows as dicts.
+
+        Filters are optional and combine with AND. Ordered by most recently
+        verified first.
+        """
+        sql = (
+            "SELECT ip, port, user, password, key_path, source, verified_at "
+            "FROM footholds WHERE 1=1"
+        )
+        params: list[object] = []
+        if ip is not None:
+            sql += " AND ip = ?"
+            params.append(str(ip))
+        if source is not None:
+            sql += " AND source = ?"
+            params.append(source)
+        sql += " ORDER BY verified_at DESC LIMIT ?"
+        params.append(int(limit))
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            self._close(conn)
+        return [
+            {
+                "ip": r[0],
+                "port": int(r[1]),
+                "user": r[2],
+                "password": r[3],
+                "key_path": r[4],
+                "source": r[5],
+                "verified_at": r[6],
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------ #
     # Chain run state (v0.2: durable resume)
     # ------------------------------------------------------------------ #
     def save_chain_state(self, run_id: str, state: dict) -> None:
-        """Persist a chain run's resumable state (round, pivoted subnets,
-        looted footholds, enqueued targets, recovered keys).
+        """Persist a chain run's full resumable state.
 
         One row per run id; each phase checkpoints into it so a killed
         daemon resumes from where it left off instead of re-scanning every
         pivoted subnet, re-SFTPing every loot file, and re-enqueuing deploys.
+
+        All list-of-tuple fields are serialized as lists of lists (JSON doesn't
+        have tuples). The ``log`` field is included so a resumed run retains
+        its full operational history for reporting.
         """
         conn = self._connect()
         try:
@@ -683,8 +967,10 @@ class Store:
                     INSERT OR REPLACE INTO chain_state (
                         run_id, round, pivoted_subnets, looted_footholds,
                         enqueued, recovered_ssh_keys, cloud_creds, loot,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        hosts, sprayable, credentials, footholds,
+                        stopped, stop_reason, phases_completed,
+                        arp_neighbors, vulnerable_packages, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -695,6 +981,15 @@ class Store:
                         json.dumps(state.get("recovered_ssh_keys", [])),
                         json.dumps(state.get("cloud_creds", []), default=str),
                         json.dumps(state.get("loot", []), default=str),
+                        json.dumps([list(x) for x in state.get("hosts", [])]),
+                        json.dumps([list(x) for x in state.get("sprayable", [])]),
+                        json.dumps(state.get("credentials", []), default=str),
+                        json.dumps([list(x) for x in state.get("footholds", [])]),
+                        1 if state.get("stopped") else 0,
+                        state.get("stop_reason", ""),
+                        json.dumps(state.get("phases_completed", [])),
+                        json.dumps([list(x) for x in state.get("arp_neighbors", [])]),
+                        json.dumps(state.get("vulnerable_packages", [])),
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
@@ -702,12 +997,19 @@ class Store:
             self._close(conn)
 
     def load_chain_state(self, run_id: str) -> dict | None:
-        """Restore a chain run's persisted state, or ``None`` if unknown."""
+        """Restore a chain run's persisted state, or ``None`` if unknown.
+
+        Deserializes all fields back into the same types that
+        :class:`ChainState` uses (list-of-tuple for hosts, footholds, etc.).
+        """
         conn = self._connect()
         try:
             row = conn.execute(
                 "SELECT round, pivoted_subnets, looted_footholds, enqueued, "
-                "recovered_ssh_keys, cloud_creds, loot "
+                "recovered_ssh_keys, cloud_creds, loot, "
+                "hosts, sprayable, credentials, footholds, "
+                "stopped, stop_reason, phases_completed, "
+                "arp_neighbors, vulnerable_packages "
                 "FROM chain_state WHERE run_id = ?",
                 (str(run_id),),
             ).fetchone()
@@ -722,12 +1024,57 @@ class Store:
             except ValueError:
                 return default
 
+        def _load_tuples(raw):
+            """Deserialize a JSON list-of-lists into a list of tuples."""
+            items = _load(raw, [])
+            return [tuple(x) for x in items]
+
         return {
             "round": int(row[0] or 0),
             "pivoted_subnets": _load(row[1], []),
-            "looted_footholds": [tuple(x) for x in _load(row[2], [])],
-            "enqueued": [tuple(x) for x in _load(row[3], [])],
+            "looted_footholds": _load_tuples(row[2]),
+            "enqueued": _load_tuples(row[3]),
             "recovered_ssh_keys": _load(row[4], []),
             "cloud_creds": _load(row[5], []),
             "loot": _load(row[6], []),
+            "hosts": _load_tuples(row[7]),
+            "sprayable": _load_tuples(row[8]),
+            "credentials": _load(row[9], []),
+            "footholds": _load_tuples(row[10]),
+            "stopped": bool(row[11]),
+            "stop_reason": row[12] or "",
+            "phases_completed": _load(row[13], []),
+            "arp_neighbors": _load_tuples(row[14]),
+            "vulnerable_packages": _load(row[15], []),
         }
+
+    def load_learning_outcomes(self) -> dict[str, tuple[int, int]]:
+        """Load bandit arm state from the learning_outcomes table.
+
+        Returns ``{banner: (attempts, successes)}`` for UCB1Bandit init.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT banner, attempts, successes FROM learning_outcomes"
+            ).fetchall()
+        finally:
+            self._close(conn)
+        return {r[0]: (int(r[1]), int(r[2])) for r in rows}
+
+    def save_learning_outcomes(self, arms: dict[str, tuple[int, int]]) -> None:
+        """Upsert bandit arm state into the learning_outcomes table."""
+        from datetime import datetime, timezone
+        conn = self._connect()
+        try:
+            with conn:
+                for banner, (attempts, successes) in arms.items():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO learning_outcomes "
+                        "(banner, attempts, successes, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (banner, attempts, successes,
+                         datetime.now(timezone.utc).isoformat()),
+                    )
+        finally:
+            self._close(conn)

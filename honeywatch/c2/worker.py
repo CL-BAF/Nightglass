@@ -25,6 +25,7 @@ import urllib.request
 import uuid
 from typing import Any
 
+from honeywatch.c2.beacon import BeaconProfile
 from honeywatch.models import Target, WorkerTask
 
 # Optional WebSocket transport.
@@ -58,18 +59,113 @@ class Worker:
         ssh_key: str | None = None,
         ssh_user: str = "root",
         api_token: str | None = None,
+        jitter_fraction: float = 0.2,
+        max_backoff: float = 60.0,
+        beacon: "BeaconProfile | None" = None,
+        ca_path: str | None = None,
+        worker_cert: str | None = None,
+        worker_key: str | None = None,
+        ca_pin: str | None = None,
+        c2_encrypt: bool = False,
+        c2_key: str | None = None,
+        adaptive_timing: bool = False,
     ):
         self.controller_url = controller_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.categories = list(categories) if categories else []
         self.exec_mode = exec_mode
-        self.poll_interval = poll_interval
         self.ssh_key = ssh_key
         self.ssh_user = ssh_user
         # Optional shared bearer secret. When set, it is sent on every HTTP
         # request (Authorization header) and every WebSocket handshake (?token=).
         self.api_token = api_token
         self._shutdown = False
+        # Adaptive jittered beacon. A fixed-interval poll is a network
+        # signature (a metronomic beacon to one host); jitter spreads each
+        # wait around `poll_interval` and the level backs off exponentially up
+        # to `max_backoff` on idle/error cycles. Callers may pass a pre-built
+        # profile (e.g. a seeded one for tests); otherwise one is built from the
+        # poll_interval/jitter_fraction/max_backoff knobs. `poll_interval`
+        # is kept as the base cadence for back-compat with the CLI flag and
+        # config.
+        self.beacon = beacon if beacon is not None else BeaconProfile(
+            base=poll_interval,
+            jitter_fraction=jitter_fraction,
+            max_backoff=max_backoff,
+        )
+        # Back-compat alias for callers/tests that read poll_interval.
+        self.poll_interval = self.beacon.base
+        # Optional mutual TLS: when ca_path is set the worker verifies the
+        # controller against the internal CA (CA pinning) and, when
+        # worker_cert/worker_key are provided, presents a client cert so the
+        # controller can authenticate it. ca_pin guards against CA-file
+        # substitution. None of this is configured by default -> the worker
+        # talks plaintext HTTP and the lab behaviour is unchanged.
+        from honeywatch.c2.tls import build_client_ssl_context
+
+        self.ssl_context = build_client_ssl_context(
+            ca_path, worker_cert, worker_key, ca_pin
+        )
+        # C2 encryption: when enabled, the worker fetches the controller's
+        # public key on first connect and uses it to decrypt task data and
+        # encrypt results. The controller decrypts results with its private key.
+        self.c2_encrypt = c2_encrypt
+        self.crypto: Any = None
+        if c2_encrypt:
+            from honeywatch.c2.crypto import C2Crypto
+            import base64
+            if c2_key:
+                try:
+                    privkey = base64.b64decode(c2_key)
+                    self.crypto = C2Crypto(private_key=privkey)
+                except Exception:
+                    self.crypto = C2Crypto(passphrase=c2_key)
+            else:
+                # Worker doesn't have the private key — it encrypts with the
+                # controller's pubkey (fetched from /api/pubkey). For decryption
+                # of task data, the worker uses the controller's pubkey as well.
+                self.crypto = C2Crypto()
+        # Adaptive timing: when enabled, the worker measures RTT to the
+        # controller and adjusts its poll interval based on responsiveness.
+        # A responsive controller gets faster polls; a slow/unreachable
+        # controller triggers exponential backoff. This matches real botnet
+        # behaviour where beacons adapt to network conditions.
+        self.adaptive_timing = adaptive_timing
+        self._rtt_samples: list[float] = []
+        self._current_interval = poll_interval
+        self._consecutive_failures = 0
+        self._max_backoff = self.beacon.max_backoff
+
+    def _record_rtt(self, rtt: float) -> None:
+        """Track the last 10 RTT samples for median calculation."""
+        self._rtt_samples.append(rtt)
+        if len(self._rtt_samples) > 10:
+            self._rtt_samples.pop(0)
+
+    def _adaptive_interval(self) -> float:
+        """Compute the next poll interval based on recent RTT measurements.
+
+        - When RTT is low (responsive controller): use base poll_interval
+        - When RTT increases by >2x median: double the interval (back off)
+        - When RTT decreases by <0.5x median: halve the interval (speed up)
+        - Never exceed max_backoff
+        - Never go below poll_interval / 4
+        """
+        if not self._rtt_samples:
+            return self.poll_interval
+        if self._consecutive_failures > 0:
+            backoff = min(
+                self.poll_interval * (2 ** self._consecutive_failures),
+                self._max_backoff,
+            )
+            return backoff
+        median_rtt = sorted(self._rtt_samples)[len(self._rtt_samples) // 2]
+        last_rtt = self._rtt_samples[-1]
+        if last_rtt > median_rtt * 2:
+            self._current_interval = min(self._current_interval * 2, self._max_backoff)
+        elif last_rtt < median_rtt * 0.5 and self._current_interval > self.poll_interval / 4:
+            self._current_interval = max(self._current_interval / 2, self.poll_interval / 4)
+        return self._current_interval
 
     # ------------------------------------------------------------------ #
     # HTTP helpers
@@ -95,7 +191,14 @@ class Worker:
             method=method,
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # context= is only valid for HTTPS; pass it when we have a pinned
+            # mTLS context AND the target is https. For plaintext HTTP (lab, or
+            # ca_path unset) we omit it -- urlopen would otherwise reject a
+            # context on a non-TLS URL.
+            kwargs: dict[str, Any] = {"timeout": timeout}
+            if self.ssl_context is not None and url.lower().startswith("https://"):
+                kwargs["context"] = self.ssl_context
+            with urllib.request.urlopen(req, **kwargs) as resp:
                 text = resp.read().decode("utf-8", "replace")
                 if not text:
                     return {}
@@ -123,20 +226,30 @@ class Worker:
         task_data = resp.get("task")
         if not task_data:
             return None
+        # When C2 encryption is enabled, the task data arrives encrypted.
+        # Decrypt the script and variables before constructing the task.
+        if self.c2_encrypt and self.crypto and task_data.get("api_version") == 2:
+            from honeywatch.c2.crypto import decrypt_task
+            task_data = decrypt_task(task_data, self.crypto)
         return _task_from_dict(task_data)
 
     def report_result(
         self, task_id: str, success: bool, result: dict[str, Any]
     ) -> None:
-        self._request(
-            "POST",
-            f"/api/tasks/{task_id}/result",
-            {
-                "worker_id": self.worker_id,
-                "success": success,
-                "result": result,
-            },
-        )
+        payload: dict[str, Any] = {
+            "worker_id": self.worker_id,
+            "success": success,
+            "result": result,
+        }
+        # When C2 encryption is enabled, encrypt the result before sending.
+        # The controller decrypts it with its private key.
+        if self.c2_encrypt and self.crypto:
+            from honeywatch.c2.crypto import encrypt_result
+            encrypted = encrypt_result(payload, self.crypto)
+            encrypted["task_id"] = task_id
+            self._request("POST", f"/api/tasks/{task_id}/result", encrypted)
+        else:
+            self._request("POST", f"/api/tasks/{task_id}/result", payload)
 
     def execute_task(self, task: WorkerTask) -> dict[str, Any]:
         """Execute ``task.script`` according to ``self.exec_mode``."""
@@ -266,19 +379,27 @@ class Worker:
             await self._run_polling()
 
     async def _run_polling(self) -> None:
-        backoff = self.poll_interval
-        max_backoff = max(self.poll_interval * 12, 60.0)
+        self.beacon.reset()
         while not self._shutdown:
             try:
+                t0 = time.monotonic()
                 task = await asyncio.to_thread(self.claim_task)
+                rtt = time.monotonic() - t0
+                if self.adaptive_timing:
+                    self._record_rtt(rtt)
+                    self._consecutive_failures = 0
                 if task is None:
-                    # Idle: actually sleep the grown backoff (the previous code
-                    # computed backoff but always slept the base interval, so the
-                    # exponential idle cadence was dead code).
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 1.5, max_backoff)
+                    # Idle: sleep a jittered wait at the current backoff level,
+                    # then grow the level toward max_backoff (jittered so the
+                    # cadence is not a clean metronome).
+                    if self.adaptive_timing:
+                        await asyncio.sleep(self._adaptive_interval())
+                    else:
+                        await asyncio.sleep(self.beacon.on_idle())
                     continue
-                backoff = self.poll_interval  # reset after successful work
+                self.beacon.on_success()  # reset after successful work
+                if self.adaptive_timing:
+                    self._current_interval = self.poll_interval
                 result = await asyncio.to_thread(self.execute_task, task)
                 # Default an absent returncode to 0 so a dry_run result (which
                 # carries no returncode, only stdout) is reported as success when
@@ -287,12 +408,24 @@ class Worker:
                 await asyncio.to_thread(self.report_result, task.id, success, result)
             except WorkerError as exc:
                 print(f"honeywatch worker: controller error: {exc}", flush=True)
-                # Exponential backoff so a controller outage doesn't hammer it.
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+                if self.adaptive_timing:
+                    self._consecutive_failures += 1
+                    await asyncio.sleep(self._adaptive_interval())
+                else:
+                    # Exponential backoff (steeper than idle) so a controller outage
+                    # doesn't hammer it; jittered so retries don't synchronize.
+                    await asyncio.sleep(self.beacon.on_error())
             except Exception as exc:
                 print(f"honeywatch worker: task error: {exc}", flush=True)
-                await asyncio.sleep(self.poll_interval)
+                # A task-execution error (SSH/subprocess failure, report error) is
+                # not a cadence problem -- the controller is reachable, one task
+                # just failed. Reset to the base cadence and sleep a jittered base
+                # beat before retrying, matching the prior fixed-interval behaviour
+                # (the pre-beacon code slept the base poll_interval here).
+                self.beacon.reset()
+                if self.adaptive_timing:
+                    self._current_interval = self.poll_interval
+                await asyncio.sleep(self.beacon.next_beacon())
 
     async def _run_websocket(self) -> None:
         if websockets is None:  # pragma: no cover
@@ -303,16 +436,21 @@ class Worker:
         if self.api_token:
             sep = "&" if "?" in uri else "?"
             uri = f"{uri}{sep}token={self.api_token}"
-        backoff = self.poll_interval
-        max_backoff = max(self.poll_interval * 12, 60.0)
         # Outer reconnect loop: a dropped connection used to leave the worker
         # spinning on a dead socket forever (recv kept raising into the broad
         # `except Exception`, which slept and retried the same closed socket).
         # Now a closed connection breaks the inner loop and we reconnect here
-        # with exponential backoff.
+        # with the jittered exponential beacon.
+        self.beacon.reset()
+        # For wss://, pass the pinned mTLS context (CA verification + client
+        # cert). websockets.connect takes ssl=<SSLContext>. Plain ws:// is
+        # used when no CA is configured (lab).
+        ws_kwargs: dict[str, Any] = {}
+        if self.ssl_context is not None and uri.lower().startswith("wss://"):
+            ws_kwargs["ssl"] = self.ssl_context
         while not self._shutdown:
             try:
-                async with websockets.connect(uri) as ws:
+                async with websockets.connect(uri, **ws_kwargs) as ws:
                     await ws.send(
                         json.dumps(
                             {
@@ -322,7 +460,7 @@ class Worker:
                             }
                         )
                     )
-                    backoff = self.poll_interval  # connected -> reset backoff
+                    self.beacon.on_success()  # connected -> reset backoff
                     while not self._shutdown:
                         try:
                             msg = await asyncio.wait_for(
@@ -382,14 +520,17 @@ class Worker:
                 if self._shutdown:
                     break
                 print(
-                    f"honeywatch worker: websocket disconnected: {exc}; "
-                    f"reconnecting in {backoff}s",
+                    f"honeywatch worker: websocket disconnected: {exc}; reconnecting",
                     flush=True,
                 )
             if self._shutdown:
                 break
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, max_backoff)
+            # Reconnect backoff. Reaching here means either the inner loop broke
+            # on ConnectionClosed (clean exit, no exception) or the connect
+            # itself raised -- both need the same jittered exponential backoff.
+            # Computed once here so `wait` is always bound (the clean-break path
+            # never enters the except above).
+            await asyncio.sleep(self.beacon.on_error())
 
     def stop(self) -> None:
         self._shutdown = True

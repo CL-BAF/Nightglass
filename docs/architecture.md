@@ -34,10 +34,12 @@ honeywatch/
 │   └── scripts.py         # template engine, manifest rendering
 ├── c2/
 │   ├── __init__.py
+│   ├── beacon.py          # BeaconProfile (jittered exponential beacon cadence)
+│   ├── ca.py              # internal CA (generate_ca, sign_worker_cert, sign_server_cert, ca_pin, serials)
 │   ├── store.py           # C2Store (operations/tasks/workers)
-│   ├── controller.py      # aiohttp Controller (dashboard + REST + WS)
-│   ├── worker.py          # Worker (polling + WebSocket, 3 exec modes)
-│   └── tls.py             # certs + nginx config
+│   ├── controller.py      # aiohttp Controller (dashboard + REST + WS, mTLS revocation)
+│   ├── worker.py          # Worker (polling + WebSocket, 3 exec modes, CA-pinned mTLS)
+│   └── tls.py             # certs + nginx config + mTLS SSL context builders
 ├── ops/
 │   ├── __init__.py
 │   ├── targeting.py       # TargetFilter, select_targets
@@ -46,8 +48,34 @@ honeywatch/
     ├── __init__.py
     ├── setup.py           # SetupStore, AgentConfig, run_setup_wizard
     ├── tools.py           # 10 LLM-callable tools + TOOL_REGISTRY
+    ├── recovery.py        # RecoveryEnforcer (programmatic failure recovery between execute_tool and model)
     └── ollama_agent.py    # ChatAgent (tool loop, 5 iterations)
 ```
+
+### Failure recovery enforcer (`agent/recovery.py`)
+
+`RecoveryEnforcer` sits between `execute_tool` and the model. When a tool call
+returns an error, it classifies the failure (`honeywatch/failure.py`) and, for
+**programmatic** recoveries, injects a corrected call that runs before the model
+sees the failure — so a transient blip or a bad-argument schema error is handled
+without a model round-trip (the model would often blindly re-emit the same
+failing call):
+
+- `TRANSPORT_ERROR` → retry the same call (RETRY_SAME).
+- `TIMEOUT` → retry with a doubled `timeout` arg if the tool declares one (RETRY_WITH_PARAMS).
+- `SCHEMA_ERROR` → strip args the tool's parameter schema doesn't declare and
+  coerce simple type mismatches (`"30"`→`30`), then retry (REPAIR_CODE). A
+  *missing required* argument is never auto-fixed (stripping can't create it) —
+  left to the model.
+
+Each original call is capped at `MAX_RETRIES=2` (keyed by a stable signature of
+the *original* call, so a param-mutating retry still counts against the same
+budget) — a persistently failing call can't loop forever. Non-retryable failures
+(STOP / SWITCH_CAPABILITY / CREATE_PREREQUISITE / GATHER_INFO) need a decision
+the enforcer can't make, so they surface to the model with the
+`FAILURE_CLASS` / `RECOVERY` hint and the model chooses. Every injected retry
+goes back through `execute_tool`, so it is recorded on the tamper-evident audit
+chain — recovery is observable, not silent.
 
 ## Data Flow
 
@@ -119,7 +147,7 @@ Config object  (dot + dict access, config.py:131)
 ## Key Constants
 
 - `SSH_PORT = 22` (`models.py:15`)
-- `CLIENT_BANNER = b"SSH-2.0-honeywatch_0.1\r\n"` (`fingerprint/probe.py:343`)
+- `CLIENT_BANNER` — deprecated back-compt alias; the probe sends a per-target sticky spoofed banner via `_client_banner_bytes(ip, port)` (`fingerprint/probe.py`), drawing from `opsec.spoofed_ssh_banner_for_target` (bounded per-process cache, sticky per target so repeat connections to one host carry one consistent client identity)
 - `LABELS = ["real","likely_real","uncertain","likely_honeypot","honeypot"]` (`report.py:142`)
 - `CLASSIFICATIONS = {real,likely_real,uncertain,likely_honeypot,honeypot}` (`ai/scorer.py:354`)
 - `IFACE_PATTERNS = ("mullvad","wg-mullvad","wg0")` (`vpn.py:169`)

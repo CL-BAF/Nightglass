@@ -13,6 +13,7 @@ from honeywatch.ai.scorer import AiScorer, profile_key
 from honeywatch.fingerprint.features import analyze
 from honeywatch.fingerprint.probe import is_ssh, probe_many
 from honeywatch.models import Fingerprint, HostHit, Score
+from honeywatch.scorers import compute_priority_score, compute_vulnerability_score
 
 
 def _make_progress_reporter(every: int = 1000):
@@ -206,6 +207,19 @@ class Pipeline:
                 confidence = sig.heuristic_score
             confidence = round(float(confidence), 4)
 
+            # Compute vulnerability and priority scores from fingerprint
+            # signals. Higher vulnerability = more exploitable; higher
+            # priority = more valuable target (low honeypot confidence +
+            # high vulnerability).
+            vuln_score = compute_vulnerability_score(
+                software_version=fp.software_version if fp else None,
+                enc_c2s=fp.enc_c2s if fp else None,
+                enc_s2c=fp.enc_s2c if fp else None,
+                host_key_type=fp.host_key_type if fp else None,
+                flags=set(sig.flags) if sig else set(),
+            )
+            prio_score = compute_priority_score(confidence, vuln_score)
+
             scores.append(
                 Score(
                     ip=fp.ip,
@@ -215,6 +229,8 @@ class Pipeline:
                     ai=ai,
                     final_confidence=confidence,
                     final_label=_classify(confidence),
+                    vulnerability_score=vuln_score,
+                    priority_score=prio_score,
                 )
             )
 

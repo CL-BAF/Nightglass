@@ -189,7 +189,7 @@ source; the offline cracking (hashcat/john) touches nothing on the target.
 
 | Detector | Status |
 |---|---|
-| Version-string regex (Suricata `ssh.protoversion` for hydra/medusa) | **Closed** — spoofed banner + real `ssh` client |
+| Version-string regex (Suricata `ssh.protoversion` for hydra/medusa) | **Closed** — spoofed banner + real `ssh` client; per-target stickiness so repeat connections to one host carry one consistent client banner (per-call randomization to the same host is itself an anomaly) |
 | HASSH / JA4SSH client fingerprint | **Closed with sshpass backend; residual with paramiko** |
 | fail2ban per-IP rate bans | **Mitigated** — source rotation + low-and-slow; not zero-risk if a proxy pool is thin |
 | Account lockout (AD/PAM) | **Closed** — lockout-safe spray cadence |

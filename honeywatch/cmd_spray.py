@@ -20,7 +20,8 @@ def _cmd_spray(args, argv) -> int:
         return 2
 
     db_path = args.db or getattr(cfg.storage, "db", "honeywatch.db")
-    store = Store(db_path)
+    vault_pass = args.vault_passphrase or getattr(getattr(cfg, "storage", None), "vault_passphrase", None)
+    store = Store(db_path, vault_passphrase=vault_pass)
 
     users: list[str] = []
     if args.users:
@@ -119,7 +120,9 @@ def _cmd_spray(args, argv) -> int:
             password=pw, hosts=spray_hosts, delay=args.delay, jitter=args.jitter,
             lockout_delay=args.lockout_delay, business_hours=args.business_hours,
             skip_publickey_only=not args.no_precheck, host_concurrency=args.host_concurrency,
-            proxy_file=args.proxy_file, jump_file=args.jump_file, on_attempt=on_attempt,
+            proxy_file=args.proxy_file, jump_file=args.jump_file,
+            max_user_attempts=getattr(args, "max_user_attempts", 0) or 0,
+            on_attempt=on_attempt,
         )
         all_results.extend(res)
 

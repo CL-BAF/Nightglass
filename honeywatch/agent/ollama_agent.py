@@ -24,6 +24,7 @@ _MAX_TOOL_RESULT_CHARS = 4000
 
 from honeywatch.agent.setup import AgentConfig, SetupStore
 from honeywatch.agent.tools import TOOL_REGISTRY, ToolContext, execute_tool
+from honeywatch.agent.recovery import RecoveryEnforcer
 from honeywatch.ai.ollama import AiError, OllamaClient
 from honeywatch.opsec import within_business_hours
 
@@ -313,6 +314,19 @@ def _parse_model_response(text: str) -> dict[str, Any] | None:
 _TRUTHY_STRINGS = {"1", "true", "yes", "y", "done", "ok", "okay"}
 
 
+def _result_error(record: dict[str, Any]) -> str | None:
+    """Extract the error string from a tool result record, or None on success.
+
+    Records are shaped ``{"tool", "arguments", "result"}`` with an error, when
+    present, at ``record["result"]["error"]``.
+    """
+    result = record.get("result") if isinstance(record, dict) else None
+    if isinstance(result, dict) and result.get("error"):
+        err = result["error"]
+        return err if isinstance(err, str) else str(err)
+    return None
+
+
 def _signal_done(response: dict[str, Any]) -> bool:
     """Return whether the model signalled DONE, coercing string values.
 
@@ -386,6 +400,11 @@ class ChatAgent:
         self.on_say: Callable[[str], None] = on_say or self._default_say
         self.on_tool_running: Callable[[str], None] = on_tool_running or (lambda _: None)
         self.on_tool_result: Callable[[str, dict[str, Any]], None] = on_tool_result or (lambda _n, _r: None)
+        # Programmatic failure-recovery enforcer: sits between execute_tool and
+        # the model, auto-retrying transient/fixable failures (transport reset,
+        # timeout, bad-arg schema errors) without a model round-trip. Per-run
+        # retry counters are reset at the start of each run/turn.
+        self.recovery = RecoveryEnforcer(self.context)
 
     @staticmethod
     def _default_say(text: str) -> None:
@@ -500,34 +519,25 @@ class ChatAgent:
         return {"thoughts": "model returned plain text", "speak": raw, "tools": []}
 
     def _execute_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Run every tool call and return a list of results."""
-        results = []
-        for call in tool_calls:
-            name = call.get("name")
-            raw_args = call.get("arguments", {})
-            # Defensive: arguments may be None, a string, or non-dict from the model.
-            if isinstance(raw_args, dict):
-                args = dict(raw_args)
-            elif isinstance(raw_args, str):
-                try:
-                    args = json.loads(raw_args)
-                    if not isinstance(args, dict):
-                        args = {}
-                except (json.JSONDecodeError, ValueError):
-                    args = {}
-            else:
-                args = {}
-            if not name:
-                results.append({"tool": "?", "result": {"error": "missing tool name"}})
-                continue
-            self.on_tool_running(name)
-            result = execute_tool(name, args, self.context)
-            self.on_tool_result(name, result)
-            results.append({"tool": name, "arguments": args, "result": result})
-        return results
+        """Run every tool call and return a list of result records.
+
+        Delegates to the :class:`RecoveryEnforcer`, which executes each call via
+        ``execute_tool`` and, for transient/fixable failures, injects a
+        corrective retry (transport reset, timeout bump, schema arg-strip) that
+        runs before the model sees the failure. Injected records carry a
+        ``recovery`` marker. Callbacks fire for originals and recoveries alike.
+        """
+        return self.recovery.execute_with_recovery(
+            tool_calls,
+            on_running=self.on_tool_running,
+            on_result=self.on_tool_result,
+        )
 
     def _run_round(self, user_text: str, max_iterations: int = 5) -> str:
         """Process one user turn, possibly through multiple tool rounds."""
+        # Fresh per-turn retry budget so a failure in one turn doesn't consume
+        # the next turn's recovery budget.
+        self.recovery.reset()
         self.messages.append({"role": "user", "content": user_text})
 
         for _ in range(max_iterations):
@@ -595,6 +605,46 @@ class ChatAgent:
             lines.append(f"operations: {n} tracked")
         except Exception:
             pass
+        # Hypothesis ledger: show open/confirmed/refuted counts so the model
+        # knows what's being tested and what's already proven.
+        try:
+            hyp_sum = self.context.hypothesis_store.summary(self.context.run_id)
+            lines.append(
+                f"hypotheses: {hyp_sum['open']} open, {hyp_sum['confirmed']} confirmed, "
+                f"{hyp_sum['refuted']} refuted, {hyp_sum['exhausted']} exhausted"
+            )
+        except Exception:
+            pass
+        # Audit chain: show record count + chain validity so the model (and the
+        # operator reading the log) knows the evidence trail is intact.
+        try:
+            audit_sum = self.context.audit_store.summary(self.context.run_id)
+            valid = "OK" if audit_sum["chain_valid"] else "BROKEN"
+            lines.append(f"audit: {audit_sum['records']} records, chain {valid}")
+        except Exception:
+            pass
+        # Capability graph: show ready/blocked counts so the model knows what
+        # the chain can do next and what's blocked by missing prerequisites.
+        try:
+            from honeywatch.capability import build_default_graph, ChainContext
+            from honeywatch.agent.tools import _build_chain_context_state, _build_chain_config_stub
+            graph = build_default_graph()
+            cap_state = _build_chain_context_state(self.context)
+            cap_cfg = _build_chain_config_stub(self.context)
+            cap_ctx = ChainContext(
+                state=cap_state, config=cap_cfg,
+                hypothesis_store=self.context.hypothesis_store,
+                run_id=self.context.run_id,
+            )
+            ready = graph.next_capabilities(cap_ctx)
+            blocked = graph.blocked_capabilities(cap_ctx)
+            if ready:
+                ready_ids = ", ".join(c.id for c in ready[:5])
+                lines.append(f"capabilities: {len(ready)} ready ({ready_ids}), {len(blocked)} blocked")
+            else:
+                lines.append(f"capabilities: 0 ready, {len(blocked)} blocked")
+        except Exception:
+            pass
         return "\n".join(lines)
 
     def _trim_history(self, keep_tail: int = 8) -> None:
@@ -637,6 +687,45 @@ class ChatAgent:
              "execute actions to advance this goal. Signal DONE=true when the "
              "goal is met or no productive move remains."},
         ]
+        # Phase 7: inject the OPSEC briefing into the system prompt so the
+        # model knows the posture for the current target. Empty for local
+        # targets (the operator's own box) — the AI moves freely. Full
+        # posture for public-routable targets.
+        try:
+            from honeywatch.opsec import OpsecProfile, build_opsec_briefing
+            from honeywatch.config import load_config
+            cfg = load_config()
+            opsec_profile = OpsecProfile.from_config(cfg)
+            briefing = build_opsec_briefing(opsec_profile)
+            if briefing:
+                self.messages[0]["content"] += "\n\n" + briefing
+        except Exception:
+            pass
+        # Phase 5: inject selected skills into the system prompt so the model
+        # gets tradecraft guidance relevant to its goal. Skills are advisory-
+        # only — they never override scope, permission, approval, command-safety,
+        # or audit rules. Selected via deterministic + semantic matching, then
+        # sanitized and fenced as untrusted guidance.
+        try:
+            from pathlib import Path as _Path
+            from honeywatch.skills.registry import SkillRegistry
+            from honeywatch.skills.pipeline import build_skill_context, apply_skills_to_prompt
+            skills_dir = _Path(__file__).resolve().parent.parent / "skills"
+            registry = SkillRegistry.from_directory(str(skills_dir))
+            skills = build_skill_context(registry, query=goal, attack_mode=True)
+            if skills:
+                self.messages[0]["content"] = apply_skills_to_prompt(
+                    self.messages[0]["content"], skills
+                )
+        except Exception:
+            pass
+        # Tag the context with the run identity so hypothesis/audit tools can
+        # attribute their records to this run.
+        run_id = f"auto-{self.session_id}"
+        self.context.run_id = run_id
+        self.context.session_id = self.session_id
+        # Fresh per-run retry budget for the recovery enforcer.
+        self.recovery.reset()
         cycle = 0
         tool_calls_total = 0
         done = False
@@ -655,6 +744,7 @@ class ChatAgent:
                     time.sleep(cycle_delay)
                 continue
             cycle += 1
+            self.context.cycle = cycle
             # 1. observe: hand the model the live fleet state.
             self.messages.append({
                 "role": "user",
@@ -729,6 +819,21 @@ class ChatAgent:
                 text = json.dumps(r, default=str, ensure_ascii=False)
                 if len(text) > _MAX_TOOL_RESULT_CHARS:
                     text = text[:_MAX_TOOL_RESULT_CHARS] + "\n...[truncated]"
+                # Failure taxonomy (Phase 4): when a tool returned an error,
+                # append a FAILURE_CLASS + RECOVERY hint so the model follows
+                # the recovery action instead of blindly retrying. The error
+                # lives on the result dict (r["result"]["error"]); the earlier
+                # `r.get("error")` check looked at the wrong level and never
+                # fired. The recovery enforcer already auto-recovered what it
+                # could (transient/fixable failures); this hint covers the
+                # non-recoverable remainder the model must decide on.
+                err = _result_error(r)
+                if err is not None:
+                    try:
+                        from honeywatch.failure import failure_class_line
+                        text += "\n" + failure_class_line(err)
+                    except Exception:
+                        pass
                 summary_lines.append(text)
             self.messages.append({
                 "role": "user",
@@ -740,6 +845,17 @@ class ChatAgent:
             if done:
                 stop_reason = f"DONE after executing {len(tools)} final tool call(s): {thoughts}"
                 break
+            # 4b. Hypothesis-ledger halt: if every hypothesis for this run is in
+            # a terminal state (confirmed/refuted/exhausted), the agent has
+            # nothing productive left to test.  This is the outcome judge's
+            # authority to stop the run — not the model saying DONE, but the
+            # evidence saying "there are no open claims left."
+            try:
+                if self.context.hypothesis_store.all_exhausted(self.context.run_id):
+                    stop_reason = "all hypotheses exhausted (confirmed/refuted/exhausted)"
+                    break
+            except Exception:
+                pass
             if cycle_delay:
                 time.sleep(cycle_delay)
         else:

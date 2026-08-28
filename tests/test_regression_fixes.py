@@ -622,3 +622,94 @@ def test_spoofed_banner_no_hardcoded_string_in_production():
         if 'SSH-2.0-OpenSSH_9.0p1 Debian-1' in text:
             offenders.append(str(py))
     assert not offenders, f"hardcoded banner still in: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# Upgrade #3: per-target banner stickiness. Repeat connections to one host
+# must carry one consistent client banner (a real client's banner is fixed for
+# its process); different targets / instances draw independently.
+# ---------------------------------------------------------------------------
+
+
+def test_spoofed_banner_sticky_per_target():
+    """Two draws for the same (ip, port) within one process return the same
+    banner (the cache memoizes the first random draw per target)."""
+    from honeywatch.opsec import (
+        clear_target_banner_cache,
+        spoofed_ssh_banner_for_target,
+    )
+
+    clear_target_banner_cache()
+    a = spoofed_ssh_banner_for_target("10.99.0.1", 22)
+    b = spoofed_ssh_banner_for_target("10.99.0.1", 22)
+    c = spoofed_ssh_banner_for_target("10.99.0.1", 22)
+    assert a == b == c
+    assert a.startswith("SSH-2.0-OpenSSH_")
+    clear_target_banner_cache()
+
+
+def test_spoofed_banner_for_target_seed_is_deterministic_and_in_pool():
+    """The seed override is deterministic and always returns a clean pool
+    member (no jitter, no cache) so tests are reproducible."""
+    from honeywatch.opsec import spoofed_ssh_banner_for_target, _SPOOFED_BANNER_POOL
+
+    a = spoofed_ssh_banner_for_target("ignored", seed=123)
+    b = spoofed_ssh_banner_for_target("ignored", seed=123)
+    assert a == b
+    assert a in _SPOOFED_BANNER_POOL
+
+
+def test_spoofed_banner_varies_across_targets():
+    """Different seeds (proxy for different targets) yield more than one
+    banner across 20 draws so the tool has no single global client fingerprint."""
+    from honeywatch.opsec import spoofed_ssh_banner_for_target
+
+    banners = {spoofed_ssh_banner_for_target(f"10.0.0.{i}", seed=i) for i in range(20)}
+    assert len(banners) > 1
+
+
+def test_spoofed_banner_for_target_respects_configured_pool():
+    """A configured pool constrains the per-target draw (seed path)."""
+    from honeywatch.opsec import (
+        set_banner_pool,
+        spoofed_ssh_banner_for_target,
+    )
+
+    saved = None
+    try:
+        set_banner_pool(("SSH-2.0-OpenSSH_9.9p1 custom-A", "SSH-2.0-OpenSSH_9.9p1 custom-B"))
+        b = spoofed_ssh_banner_for_target("10.99.0.9", seed=7)
+        assert b in ("SSH-2.0-OpenSSH_9.9p1 custom-A", "SSH-2.0-OpenSSH_9.9p1 custom-B")
+    finally:
+        set_banner_pool(saved)
+
+
+def test_spoofed_banner_for_target_cache_is_bounded():
+    """The per-target cache evicts oldest-first past its cap so a planet-scale
+    scan cannot grow it without limit."""
+    from honeywatch.opsec import (
+        clear_target_banner_cache,
+        spoofed_ssh_banner_for_target,
+        _target_banner_cache,
+        _TARGET_BANNER_CACHE_MAX,
+    )
+
+    clear_target_banner_cache()
+    # Fill past the cap with distinct targets.
+    for i in range(_TARGET_BANNER_CACHE_MAX + 10):
+        spoofed_ssh_banner_for_target(f"172.16.0.{i}", 2222)
+    assert len(_target_banner_cache) <= _TARGET_BANNER_CACHE_MAX
+    clear_target_banner_cache()
+
+
+def test_clear_target_banner_cache_empties_it():
+    from honeywatch.opsec import (
+        clear_target_banner_cache,
+        spoofed_ssh_banner_for_target,
+        _target_banner_cache,
+    )
+
+    spoofed_ssh_banner_for_target("10.99.0.2", 22)
+    assert _target_banner_cache
+    clear_target_banner_cache()
+    assert not _target_banner_cache

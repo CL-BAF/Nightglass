@@ -15,7 +15,9 @@ __all__ = ["analyze", "probe_ssh", "probe_many", "parse_banner", "parse_kexinit"
 
 | Symbol | Signature | Meaning |
 |---|---|---|
-| `CLIENT_BANNER` | `b"SSH-2.0-honeywatch_0.1\r\n"` | sent to every host |
+| `CLIENT_BANNER` | deprecated back-compat alias | no longer used; probe sends `_client_banner_bytes(ip, port)` per target |
+| `_client_banner_bytes` | `(ip, port=22) -> bytes` | per-target sticky spoofed OpenSSH client banner sent to every host (see `opsec.spoofed_ssh_banner_for_target`) |
+| `_probe_credentials` | `() -> (str, str)` | per-call random wrong `(user, pass)` for the auth probe |
 | `MSG_KEXINIT` | `20` | RFC 4253 |
 | `is_ssh(fp)` | `(Fingerprint) -> bool` | banner starts `SSH-` |
 | `parse_banner(line)` | `(str) -> (protocol, software, version)` | handles `OpenSSH_` |

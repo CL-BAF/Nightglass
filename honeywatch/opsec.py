@@ -42,12 +42,13 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 __all__ = [
     "AuthMethods",
@@ -55,10 +56,15 @@ __all__ = [
     "PARAMIKO_HASSH_RISK",
     "ProxyPool",
     "SPOOFED_BANNER",
+    "OpsecProfile",
+    "OpsecManager",
     "attempt_sshpass",
     "auth_methods",
+    "build_opsec_briefing",
     "jitter_delay",
+    "set_banner_pool",
     "spoofed_ssh_banner",
+    "spoofed_ssh_banner_for_target",
     "within_business_hours",
 ]
 
@@ -113,10 +119,37 @@ _SPOOFED_BANNER_POOL = (
     "SSH-2.0-OpenSSH_9.6p1 Alpine-3",
 )
 # Backwards-compat constant: the single banner string older code paths still
-# import as SPOOFED_BANNER. New code should call spoofed_ssh_banner() instead
-# so each connection draws a fresh banner from the pool.
+# import as SPOOFED_BANNER. New connection code should call
+# spoofed_ssh_banner_for_target(ip, port) (sticky per target); the per-call
+# spoofed_ssh_banner() is kept for one-shot / test use.
 SPOOFED_BANNER = _SPOOFED_BANNER_POOL[0]
 _banner_lock = _threading.Lock()
+
+# Configurable banner pool (Finding #7): an operator can override the pool
+# via config.  When None, the hardcoded _SPOOFED_BANNER_POOL is used.
+_configured_banner_pool: tuple[str, ...] | None = None
+
+# Per-target sticky-banner cache (Upgrade #3). Keyed by (ip, port); the first
+# connection to a target draws a random pool banner and every subsequent
+# connection in this process reuses it. A real SSH client's identification
+# string is fixed for its process, so repeat connections to one host from one
+# operator carry one consistent banner -- per-call randomization to the same
+# host (OpenSSH_9.6 then OpenSSH_8.9 seconds later) is itself an anomaly. The
+# cache is per-process (not derived from the target), so two honeywatch
+# instances hitting the same target still draw different banners (no shared
+# fingerprint, preserving Finding #1). Bounded + LRU-evicted so a planet-scale
+# scan cannot grow it without limit.
+_TARGET_BANNER_CACHE_MAX = 4096
+_target_banner_cache: dict[tuple[str, int], str] = {}
+
+# Regex to jitter the patch level (pN) in a banner string.
+_banner_patch_re = re.compile(r"p(\d+)")
+
+
+def set_banner_pool(pool: tuple[str, ...] | list[str] | None) -> None:
+    """Override the banner pool (e.g. from config).  None = use the default."""
+    global _configured_banner_pool
+    _configured_banner_pool = tuple(pool) if pool else None
 
 
 def spoofed_ssh_banner(seed: int | None = None) -> str:
@@ -127,9 +160,66 @@ def spoofed_ssh_banner(seed: int | None = None) -> str:
     instances don't share a client fingerprint, and a single instance doesn't
     reuse the same banner across every connection in a scan. Pass a ``seed``
     for deterministic test output.
+
+    Finding #7: with 30% probability, the patch level (``pN``) is jittered
+    ±1 to expand the effective banner population from 9 to ~30+ without
+    maintaining a larger list.  Two connections from the same instance don't
+    always show the same patch level.
     """
     rng = _random.Random(seed) if seed is not None else _random
-    return rng.choice(_SPOOFED_BANNER_POOL)
+    pool = _configured_banner_pool or _SPOOFED_BANNER_POOL
+    base = rng.choice(pool)
+    # Jitter the patch level ±1 with 30% probability.
+    if rng.random() < 0.3:
+        def _jitter(m: re.Match) -> str:
+            n = int(m.group(1)) + rng.randint(-1, 1)
+            return f"p{max(1, n)}"
+        base = _banner_patch_re.sub(_jitter, base, count=1)
+    return base
+
+
+def clear_target_banner_cache() -> None:
+    """Drop every cached per-target banner (tests / a fresh scan run)."""
+    with _banner_lock:
+        _target_banner_cache.clear()
+
+
+def spoofed_ssh_banner_for_target(
+    ip: str, port: int = 22, seed: int | None = None
+) -> str:
+    """Return a sticky per-target spoofed OpenSSH client banner.
+
+    The first connection to ``(ip, port)`` in this process draws a banner from
+    the pool; every later connection to the same target reuses it. A real SSH
+    client's identification string is fixed for its process, so a single
+    operator making repeat connections to one host (probe -> spray -> crack ->
+    loot -> chain) presents one consistent client banner. The per-call
+    randomization of :func:`spoofed_ssh_banner` is right for a one-shot scan
+    but wrong for repeat connections: emitting ``OpenSSH_9.6p1 Ubuntu`` then
+    ``OpenSSH_8.9p1 Fedora`` to the same host seconds apart is impossible for a
+    real client and is itself a tool fingerprint.
+
+    The cache is per-process and randomly seeded (not derived from the target),
+    so two honeywatch instances hitting the same target still draw different
+    banners -- no shared client fingerprint across instances (Finding #1
+    holds). The cache is bounded (:data:`_TARGET_BANNER_CACHE_MAX`) with
+    oldest-first eviction so a planet-scale scan cannot grow it without limit.
+
+    Pass ``seed`` for a deterministic, non-cached result (tests).
+    """
+    pool = _configured_banner_pool or _SPOOFED_BANNER_POOL
+    if seed is not None:
+        return _random.Random(seed).choice(pool)
+    key = (ip, port)
+    with _banner_lock:
+        cached = _target_banner_cache.get(key)
+        if cached is not None:
+            return cached
+        banner = _random.choice(pool)
+        _target_banner_cache[key] = banner
+        if len(_target_banner_cache) > _TARGET_BANNER_CACHE_MAX:
+            _target_banner_cache.pop(next(iter(_target_banner_cache)))
+        return banner
 
 
 # --------------------------------------------------------------------------- #
@@ -183,11 +273,18 @@ class ProxyPool:
     defeating per-IP fail2ban thresholds. A single Mullvad exit sprayed at
     planet scale gets globally banned in hours; a rotating pool survives.
 
-    Empty pool -> :meth:`next` returns ``None`` (use the direct egress IP).
+    When ``tor`` is set, :meth:`next` includes the Tor SOCKS5 proxy in
+    rotation and :meth:`rotate_tor` sends ``SIGNAL NEWNYM`` to rotate the
+    exit circuit so the next connection through Tor uses a different exit
+    node. This is the per-attempt source rotation pattern used by TREVORspray.
+
+    Empty pool + no Tor -> :meth:`next` returns ``None`` (use the direct
+    egress IP).
     """
 
     proxies: list[str] = field(default_factory=list)
     jumps: list[str] = field(default_factory=list)
+    tor: str | None = None  # "socks5://127.0.0.1:9050" when Tor is active
     _i: int = 0
 
     @classmethod
@@ -195,6 +292,7 @@ class ProxyPool:
         cls,
         proxy_file: str | None = None,
         jump_file: str | None = None,
+        tor: str | None = None,
     ) -> "ProxyPool":
         proxies: list[str] = []
         jumps: list[str] = []
@@ -202,24 +300,53 @@ class ProxyPool:
             proxies = _read_lines(proxy_file)
         if jump_file:
             jumps = _read_lines(jump_file)
-        return cls(proxies=proxies, jumps=jumps)
+        return cls(proxies=proxies, jumps=jumps, tor=tor)
 
     def __bool__(self) -> bool:
-        return bool(self.proxies or self.jumps)
+        return bool(self.proxies or self.jumps or self.tor)
 
     def next(self) -> dict[str, str | None]:
-        """Return the next rotation target as a dict, or empty for direct."""
+        """Return the next rotation target as a dict, or empty for direct.
+
+        Tor is interleaved with proxies and jumps in the rotation: if Tor
+        is configured, it is appended as a rotation slot so each call
+        cycles through proxies, jumps, and Tor. When a Tor slot is selected,
+        ``rotate_tor()`` is called first to build a fresh circuit so the
+        exit IP changes on every Tor rotation.
+        """
         items: list[tuple[str, str]] = []
         for p in self.proxies:
             items.append(("proxy", p))
         for j in self.jumps:
             items.append(("jump", j))
+        if self.tor:
+            items.append(("tor", self.tor))
         if not items:
             return {"proxy": None, "jump": None}
         kind, value = items[self._i % len(items)]
         self._i += 1
-        return {"proxy": value if kind == "proxy" else None,
-                "jump": value if kind == "jump" else None}
+        if kind == "tor":
+            self.rotate_tor()
+        return {
+            "proxy": value if kind in ("proxy", "tor") else None,
+            "jump": value if kind == "jump" else None,
+        }
+
+    def rotate_tor(self) -> None:
+        """Send SIGNAL NEWNYM to the Tor control port to rotate the exit circuit.
+
+        No-op when ``tor`` is not set. Requires the TorProxy to be running
+        and reachable on its control port.
+        """
+        if not self.tor:
+            return
+        from honeywatch.tor import TorProxy
+        proxy = TorProxy(socks_port=int(self.tor.rsplit(":", 1)[-1]))
+        try:
+            proxy.rotate_sync()
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("Tor NEWNYM failed: %s", exc)
 
 
 def _read_lines(path: str) -> list[str]:
@@ -435,3 +562,318 @@ def sleep_with_jitter(base: float, jitter: float, rng: random.Random | None = No
     if d > 0:
         time.sleep(d)
     return d
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7: Target-aware OPSEC profile + manager
+# --------------------------------------------------------------------------- #
+
+
+# Aggression-level factors for pacing. STEALTH doubles the base delay, MAXIMUM
+# eliminates it entirely. The chain escalates STEALTH -> NORMAL -> AGGRESSIVE
+# -> MAXIMUM when capabilities fail, and the pacing delay tightens with each
+# level.
+_AGGRESSION_FACTOR: dict[str, float] = {
+    "stealth": 2.0,
+    "normal": 1.0,
+    "aggressive": 0.5,
+    "maximum": 0.0,
+}
+
+# Noisy command patterns — substring matches (case-insensitive). Each adds 1
+# to the noise score. These are the commands that show up in SOC tooling
+# (Suricata rules, Splunk detections, EDR alerts) and should be avoided or
+# rewritten when OPSEC is engaged.
+_NOISY_PATTERNS: tuple[str, ...] = (
+    "nmap -t5", "-t5", "--script=vuln", "masscan", "hydra",
+    "nuclei", "ffuf", "gobuster", "dirb", "crackmapexec",
+    "nmap -sS -p-", "zmap", "rustscan -t", "sqlmap --dump",
+    "nmap --script", "nbtscan", "enum4linux", "wpscan",
+    "nmap -O", "-sV --version-all",
+)
+
+# Low-noise rewrites — the single source of truth shared by
+# suggest_low_noise_alternative and build_opsec_briefing so they can't drift.
+_LOW_NOISE_REWRITES: tuple[tuple[str, str], ...] = (
+    ("-t5", "-T2"),
+    ("-t4", "-T2"),
+    ("--script=vuln", "(drop --script=vuln)"),
+    ("masscan", "nmap -sS -Pn"),
+    ("crackmapexec", "smbclient -N"),
+    ("nuclei", "nmap -sV"),
+    ("ffuf", "nmap -sV"),
+    ("gobuster", "nmap -sV"),
+    ("dirb", "nmap -sV"),
+    ("nmap -sS -p-", "nmap -sS -p 22,80,443"),
+    ("sqlmap --dump", "sqlmap --batch --level 1"),
+)
+
+# Realistic browser User-Agent strings for UA rotation.
+_UA_POOL: tuple[str, ...] = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "curl/7.88.1",
+)
+
+
+def _is_private_or_local(ip_str: str, local_cidrs: tuple[str, ...] = ()) -> bool:
+    """True when the IP is private/local (RFC1918, loopback, link-local, reserved).
+
+    Used by OpsecProfile.resolve_for_target to auto-disable OPSEC for the
+    operator's own box (where aggressive scanning is fine) and enable it for
+    public-routable targets (where it matters).
+    """
+    import ipaddress as _ip
+    try:
+        ip = _ip.ip_address(ip_str)
+    except (ValueError, TypeError):
+        return False
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        return True
+    # Check operator-specified local CIDRs (e.g. lab ranges).
+    for cidr in local_cidrs:
+        try:
+            if ip in _ip.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+@dataclass
+class OpsecProfile:
+    """OPSEC posture for a run or per-target.
+
+    All fields default to "off" so a missing/partial config never silently
+    enables aggressive behavior.  ``local_targets_off`` (default True) makes
+    :meth:`resolve_for_target` return a fully-disabled profile for private/local
+    IPs — the operator's own box — so the AI moves freely without pacing.
+    """
+
+    enabled: bool = False
+    ua_rotation: bool = False
+    doh: bool = False
+    doh_provider: str = "cloudflare"
+    min_gap_seconds: float = 0.0
+    jitter_seconds: float = 0.0
+    rate_per_minute: int = 0
+    quiet_command_patterns: tuple[str, ...] = ()
+    noise_budget: int = 0
+    local_targets_off: bool = True
+    local_cidrs: tuple[str, ...] = ()
+    public_autonomy: bool = True
+
+    @classmethod
+    def from_config(cls, config: Any) -> "OpsecProfile":
+        """Build a profile from a honeywatch config object.
+
+        Tolerant of missing keys — a partial config produces a partial profile,
+        not a crash.  When the ``opsec`` block is absent, returns a default
+        (all-off) profile.
+        """
+        opsec_cfg = getattr(config, "opsec", None)
+        if opsec_cfg is None:
+            return cls()
+        def _get(key: str, default: Any) -> Any:
+            v = getattr(opsec_cfg, key, default)
+            return v if v is not None else default
+        return cls(
+            enabled=bool(_get("enabled", False)),
+            ua_rotation=bool(_get("ua_rotation", False)),
+            doh=bool(_get("doh", False)),
+            doh_provider=str(_get("doh_provider", "cloudflare")),
+            min_gap_seconds=float(_get("min_gap_seconds", 0.0)),
+            jitter_seconds=float(_get("jitter_seconds", 0.0)),
+            rate_per_minute=int(_get("rate_per_minute", 0)),
+            quiet_command_patterns=tuple(_get("quiet_command_patterns", ())),
+            noise_budget=int(_get("noise_budget", 0)),
+            local_targets_off=bool(_get("local_targets_off", True)),
+            local_cidrs=tuple(_get("local_cidrs", ())),
+            public_autonomy=bool(_get("public_autonomy", True)),
+        )
+
+    def resolve_for_target(self, target_ip: str) -> "OpsecProfile":
+        """Return the effective profile for a specific target.
+
+        When ``local_targets_off`` is True and the target is a private/local IP
+        (RFC1918/loopback/link-local/reserved, plus any ``local_cidrs``), return
+        a fully-disabled profile that preserves ``local_targets_off``/
+        ``local_cidrs``/``public_autonomy`` so a later re-resolution against a
+        public pivot target re-enables correctly.
+
+        For public-routable targets (or when ``local_targets_off`` is False),
+        return ``self`` unchanged — the configured posture applies.
+        """
+        if not target_ip:
+            return self
+        if self.local_targets_off and _is_private_or_local(target_ip, self.local_cidrs):
+            return OpsecProfile(
+                enabled=False,
+                local_targets_off=self.local_targets_off,
+                local_cidrs=self.local_cidrs,
+                public_autonomy=self.public_autonomy,
+            )
+        return self
+
+    def is_off(self) -> bool:
+        """True when the profile is effectively disabled (no hardening active)."""
+        return not self.enabled
+
+
+class OpsecManager:
+    """Applies an :class:`OpsecProfile` to the running chain.
+
+    Provides:
+    - ``score_command_noise(command)`` — how noisy a command is (0 = quiet).
+    - ``suggest_low_noise_alternative(command)`` — rewrite a noisy command.
+    - ``pacing_delay(aggression)`` — seconds to wait before the next action.
+    - ``acquire_pacing(aggression)`` — async: rate-limit + sleep.
+    - ``user_agent()`` — a rotating UA when ``ua_rotation`` is on.
+    """
+
+    def __init__(
+        self,
+        profile: OpsecProfile,
+        rng: random.Random | None = None,
+        sleep_fn: Callable[[float], Any] | None = None,
+    ):
+        self.profile = profile
+        self._rng = rng or random
+        self._sleep = sleep_fn or time.sleep
+        self._rate_bucket: list[float] = []  # timestamps of recent actions
+
+    def resolve_for_target(self, target_ip: str) -> "OpsecManager":
+        """Return a new manager with the profile resolved for the target."""
+        resolved = self.profile.resolve_for_target(target_ip)
+        return OpsecManager(resolved, rng=self._rng, sleep_fn=self._sleep)
+
+    def score_command_noise(self, command: str) -> dict[str, Any]:
+        """Score a command's noise level.
+
+        Returns ``{"score": int, "reasons": list[str], "noisy": bool}``.
+        Score = number of distinct noisy patterns matched.  Empty/None command
+        returns score 0.
+        """
+        if not command or not isinstance(command, str):
+            return {"score": 0, "reasons": [], "noisy": False}
+        if self.profile.is_off():
+            return {"score": 0, "reasons": [], "noisy": False}
+        lower = command.lower()
+        reasons: list[str] = []
+        matched: set[str] = set()
+        for pat in _NOISY_PATTERNS:
+            if pat in lower and pat not in matched:
+                matched.add(pat)
+                reasons.append(f"noisy pattern: {pat}")
+        return {"score": len(matched), "reasons": reasons, "noisy": len(matched) > 0}
+
+    def suggest_low_noise_alternative(self, command: str) -> str:
+        """Suggest a quieter rewrite of a noisy command.
+
+        Pure string replacement — never executes anything.  More specific
+        rewrites are applied first (order matters in ``_LOW_NOISE_REWRITES``).
+        """
+        if not command or not isinstance(command, str):
+            return command
+        result = command
+        for needle, replacement in _LOW_NOISE_REWRITES:
+            if needle.lower() in result.lower():
+                # Case-insensitive replace of the first occurrence.
+                idx = result.lower().find(needle.lower())
+                result = result[:idx] + replacement + result[idx + len(needle):]
+        return result
+
+    def pacing_delay(self, aggression: str = "normal") -> float:
+        """Return the delay (seconds) to wait before the next action.
+
+        ``base = min_gap_seconds * AGGRESSION_FACTOR[aggression]``
+        ``jitter = jitter_seconds * random()`` when jitter > 0.
+        Returns ``max(0.0, base + jitter)``.  Fast path: when profile is off
+        AND min_gap_seconds == 0, returns exactly 0.0.
+        """
+        if self.profile.is_off() and self.profile.min_gap_seconds == 0:
+            return 0.0
+        factor = _AGGRESSION_FACTOR.get(aggression, 1.0)
+        base = self.profile.min_gap_seconds * factor
+        jitter = 0.0
+        if self.profile.jitter_seconds > 0:
+            jitter = self.profile.jitter_seconds * self._rng.random()
+        return max(0.0, base + jitter)
+
+    async def acquire_pacing(self, aggression: str = "normal") -> float:
+        """Async: rate-limit + sleep the pacing delay.
+
+        When ``rate_per_minute > 0``, enforces a token-bucket rate limit.
+        Then sleeps the pacing delay.  Returns the total seconds slept.
+        """
+        import asyncio
+        slept = 0.0
+        # Rate limiting: enforce max actions per minute.
+        if self.profile.rate_per_minute > 0:
+            now = time.monotonic()
+            # Prune entries older than 60s.
+            self._rate_bucket = [t for t in self._rate_bucket if now - t < 60.0]
+            if len(self._rate_bucket) >= self.profile.rate_per_minute:
+                wait = 60.0 - (now - self._rate_bucket[0])
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    slept += wait
+            self._rate_bucket.append(time.monotonic())
+        # Pacing delay.
+        delay = self.pacing_delay(aggression)
+        if delay > 0:
+            await asyncio.sleep(delay)
+            slept += delay
+        return slept
+
+    def user_agent(self, default: str = "honeywatch/1.0") -> str:
+        """Return a User-Agent string.  Rotates when ``ua_rotation`` is on."""
+        if self.profile.is_off() or not self.profile.ua_rotation:
+            return default
+        return self._rng.choice(_UA_POOL)
+
+    def is_quiet_blocked(self, command: str) -> bool:
+        """True when OPSEC is on AND the command matches a quiet-block pattern."""
+        if self.profile.is_off():
+            return False
+        if not command or not isinstance(command, str):
+            return False
+        lower = command.lower()
+        return any(pat.lower() in lower for pat in self.profile.quiet_command_patterns)
+
+
+def build_opsec_briefing(profile: OpsecProfile, target_ip: str = "") -> str:
+    """Build a system-prompt OPSEC briefing block for the agent.
+
+    Returns ``""`` when OPSEC is off for the target (private/local IPs or
+    profile disabled) so the AI is never told OPSEC is "on" for the operator's
+    own box.  For public-routable targets with OPSEC enabled, lists the noisy
+    vocabulary + low-noise rewrites + posture summary.
+    """
+    resolved = profile.resolve_for_target(target_ip)
+    if resolved.is_off():
+        return ""
+
+    lines = [
+        "OPSEC BRIEFING (advisory — never a hard gate; the command always executes):",
+        f"  Posture: {'ENABLED' if resolved.enabled else 'disabled'}",
+        f"  Pacing: min_gap={resolved.min_gap_seconds}s, jitter={resolved.jitter_seconds}s",
+        f"  Rate limit: {resolved.rate_per_minute}/min" if resolved.rate_per_minute else "  Rate limit: none",
+    ]
+    if resolved.ua_rotation:
+        lines.append("  UA rotation: ON")
+    if resolved.doh:
+        lines.append(f"  DNS-over-HTTPS: {resolved.doh_provider}")
+    if _LOW_NOISE_REWRITES:
+        lines.append("  Noisy vocabulary → low-noise rewrite:")
+        for needle, replacement in _LOW_NOISE_REWRITES[:5]:
+            lines.append(f"    {needle} → {replacement}")
+    if resolved.quiet_command_patterns:
+        lines.append(f"  Quiet-blocked patterns: {', '.join(resolved.quiet_command_patterns)}")
+    lines.append("  Note: these are advisory. The command always runs; the briefing helps you pick quieter alternatives.")
+    return "\n".join(lines)

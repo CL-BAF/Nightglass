@@ -153,6 +153,10 @@ class Controller:
         port: int = 8443,
         ssl_context: ssl.SSLContext | None = None,
         api_token: str | None = None,
+        ca_path: str | None = None,
+        revoked_serials: "set[int] | None" = None,
+        c2_encrypt: bool = False,
+        c2_key: str | None = None,
     ):
         if not HAS_AIOHTTP:
             raise RuntimeError(
@@ -162,10 +166,23 @@ class Controller:
         self.host = host
         self.port = port
         self.ssl = ssl_context
-        # When set, every API + WebSocket request must carry this bearer token
-        # (``Authorization: Bearer <token>`` or ``?token=...``). ``None`` = open,
-        # matching the historical lab-only behaviour and the test harness.
         self.api_token = api_token
+        self.ca_path = ca_path
+        self.mtls_active = ca_path is not None
+        self.revoked_serials: set[int] = set(revoked_serials or [])
+        self.c2_encrypt = c2_encrypt
+        self.crypto: Any = None
+        if c2_encrypt:
+            from honeywatch.c2.crypto import C2Crypto
+            if c2_key:
+                import base64
+                try:
+                    privkey = base64.b64decode(c2_key)
+                    self.crypto = C2Crypto(private_key=privkey)
+                except Exception:
+                    self.crypto = C2Crypto(passphrase=c2_key)
+            else:
+                self.crypto = C2Crypto()
         self.app = web.Application(middlewares=[self._build_auth_middleware()])
         self._clients: list["web.WebSocketResponse"] = []
         self._setup_routes()
@@ -174,20 +191,81 @@ class Controller:
     # Auth middleware
     # ------------------------------------------------------------------ #
     def _build_auth_middleware(self):
-        """Return a new-style aiohttp middleware enforcing the bearer token.
+        """Return a new-style aiohttp middleware enforcing auth.
 
-        When ``api_token`` is unset the middleware is a passthrough (preserving
-        the historical lab-only behaviour and the test harness).
+        Two opt-in gates, composable:
+          * mTLS revocation (when ``ca_path`` is set): a request that presents no
+            client cert, or presents one whose serial is revoked, is 403. (A
+            missing/invalid cert normally fails the TLS handshake before
+            reaching here when CERT_REQUIRED is set; this is the app-layer
+            backstop for revocation.)
+          * Bearer token (when ``api_token`` is set): 401 without it.
+
+        When neither is configured the middleware is a passthrough, preserving
+        the historical lab-only behaviour and the test harness.
         """
         token = self.api_token
+        mtls = self.mtls_active
 
         @web.middleware
         async def _auth(request: "web.Request", handler):
+            if mtls and not self._mtls_ok(request):
+                return web.json_response(
+                    {"error": "forbidden: client certificate missing or revoked"},
+                    status=403,
+                )
             if token and not self._authorized(request):
                 return web.json_response({"error": "unauthorized"}, status=401)
             return await handler(request)
 
         return _auth
+
+    def _client_cert_serial(self, request: "web.Request") -> int | None:
+        """Extract the presented client cert's serial, or None if unavailable.
+
+        aiohttp's transport exposes the peer cert via ``get_extra_info("peercert")``
+        (the asyncio SSL transport forwards the underlying socket's
+        ``getpeercert()`` dict). Python's ``getpeercert()`` returns ``serialNumber``
+        as an uppercase hex string with no separators (e.g. ``'2ED0594A...'``),
+        so we parse it to an int for set membership/revocation comparison. This
+        matches the hex format ``ca.cert_serial`` produces from
+        ``openssl x509 -serial``. Never raises.
+        """
+        try:
+            cert = request.transport.get_extra_info("peercert")
+        except Exception:
+            return None
+        if not isinstance(cert, dict):
+            return None
+        serial = cert.get("serialNumber")
+        if serial is None:
+            return None
+        if isinstance(serial, int):  # defensive; stdlib gives a hex str
+            return serial
+        try:
+            return int(str(serial), 16)
+        except (TypeError, ValueError):
+            return None
+
+    def _mtls_ok(self, request: "web.Request") -> bool:
+        """True when mTLS is active and the presented client cert is not revoked.
+
+        Returns True (passthrough) when mTLS is not configured.
+        """
+        if not self.mtls_active:
+            return True
+        serial = self._client_cert_serial(request)
+        if serial is None:
+            return False
+        return serial not in self.revoked_serials
+
+    def revoke_serial(self, serial: int) -> None:
+        """Revoke a worker client certificate by its serial number."""
+        self.revoked_serials.add(int(serial))
+
+    def is_revoked(self, serial: int) -> bool:
+        """True when the serial has been revoked."""
+        return int(serial) in self.revoked_serials
 
     def _authorized(self, request: "web.Request") -> bool:
         """True when the request carries the configured bearer token.
@@ -219,6 +297,7 @@ class Controller:
         self.app.router.add_get("/api/tasks", self._api_tasks)
         self.app.router.add_post("/api/tasks/claim", self._api_claim_task)
         self.app.router.add_post("/api/tasks/{task_id}/result", self._api_task_result)
+        self.app.router.add_get("/api/pubkey", self._api_pubkey)
         self.app.router.add_get("/api/health", self._api_health)
 
     # ------------------------------------------------------------------ #
@@ -226,6 +305,20 @@ class Controller:
     # ------------------------------------------------------------------ #
     async def _dashboard(self, request: "web.Request") -> "web.Response":
         return web.Response(text=_DASHBOARD_HTML, content_type="text/html")
+
+    async def _api_pubkey(self, request: "web.Request") -> "web.Response":
+        """Return the controller's public key for C2 encryption.
+
+        Workers fetch this key on first connect and use it to encrypt
+        task results. When encryption is disabled, returns 404.
+        """
+        if not self.c2_encrypt or self.crypto is None:
+            return _json_response({"error": "encryption not enabled"}, status=404)
+        from honeywatch.c2.crypto import pubkey_b64
+        return _json_response({
+            "public_key": pubkey_b64(self.crypto.public_key),
+            "algorithm": "nacl-sealed-box" if self.crypto.use_nacl else "aes-256-gcm",
+        })
 
     async def _api_health(self, request: "web.Request") -> "web.Response":
         return _json_response({"status": "ok", "time": _now()})
@@ -299,7 +392,15 @@ class Controller:
         # The worker executing the task needs the target's ssh credentials,
         # so the claim response includes them (the worker is the authorized
         # actor). Dashboard *listings* strip them -- see _api_tasks/_push_snapshot.
-        return _json_response({"task": _task_dict(task, include_credentials=True)})
+        task_dict = _task_dict(task, include_credentials=True)
+        # When C2 encryption is enabled, encrypt the script and variables
+        # before sending them over the wire. The marker_map stays plaintext
+        # so the controller can deobfuscate worker output without decrypting.
+        if self.c2_encrypt and self.crypto is not None:
+            from honeywatch.c2.crypto import encrypt_task
+            encrypted = encrypt_task(task_dict, self.crypto)
+            return _json_response({"task": encrypted})
+        return _json_response({"task": task_dict})
 
     async def _api_task_result(self, request: "web.Request") -> "web.Response":
         task_id = request.match_info["task_id"]
@@ -307,9 +408,18 @@ class Controller:
             data = await request.json()
         except Exception:
             return _json_response({"error": "invalid JSON"}, status=400)
-        worker_id = data.get("worker_id", "")
-        success = bool(data.get("success"))
-        result = data.get("result", {})
+        # When C2 encryption is enabled and the worker sent an encrypted
+        # result, decrypt it before storing in the database.
+        if self.c2_encrypt and self.crypto is not None and "encrypted_result" in data:
+            from honeywatch.c2.crypto import decrypt_result
+            decrypted = decrypt_result(data, self.crypto)
+            worker_id = decrypted.get("worker_id", "")
+            success = bool(decrypted.get("success"))
+            result = decrypted.get("result", {})
+        else:
+            worker_id = data.get("worker_id", "")
+            success = bool(data.get("success"))
+            result = data.get("result", {})
         completed = await asyncio.to_thread(
             self.store.complete_task, task_id, worker_id, success, result
         )

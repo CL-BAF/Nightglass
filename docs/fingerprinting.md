@@ -15,7 +15,9 @@ Source: `honeywatch/fingerprint/probe.py:343`.
 
 ### Constants
 
-- `CLIENT_BANNER = b"SSH-2.0-honeywatch_0.1\r\n"` — sent to every host.
+- `CLIENT_BANNER` — backwards-compat alias for a single plausible OpenSSH banner; no longer used by the probe (kept for static imports).
+- `_client_banner_bytes(ip, port=22)` — a per-target sticky spoofed OpenSSH client banner (`spoofed_ssh_banner_for_target(ip, port).encode() + b"\r\n"`) actually sent to every host. The banner is memoized per `(ip, port)` within the process so repeat probes of one host present one consistent client identity (a real client's banner is fixed for its process — per-call randomization to the same host is itself an anomaly); different targets and different process instances draw independently, so there is no shared client fingerprint. See `opsec.spoofed_ssh_banner_for_target`.
+- `_probe_credentials()` — per-call `(username, password)` for the deliberate-wrong auth probe (generic username pool + random high-entropy password), replacing the former fixed `honeywatch_probe_xz9` / `wrong-pass-12345` handle.
 - `MSG_KEXINIT = 20` — RFC 4253 message type.
 - `_MAX_PACKET = 1<<16` — 64 KiB cap per packet.
 - `_NAME_LIST_KEYS` — tuple order for KEXINIT name-lists.
@@ -38,9 +40,9 @@ Per-host logic:
 
 1. `asyncio.open_connection(ip, port)` — measures `connect_ms`, `time_to_banner_ms`, `banner_ms`.
 2. `_read_banner(reader)` — reads until `\n`, decodes as UTF-8/ignore, strips.
-3. Sends `CLIENT_BANNER`, then `_read_packet` loop (up to 4 attempts) to capture `SSH_MSG_KEXINIT`.
+3. Sends a per-target spoofed client banner via `_client_banner_bytes(ip, port)` (sticky per target), then `_read_packet` loop (up to 4 attempts) to capture `SSH_MSG_KEXINIT`.
 4. Parses banner via `parse_banner`, KEXINIT via `parse_kexinit`, populates `Fingerprint` fields (`kex_algorithms`, `server_host_key_algorithms`, `enc_c2s/s2c`, `mac_c2s/s2c`, `comp_c2s/s2c`).
-5. When `level=="full"` and `paramiko` is available, delegates `_full_probe` via `asyncio.to_thread`: creates `paramiko.Transport`, completes KEX, extracts `host_key_type` and `host_key_sha256` (`hashlib.sha256` of `_key_bytes(key)`), optionally does one `auth_password("honeywatch_probe", "invalid")` and records the rejection in `evidence` when `auth_probe=True`.
+5. When `level=="full"` and `paramiko` is available, delegates `_full_probe` via `asyncio.to_thread`: creates `paramiko.Transport`, sets `transport.local_version` to a per-target sticky spoofed OpenSSH banner (`spoofed_ssh_banner_for_target(fp.ip, fp.port)`), completes KEX, extracts `host_key_type` and `host_key_sha256` (`hashlib.sha256` of `_key_bytes(key)`), optionally does one `auth_password(*_probe_credentials())` with a per-call random wrong credential and records the rejection in `evidence` when `auth_probe=True`.
 6. Never raises for a single host — errors populate `Fingerprint.error`.
 
 ### `async probe_many(ips, port=22, level="fast", timeout=6.0, auth_probe=False, concurrency=512, on_result=None) -> list[Fingerprint]`
@@ -49,7 +51,7 @@ Semaphore-bounded gather (`asyncio.Semaphore(concurrency)`). Preserves input ord
 
 ### Internal Helpers
 
-- `_elapsed_ms(start)`, `_read_banner`, `_read_packet`, `_key_bytes(key)` (paramiko `as_bytes`/`asbytes` across generations), `_full_probe(fp, auth_probe, timeout)`.
+- `_elapsed_ms(start)`, `_read_banner`, `_read_packet`, `_key_bytes(key)` (paramiko `as_bytes`/`asbytes` across generations), `_full_probe(fp, auth_probe, timeout)`, `_client_banner_bytes(ip, port)`, `_probe_credentials()`.
 
 ## Heuristic Signals (`features.py`)
 

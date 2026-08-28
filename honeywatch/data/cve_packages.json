@@ -1,0 +1,4 @@
+["sudo", "openssh-server", "openssl", "nginx", "apache2", "redis-server",
+ "mongodb", "postgresql", "mysql-server", "nodejs", "python3", "libssl",
+ "libcurl", "libxml2", "glibc", "bash", "coreutils", "systemd", "dbus",
+ "polkit"]

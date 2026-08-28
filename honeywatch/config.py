@@ -118,6 +118,12 @@ def default_config() -> dict[str, Any]:
                                 # workers require it on every API + WS request
             # Defaults to storage.db when null.
             "db": None,
+            # Internal CA for mutual-TLS worker auth. When ca_path is set (and a
+            # server cert/key are configured), the controller requires every
+            # worker to present a client cert chaining to this CA -- so only
+            # CA-signed workers even complete the TLS handshake. The bearer token
+            # remains a second factor at the app layer. None = no mTLS.
+            "ca_path": None,
         },
         # ------------------------------------------------------------------ #
         # Controller-to-worker plane
@@ -126,12 +132,28 @@ def default_config() -> dict[str, Any]:
             "controller_url": "http://127.0.0.1:8443",
             "categories": ["miner", "exploit", "evasion"],
             "poll_interval": 5.0,
+            # Beacon jitter fraction (0.0-1.0): each wait is drawn from
+            # [level - spread, level + spread] where spread = level*jitter.
+            # 0.0 = fixed cadence (metronomic beacon signature); 0.2 spreads
+            # each wait +/-20% so the controller flow is not a clean metronome.
+            "jitter_fraction": 0.2,
+            # Max seconds to back off on idle cycles / controller errors.
+            "max_backoff": 60.0,
             "exec_mode": "dry_run",
             "ssh_user": "root",
             "ssh_key": None,
             # Bearer token gating controller API + WS. None = unauthenticated
             # (matches the controller default; set to match --api-token).
             "api_token": None,
+            # mTLS: pin the internal CA, present a CA-signed client cert. When
+            # ca_path is set the worker builds a client SSL context that trusts
+            # ONLY this CA (chain-level pinning); ca_pin is the CA cert's SHA-256
+            # fingerprint, checked constant-time before the CA file is trusted to
+            # guard against on-disk CA substitution. None = plaintext HTTP.
+            "ca_path": None,
+            "worker_cert": None,
+            "worker_key": None,
+            "ca_pin": None,
         },
         # ------------------------------------------------------------------ #
         # SSH password cracker
