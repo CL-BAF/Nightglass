@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS c2_tasks (
     payload_id TEXT NOT NULL,
     category TEXT NOT NULL,
     target_json TEXT,
+    target_ip TEXT,
     script TEXT,
     variables_json TEXT,
     status TEXT NOT NULL,
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS c2_workers (
 CREATE INDEX IF NOT EXISTS idx_c2_tasks_claim ON c2_tasks(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_c2_tasks_op ON c2_tasks(operation_id);
 CREATE INDEX IF NOT EXISTS idx_c2_ops_status ON c2_operations(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_c2_tasks_target_ip ON c2_tasks(status, target_ip);
 """
 
 
@@ -131,6 +133,16 @@ class C2Store:
             except sqlite3.OperationalError:
                 pass  # read-only filesystem — fall back silently
             conn.executescript(_SCHEMA)
+            conn.commit()
+            # Migration: add target_ip column for efficient beacon lookups.
+            try:
+                conn.execute("ALTER TABLE c2_tasks ADD COLUMN target_ip TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_c2_tasks_target_ip ON c2_tasks(status, target_ip)")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
             self._initialized = True
         return conn
@@ -270,9 +282,9 @@ class C2Store:
                 conn.execute(
                     """
                     INSERT INTO c2_tasks (id, operation_id, payload_id, category,
-                        target_json, script, variables_json, status, worker_id,
+                        target_json, target_ip, script, variables_json, status, worker_id,
                         claimed_at, result_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.id,
@@ -280,6 +292,7 @@ class C2Store:
                         task.payload_id,
                         task.category,
                         _encode(_target_to_dict(task.target)),
+                        task.target.ip if task.target else "",
                         task.script,
                         _encode(task.variables),
                         task.status,
@@ -356,18 +369,17 @@ class C2Store:
             self._close(conn)
 
     def query_pending_by_target_ip(self, ip: str) -> list[dict]:
-        """Return pending tasks whose target_json contains the given IP.
+        """Return pending tasks whose target_ip column matches exactly.
 
-        Uses LIKE for substring matching against the JSON target field.
-        This is more efficient than loading all pending tasks and filtering
-        in Python (C5 fix).
+        Uses the indexed (status, target_ip) column for O(1) lookup,
+        avoiding LIKE wildcards and false-positive substring matches.
         """
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT * FROM c2_tasks WHERE status = 'pending' "
-                "AND target_json LIKE ? ORDER BY created_at ASC LIMIT 1",
-                (f"%{ip}%",),
+                "AND target_ip = ? ORDER BY created_at ASC LIMIT 1",
+                (ip,),
             ).fetchall()
         finally:
             self._close(conn)

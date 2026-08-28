@@ -201,7 +201,7 @@ class Controller:
                     self.crypto = C2Crypto(passphrase=c2_key)
             else:
                 self.crypto = C2Crypto()
-        self.app = web.Application(middlewares=[self._build_auth_middleware()])
+        self.app = web.Application(middlewares=[self._build_auth_middleware(), self._build_padding_middleware()])
         self._clients: list["web.WebSocketResponse"] = []
         self._setup_routes()
 
@@ -237,6 +237,39 @@ class Controller:
             return await handler(request)
 
         return _auth
+
+    def _build_padding_middleware(self):
+        """Pad all JSON responses to 4KB boundaries when c2_encrypt is on.
+
+        Without this, response sizes leak endpoint identity (e.g. a 50-byte
+        /health vs a 50KB /task). Padding all responses uniformly denies
+        traffic analysis the size fingerprint.
+        """
+        enabled = self.c2_encrypt
+
+        @web.middleware
+        async def _pad(request: "web.Request", handler):
+            resp = await handler(request)
+            if not enabled:
+                return resp
+            if resp.content_type != "application/json":
+                return resp
+            if resp.body is None:
+                return resp
+            try:
+                data = json.loads(resp.body)
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                return resp
+            if not isinstance(data, dict):
+                return resp
+            raw = resp.body.decode() if isinstance(resp.body, bytes) else resp.body
+            block_size = 4096
+            if len(raw) % block_size != 0:
+                target = ((len(raw) // block_size) + 1) * block_size
+                data["_padding"] = "x" * max(0, target - len(raw) - 16)
+            return web.json_response(data, status=resp.status, headers=dict(resp.headers))
+
+        return _pad
 
     def _client_cert_serial(self, request: "web.Request") -> int | None:
         """Extract the presented client cert's serial, or None if unavailable.
