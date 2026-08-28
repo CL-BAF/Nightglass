@@ -376,9 +376,10 @@ def spray_targets(
     max_user_attempts: int = 0,
     on_result=None,
     on_attempt=None,
+    tor: str | None = None,
 ) -> list[SprayResult]:
     """Synchronous wrapper that builds a SprayPlan + ProxyPool and runs it."""
-    pool = ProxyPool.from_files(proxy_file=proxy_file, jump_file=jump_file)
+    pool = ProxyPool.from_files(proxy_file=proxy_file, jump_file=jump_file, tor=tor)
     plan = SprayPlan(
         password=password,
         hosts=list(hosts),

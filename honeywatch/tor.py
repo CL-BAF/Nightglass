@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import shutil
 import subprocess
 import time
@@ -102,12 +103,28 @@ class TorProxy:
             )
         logger.info("Starting Tor: socks_port=%d control_port=%d",
                      self.socks_port, self.control_port)
+        # Generate a random control password and hash it with
+        # ``tor --hash-password``. Using HashedControlPassword instead of
+        # CookieAuthentication=0 prevents unauthenticated control port access
+        # from other processes on the same host.
+        ctrl_pass = self.control_password or secrets.token_urlsafe(16)
+        hash_proc = subprocess.run(
+            [tor_path, "--hash-password", ctrl_pass],
+            capture_output=True, text=True, timeout=10,
+        )
+        hashed_pw = hash_proc.stdout.strip()
+        if not hashed_pw or hash_proc.returncode != 0:
+            raise RuntimeError(
+                f"Tor --hash-password failed (rc={hash_proc.returncode}): "
+                f"{hash_proc.stderr or hash_proc.stdout}"
+            )
+        self.control_password = ctrl_pass
         self._process = subprocess.Popen(
             [
                 tor_path,
                 "--SocksPort", str(self.socks_port),
                 "--ControlPort", str(self.control_port),
-                "--CookieAuthentication", "0",
+                "--HashedControlPassword", hashed_pw,
                 "--Log", "notice stdout",
                 "--Quiet",
             ],

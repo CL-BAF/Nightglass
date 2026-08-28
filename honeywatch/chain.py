@@ -574,11 +574,13 @@ class ChainOrchestrator:
                 hosts_flat = [c for h in self.state.hosts for c in h]
                 placeholders = ",".join("(?,?)" for _ in self.state.hosts)
                 rows = conn_enum.execute(
-                    f"SELECT ip, port, version FROM hosts "
+                    f"SELECT ip, port, version, banner FROM hosts "
                     f"WHERE (ip, port) IN ({placeholders})",
                     hosts_flat,
                 ).fetchall()
-                banner_map = {(r[0], r[1]): r[2] or "" for r in rows}
+                # Fall back to the banner column when version is empty
+                # (pivot-discovered hosts may not have been scanned yet).
+                banner_map = {(r[0], r[1]): r[2] or r[3] or "" for r in rows}
             finally:
                 store._close(conn_enum)
             self.state.hosts.sort(
@@ -709,11 +711,12 @@ class ChainOrchestrator:
                     hosts_flat = [c for h in sprayed_hosts for c in h]
                     placeholders = ",".join("(?,?)" for _ in sprayed_hosts)
                     rows = conn.execute(
-                        f"SELECT ip, port, version FROM hosts "
+                        f"SELECT ip, port, version, banner FROM hosts "
                         f"WHERE (ip, port) IN ({placeholders})",
                         hosts_flat,
                     ).fetchall()
-                    banner_map = {(r[0], r[1]): r[2] or "" for r in rows}
+                    # Fall back to banner when version is empty.
+                    banner_map = {(r[0], r[1]): r[2] or r[3] or "" for r in rows}
                 finally:
                     bandit_store._close(conn)
                 for ip, port in sprayed_hosts:

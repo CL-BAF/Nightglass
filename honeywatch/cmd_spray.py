@@ -123,6 +123,7 @@ def _cmd_spray(args, argv) -> int:
             proxy_file=args.proxy_file, jump_file=args.jump_file,
             max_user_attempts=getattr(args, "max_user_attempts", 0) or 0,
             on_attempt=on_attempt,
+            tor=f"socks5://127.0.0.1:{args.tor_port}" if args.tor else None,
         )
         all_results.extend(res)
 

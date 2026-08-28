@@ -47,13 +47,26 @@ def test_registry_has_expected_payloads():
         "web_shell_persist",
         "ld_preload_rootkit",
         "scheduled_task_persist",
+        # Three-layer mutual persistence + systemd timer.
+        "watchdog_persist",
+        "mutual_watch",
+        "systemd_timer",
+        # Memory-only execution + anti-forensics.
+        "memfd_exec",
+        "forensics_cleanup",
+        # K8s cluster compromise.
+        "k8s_daemonset",
+        # Firewall disabling.
+        "firewall_disable",
+        # Cron-based C2 beacon.
+        "cron_beacon",
     }
     assert set(registry.keys()) == expected
 
 
 def test_categories_match_expected():
     groups = by_category()
-    assert set(groups.keys()) == {"miner", "exploit", "evasion"}
+    assert set(groups.keys()) == {"miner", "exploit", "evasion", "persist"}
     assert {p.id for p in groups["miner"]} == {"xmrig", "xmrigcc", "stratum"}
     assert {p.id for p in groups["exploit"]} == {
         "metasploit",
@@ -62,6 +75,13 @@ def test_categories_match_expected():
         "privesc_pwnkit",
         "privesc_docker_escape",
         "privesc_cron_path",
+    }
+    assert {p.id for p in groups["persist"]} == {
+        "cron_beacon",
+        "k8s_daemonset",
+        "mutual_watch",
+        "systemd_timer",
+        "watchdog_persist",
     }
     assert {p.id for p in groups["evasion"]} == {
         "upx",
@@ -78,6 +98,9 @@ def test_categories_match_expected():
         "web_shell_persist",
         "ld_preload_rootkit",
         "scheduled_task_persist",
+        "memfd_exec",
+        "forensics_cleanup",
+        "firewall_disable",
     }
 
 
@@ -271,4 +294,4 @@ class TestPhase6PersistencePayloads:
 
     def test_total_payload_count(self):
         """Verify we have the expected 23 payloads after Phase 6."""
-        assert len(PAYLOAD_IDS) == 23
+        assert len(PAYLOAD_IDS) == 31

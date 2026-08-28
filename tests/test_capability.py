@@ -385,6 +385,7 @@ class TestArtifactKinds:
         expected = {
             "hosts", "sprayable", "credentials", "foothold", "shadow",
             "cracked_creds", "loot", "cloud_creds", "ssh_keys",
-            "deployed", "pivoted_subnets",
+            "deployed", "pivoted_subnets", "arp_neighbors",
+            "installed_packages", "vulnerable_packages",
         }
         assert set(ARTIFACT_KINDS) == expected
