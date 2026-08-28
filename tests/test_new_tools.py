@@ -30,7 +30,7 @@ class TestToolRegistration:
         assert new_tools.issubset(set(TOOL_REGISTRY.keys()))
 
     def test_total_tool_count(self):
-        assert len(TOOL_REGISTRY) == 30
+        assert len(TOOL_REGISTRY) == 33
 
     def test_each_new_tool_has_spec_and_func(self):
         for name in ("exec_command", "port_scan", "web_probe",

@@ -125,6 +125,55 @@ def write_md(path: str, scores: list[Score]) -> str:
         lines.append("_No flags observed._")
     lines.append("")
 
+    # C2 operations section (when available).
+    lines.append("## C2 Operations")
+    lines.append("")
+    try:
+        from honeywatch.c2 import C2Store
+        import os
+        db_path = os.environ.get("HONEYWATCH_DB", "honeywatch.db")
+        if os.path.isfile(db_path):
+            store = C2Store(db_path)
+            ops = store.list_operations()
+            lines.append(f"- Operations: {len(ops)}")
+            tasks = store.list_tasks()
+            pending = sum(1 for t in tasks if t.status == "pending")
+            running = sum(1 for t in tasks if t.status == "running")
+            completed = sum(1 for t in tasks if t.status == "completed")
+            failed = sum(1 for t in tasks if t.status == "failed")
+            retried = sum(1 for t in tasks if getattr(t, "retry_count", 0) > 0)
+            lines.append(f"- Tasks: {len(tasks)} total, {pending} pending, {running} running, {completed} completed, {failed} failed")
+            if retried:
+                lines.append(f"- Retried tasks: {retried}")
+            workers = store.list_workers()
+            if workers:
+                lines.append(f"- Workers: {len(workers)}")
+                for w in workers:
+                    ip = w.get("egress_ip", "unknown") or "unknown"
+                    lines.append(f"  - {w.get('id', 'unknown')} (IP: {ip}, last seen: {w.get('last_seen', 'unknown')})")
+    except Exception:
+        lines.append("_C2 data unavailable._")
+    lines.append("")
+
+    # Deploy verification section (when chain state exists).
+    lines.append("## Deploy Verification")
+    lines.append("")
+    try:
+        import json
+        state_path = os.environ.get("HONEYWATCH_STATE", ".honeywatch/chain_state.json")
+        if os.path.isfile(state_path):
+            with open(state_path, "r", encoding="utf-8") as sf:
+                state = json.load(sf)
+            footholds = state.get("footholds", [])
+            lines.append(f"- Footholds: {len(footholds)}")
+            loot = state.get("loot", [])
+            if loot:
+                encrypted = sum(1 for l in loot if isinstance(l, dict) and l.get("encrypted"))
+                lines.append(f"- Loot entries: {len(loot)}" + (f" ({encrypted} encrypted)" if encrypted else ""))
+    except Exception:
+        lines.append("_No chain state available._")
+    lines.append("")
+
     text = "\n".join(lines)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)

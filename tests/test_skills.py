@@ -37,7 +37,7 @@ def registry():
 class TestSkillRegistry:
     def test_loads_all_15_skills(self, registry):
         skills = registry.list_skills()
-        assert len(skills) == 15
+        assert len(skills) == 21
 
     def test_skill_names_unique(self, registry):
         names = [s.name for s in registry.list_skills()]

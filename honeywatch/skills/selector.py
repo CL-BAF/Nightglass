@@ -40,7 +40,9 @@ PHASE_TAGS: dict[str, frozenset[str]] = {
     "privesc": frozenset({"privilege-escalation", "privesc", "kernel-exploit", "sudo", "docker"}),
     "escalate": frozenset({"hash-cracking", "hashcat", "john", "credential-recovery", "shadow"}),
     "loot": frozenset({"credential-theft", "exfiltration", "cloud-metadata", "docker", "ssh-keys"}),
-    "persist": frozenset({"persistence", "systemd", "cron", "miner", "webshell", "rootkit"}),
+    "persist": frozenset({"persistence", "systemd", "cron", "miner", "webshell", "rootkit",
+                          "beacon", "k8s", "daemonset", "watchdog", "timer", "self-healing"}),
+    "verify": frozenset({"verification", "health-check", "deploy-verify", "process-check"}),
     "pivot": frozenset({"lateral-movement", "network-discovery", "pivot", "subnet"}),
 }
 
