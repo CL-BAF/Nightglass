@@ -60,6 +60,8 @@ def test_registry_has_expected_payloads():
         "firewall_disable",
         # Cron-based C2 beacon.
         "cron_beacon",
+        # Web service RCE chain.
+        "web_exploit",
     }
     assert set(registry.keys()) == expected
 
@@ -75,6 +77,7 @@ def test_categories_match_expected():
         "privesc_pwnkit",
         "privesc_docker_escape",
         "privesc_cron_path",
+        "web_exploit",
     }
     assert {p.id for p in groups["persist"]} == {
         "cron_beacon",
@@ -294,4 +297,4 @@ class TestPhase6PersistencePayloads:
 
     def test_total_payload_count(self):
         """Verify we have the expected 23 payloads after Phase 6."""
-        assert len(PAYLOAD_IDS) == 31
+        assert len(PAYLOAD_IDS) == 32

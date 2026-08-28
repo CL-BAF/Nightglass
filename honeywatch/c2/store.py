@@ -336,6 +336,43 @@ class C2Store:
         finally:
             self._close(conn)
 
+    def claim_task_by_id(self, task_id: str, worker_id: str) -> bool:
+        """Transition a specific task from pending to running by its id.
+
+        Returns True when the update matched a pending row, False otherwise.
+        Used by the beacon endpoint to claim a task without category matching.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute(
+                    "UPDATE c2_tasks "
+                    "SET status = 'running', worker_id = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (worker_id, _now(), task_id),
+                )
+                return cur.rowcount > 0
+        finally:
+            self._close(conn)
+
+    def query_pending_by_target_ip(self, ip: str) -> list[dict]:
+        """Return pending tasks whose target_json contains the given IP.
+
+        Uses LIKE for substring matching against the JSON target field.
+        This is more efficient than loading all pending tasks and filtering
+        in Python (C5 fix).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM c2_tasks WHERE status = 'pending' "
+                "AND target_json LIKE ? ORDER BY created_at ASC LIMIT 1",
+                (f"%{ip}%",),
+            ).fetchall()
+        finally:
+            self._close(conn)
+        return [dict(r) for r in rows]
+
     def complete_task(
         self,
         task_id: str,

@@ -518,10 +518,14 @@ class Worker:
                         )
                     )
                     self.beacon.on_success()  # connected -> reset backoff
+                    _ws_timeout = self.poll_interval
+                    if self.human_timing:
+                        from honeywatch.c2.beacon import human_like_interval
+                        _ws_timeout = human_like_interval(self.poll_interval)
                     while not self._shutdown:
                         try:
                             msg = await asyncio.wait_for(
-                                ws.recv(), timeout=self.poll_interval
+                                ws.recv(), timeout=_ws_timeout
                             )
                         except asyncio.TimeoutError:
                             # No WS task pushed -> fall back to an HTTP claim.

