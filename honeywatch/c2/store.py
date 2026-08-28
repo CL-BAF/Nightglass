@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS c2_tasks (
     worker_id TEXT,
     claimed_at TEXT,
     result_json TEXT,
+    retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3,
     created_at TEXT,
     updated_at TEXT
 );
@@ -47,7 +49,8 @@ CREATE TABLE IF NOT EXISTS c2_workers (
     id TEXT PRIMARY KEY,
     categories TEXT,
     connected_at TEXT,
-    last_seen TEXT
+    last_seen TEXT,
+    egress_ip TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_c2_tasks_claim ON c2_tasks(status, created_at);
@@ -141,6 +144,20 @@ class C2Store:
                 pass  # column already exists
             try:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_c2_tasks_target_ip ON c2_tasks(status, target_ip)")
+            except sqlite3.OperationalError:
+                pass
+            # Migration: add retry_count and max_retries for task retry logic.
+            try:
+                conn.execute("ALTER TABLE c2_tasks ADD COLUMN retry_count INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE c2_tasks ADD COLUMN max_retries INTEGER DEFAULT 3")
+            except sqlite3.OperationalError:
+                pass
+            # Migration: add egress_ip column for worker geolocation.
+            try:
+                conn.execute("ALTER TABLE c2_workers ADD COLUMN egress_ip TEXT")
             except sqlite3.OperationalError:
                 pass
             conn.commit()
@@ -283,8 +300,8 @@ class C2Store:
                     """
                     INSERT INTO c2_tasks (id, operation_id, payload_id, category,
                         target_json, target_ip, script, variables_json, status, worker_id,
-                        claimed_at, result_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        claimed_at, result_json, retry_count, max_retries, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.id,
@@ -299,6 +316,8 @@ class C2Store:
                         task.worker_id,
                         task.claimed_at,
                         _encode(task.result),
+                        0,
+                        3,
                         _now(),
                         _now(),
                     ),
@@ -421,6 +440,49 @@ class C2Store:
         finally:
             self._close(conn)
 
+    def fail_task_with_retry(
+        self,
+        task_id: str,
+        worker_id: str,
+        result: dict[str, Any] | None = None,
+    ) -> bool:
+        """Fail a task, OR re-queue it if retries remain.
+
+        When ``retry_count < max_retries``, the task is reset to ``pending``
+        with ``worker_id`` cleared so another worker can claim it. When
+        retries are exhausted, the task is marked ``failed`` permanently.
+
+        Returns True if the task was re-queued (caller should not treat this
+        as a permanent failure), False if the task is permanently failed.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                row = conn.execute(
+                    "SELECT retry_count, max_retries FROM c2_tasks "
+                    "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                    (task_id, worker_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                retry_count, max_retries = row
+                if retry_count < max_retries:
+                    conn.execute(
+                        "UPDATE c2_tasks SET status = 'pending', worker_id = NULL, "
+                        "retry_count = retry_count + 1, updated_at = ? WHERE id = ?",
+                        (_now(), task_id),
+                    )
+                    return True
+                else:
+                    conn.execute(
+                        "UPDATE c2_tasks SET status = 'failed', result_json = ?, "
+                        "updated_at = ? WHERE id = ?",
+                        (_encode(result), _now(), task_id),
+                    )
+                    return False
+        finally:
+            self._close(conn)
+
     def list_tasks(
         self,
         operation_id: str | None = None,
@@ -460,6 +522,9 @@ class C2Store:
             status=row["status"],
             worker_id=row["worker_id"],
             result=_decode(row["result_json"]),
+            claimed_at=row["claimed_at"] if "claimed_at" in row.keys() else None,
+            retry_count=row["retry_count"] if "retry_count" in row.keys() else 0,
+            max_retries=row["max_retries"] if "max_retries" in row.keys() else 3,
         )
 
     # ------------------------------------------------------------------ #
@@ -544,6 +609,18 @@ class C2Store:
                 conn.execute(
                     "UPDATE c2_workers SET last_seen = ? WHERE id = ?",
                     (_now(), worker_id),
+                )
+        finally:
+            self._close(conn)
+
+    def update_worker_geolocation(self, worker_id: str, ip: str) -> None:
+        """Update the egress IP for a worker (for dashboard geolocation)."""
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE c2_workers SET egress_ip = ?, last_seen = ? WHERE id = ?",
+                    (ip, _now(), worker_id),
                 )
         finally:
             self._close(conn)

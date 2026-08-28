@@ -200,3 +200,5 @@ class WorkerTask:
     # re-queue tasks whose worker died mid-execution.
     claimed_at: str | None = None
     result: dict[str, Any] | None = None
+    retry_count: int = 0
+    max_retries: int = 3

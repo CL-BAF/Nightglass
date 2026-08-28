@@ -609,6 +609,10 @@ class Controller:
         worker_id = data.get("worker_id") or f"worker-{uuid.uuid4().hex[:8]}"
         categories = data.get("categories", [])
         await asyncio.to_thread(self.store.register_worker, worker_id, categories)
+        # Record the worker's egress IP for dashboard geolocation.
+        worker_ip = request.remote or ""
+        if worker_ip:
+            await asyncio.to_thread(self.store.update_worker_geolocation, worker_id, worker_ip)
         task = await asyncio.to_thread(
             self.store.claim_next_task, worker_id, categories
         )
@@ -648,9 +652,20 @@ class Controller:
             worker_id = data.get("worker_id", "")
             success = bool(data.get("success"))
             result = data.get("result", {})
-        completed = await asyncio.to_thread(
-            self.store.complete_task, task_id, worker_id, success, result
-        )
+        # When a task fails, check if retries remain before marking it
+        # permanently failed. Re-queued tasks get another worker attempt.
+        if success:
+            completed = await asyncio.to_thread(
+                self.store.complete_task, task_id, worker_id, True, result
+            )
+        else:
+            retried = await asyncio.to_thread(
+                self.store.fail_task_with_retry, task_id, worker_id, result
+            )
+            # If the task was re-queued, don't broadcast completion — it's
+            # still pending for another worker. If permanently failed,
+            # treat as a completed-but-unsuccessful task.
+            completed = not retried
         # Only broadcast a completion when the store actually transitioned the
         # task (owned by this worker and still running). Otherwise the dashboard
         # would surface a false "task_completed" for a rejected/already-done task.
@@ -693,6 +708,11 @@ class Controller:
                             await asyncio.to_thread(
                                 self.store.register_worker, worker_id, categories
                             )
+                            ws_ip = request.remote or ""
+                            if ws_ip:
+                                await asyncio.to_thread(
+                                    self.store.update_worker_geolocation, worker_id, ws_ip
+                                )
                     elif msg_type == "task_result":
                         # Workers in pure-WS mode report results here instead of
                         # POST /api/tasks/{id}/result. Without this branch the
@@ -713,9 +733,16 @@ class Controller:
                         else:
                             succ = bool(payload.get("success"))
                             res = payload.get("result", {}) or {}
-                        completed = await asyncio.to_thread(
-                            self.store.complete_task, task_id, w_id, succ, res
-                        )
+                        # Retry failed tasks before marking them permanently failed.
+                        if succ:
+                            completed = await asyncio.to_thread(
+                                self.store.complete_task, task_id, w_id, True, res
+                            )
+                        else:
+                            retried = await asyncio.to_thread(
+                                self.store.fail_task_with_retry, task_id, w_id, res
+                            )
+                            completed = not retried
                         if completed:
                             await self._broadcast(
                                 {

